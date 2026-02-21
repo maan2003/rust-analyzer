@@ -1,0 +1,6 @@
+.devenv.flake.nix
+.devenv
+.direnv
+.envrc
+rustc
+target
