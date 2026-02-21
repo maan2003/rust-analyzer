@@ -1,69 +1,54 @@
 # Plan: rac
 
-**Take everything here with a grain of salt.** This plan is based on reading
-the code, not building it. Actual effort will vary — some things will be easier
-than expected, others will surface problems we haven't anticipated.
+**Guiding principle: unknown unknowns first.** Tackle the risky, novel parts
+early to learn what actually works. Push well-understood mechanical work
+(MIR format serialization, completeness) to later phases where it can't
+block discovery.
 
-## Phase 0: Preparation
+## Phase 0: Preparation ✅
 
-- Add `ra-ap-rustc_target` as a dependency of r-a
-- Implement `TyAbiInterface` for r-a's `Ty` — this unlocks `rustc_target`'s
-  calling convention machinery
-- Implement `HasTargetSpec` and `HasX86AbiOpt` (or equivalent per target)
-  for the codegen context — required by `adjust_for_rust_abi` /
-  `adjust_for_foreign_abi`
-- Pin a nightly toolchain revision for `ra-mir-export` and keep `ra-ap-*`
-  crates aligned with that same rustc revision
+- Vendored `rustc_target` ABI code into `rac-abi` crate (ra-ap-rustc_target
+  doesn't exist as a published crate)
+- Replaced hir-ty's hand-rolled index types (`RustcFieldIdx`,
+  `RustcEnumVariantIdx`) with rac-abi's `FieldIdx`/`VariantIdx`
+- Implemented `TyAbiInterface` for r-a's `Ty` (via `AbiTy` newtype for
+  Display requirement)
+- Implemented `HasDataLayout`, `HasTargetSpec`, `HasX86AbiOpt` on `CodegenCx`
+- `compute_fn_abi` wired to rac-abi's real `adjust_for_rust_abi`
 
-## Phase 1: ra-mir-export
+### Known limitations from Phase 0
+- `is_transparent` returns `false` (trait signature has no `cx` param to
+  query db for repr attrs). Affects ABI on riscv/loongarch/sparc64 for
+  transparent types.
+- `ty_and_layout_pointee_info_at` stubbed to `None`.
+- `TargetSpec` population from target triple not yet implemented.
 
-Build a **nightly-only** rustc driver that compiles a crate (with
-`-Z always-encode-mir`), reads the resulting MIR via rustc queries, and
-translates it to our serialized MIR format.
+## Phase 1: Single-function codegen spike
 
-This gives us MIR for any Rust code — including things r-a can't lower yet
-(async, inline asm, etc.) and all dependencies. It's the foundation that lets
-us make progress on codegen without being blocked by r-a's MIR coverage.
+**Goal: translate one MIR body → Cranelift IR → object file.** No linking,
+no std, no mangling. Just prove the MIR→CLIF translation works.
 
-### Serialization format
+- Create `ra-codegen` crate with cranelift dependencies
+- Implement `CValue`/`CPlace` (value-with-layout abstraction, adapt from
+  cg_clif)
+- Translate a trivial function: `fn foo() -> i32 { 42 }`
+  - Function signature from `FnAbi` → Cranelift `AbiParam`s
+  - MIR statement/terminator dispatch (start with Return, Assign, Const)
+  - Emit via `cranelift-object`, verify with `objdump`
+- Incrementally add MIR constructs: arithmetic (`CheckedBinaryOp`), locals,
+  control flow (if/match → MIR blocks), function calls
+- Write a test harness that compiles a function and calls it via `dlopen`
+  or similar, to validate output without a full driver
 
-The format must capture:
-- Monomorphized MIR bodies (rustc stores generic MIR; we either export
-  monomorphized instances or monomorphize on import)
-- Full type information sufficient to compute layouts on the r-a side
-- Static/const initializer bodies
-- Mangled symbol names matching rustc's output (v0 mangling)
+### What this surfaces early
+- Whether r-a's MIR representation maps cleanly to Cranelift
+- Layout/ABI integration issues in practice (not just type-checking)
+- What's missing from r-a's MIR lowering for even simple code
 
-Design the format and write a round-trip test before building the converter.
+## Phase 2: End-to-end `fn main() {}`
 
-### Scope
-
-Run the converter on std + the dependency tree, cache the output.
-
-## Phase 2: MIR → Cranelift Codegen
-
-Build `ra-codegen` — a crate that takes MIR (from either source) and produces
-Cranelift IR.
-
-- Fork/adapt cg_clif's translation patterns for our MIR representation
-- `CValue`/`CPlace` abstraction for Cranelift values with layout info
-- Statement and terminator dispatch (match arms over MIR constructs)
-- Arithmetic, casts, enum discriminants — mostly Cranelift builder calls
-- Note: r-a routes all binary ops through `CheckedBinaryOp` (returns
-  `(result, overflow_flag)` tuple), `BinaryOp` is stubbed as `Infallible`.
-  Codegen must handle the tuple result correctly.
-- ABI: use `rustc_target::callconv` to compute `PassMode` per argument,
-  translate to Cranelift `AbiParam`
-- Drop glue generation
-- Vtable layout and trait object dispatch
-- Intrinsics — start with the essential ones, add as needed
-
-### Mono-item collection
-
-Before codegen, walk MIR starting from `main` to discover all reachable
-monomorphized functions (similar to rustc's `MonoItem` collection). For each
-call site, resolve the callee, determine its generic args, monomorphize, and
-recurse. This produces the full set of functions to compile.
+**Goal: produce a running binary.** This forces solving the integration
+problems: entry points, symbol names, linking against std.
 
 ### Symbol mangling
 
@@ -72,71 +57,109 @@ so the linker can resolve calls into rustc-compiled rlibs/dylibs. This
 requires mapping r-a's `DefPath` representation to v0 mangling inputs
 (crate disambiguators, `DefPathData`, generic substitutions).
 
-### Simplifications
+This is well-specified (the v0 scheme is documented) but fiddly. Needs to
+happen before linking works.
 
-- **Skip borrow checking.** Lifetimes are erased before codegen — borrow
-  checking doesn't affect generated code. Run real rustc in the background
-  for diagnostics.
-- **Skip MIR optimizations.** No inlining, const propagation, or dead code
-  elimination passes. Feed r-a's unoptimized MIR straight to Cranelift and
-  let Cranelift handle optimization at the IR level. Slower output, but far
-  less code to write.
-- **`panic=abort` only.** No unwinding support. Panics call `abort()`, no
-  cleanup blocks, no exception tables. This simplifies drop glue (no unwind
-  paths) and eliminates `UnwindAction` complexity entirely.
-- **No debug info.** Skip DWARF generation. Lose debugger support and
-  symbolized stack traces initially. Removes a whole subsystem from scope.
-- **Parallel codegen per function.** Each function's MIR → Cranelift
-  translation is independent. Cranelift's `Context` is per-function.
-  Compile N functions on N threads, collect the object code.
+### Target spec population
 
-## Phase 3: AOT Driver
+Build `rac_abi::spec::Target` from the actual target triple. Needed for
+correct ABI computation on non-x86_64 targets, but x86_64-unknown-linux-gnu
+can be hardcoded initially.
 
-Wire up the codegen into an end-to-end compiler. This phase exists to
-**validate correctness**, not to be fast. All speed investment goes into the
-JIT phase.
+### Linking
 
 - Use `cranelift-object` to emit `.o` files
-- Shell out to a linker (or `rustc` as a linker driver) to produce the
-  final binary. Don't build custom linker invocation logic — let
-  rustc/cc/mold handle library search paths, native deps, and platform
-  quirks.
-- Handle entry point glue: emit a symbol that `std::rt::lang_start` can
-  call (the real chain is: linker entry → `lang_start` in std → user
-  `main`). The emitted symbol must have the right mangled name and
-  signature.
-- Use a fast linker (mold, lld) to reduce link overhead, but don't
-  optimize linking further — the JIT path eliminates it entirely.
+- Shell out to `rustc` as linker driver (handles library search paths,
+  native deps, platform quirks)
+- Entry point glue: emit symbol that `std::rt::lang_start` calls
+  (linker entry → `lang_start` in std → user `main`)
 
-**First milestone**: `fn main() {}` compiles and runs.
+### Mono-item collection
 
-Immediate follow-up: `fn main() { println!("hello"); }` compiles and runs.
+Walk MIR starting from `main` to discover reachable monomorphized functions.
+For `fn main() {}` this is trivial (just main itself), but the infrastructure
+is needed for anything larger.
 
-## Phase 4: Fill r-a's MIR Gaps
+**Milestone: `fn main() {}` compiles and runs.**
 
-With the converter as fallback, incrementally improve r-a's native MIR
-lowering so fewer things need the rustc roundtrip:
+Follow-up: `fn main() { println!("hello"); }` — this pulls in a huge
+transitive closure through std and will likely be the point where we need
+either ra-mir-export or a way to link against pre-compiled std objects.
 
-- Uncomment and wire `Downcast`, `SetDiscriminant`
-- Implement `BinaryOp` as a real Rvalue
+## Phase 3: Codegen breadth
+
+Expand the set of Rust constructs the codegen handles. Order by what's
+needed to compile progressively more complex programs.
+
+- Struct/enum layout, field access, discriminant read/write
+- References, raw pointers, pointer arithmetic
+- Trait object dispatch (vtable layout, virtual calls)
+- Drop glue generation
+- Closures (capture layout, `Fn`/`FnMut`/`FnOnce` dispatch)
+- Essential intrinsics (add as needed — `size_of`, `copy`, `transmute`,
+  `abort`, etc.)
+- Static/const initializers
+
+### Simplifications (maintained throughout)
+
+- **`panic=abort` only.** No unwinding, no cleanup blocks, no exception
+  tables. Panics call `abort()`.
+- **No debug info.** Skip DWARF generation entirely.
+- **No MIR optimizations.** Feed r-a's unoptimized MIR straight to
+  Cranelift.
+- **Skip borrow checking.** Doesn't affect codegen. Run rustc in background
+  for diagnostics.
+
+## Phase 4: ra-mir-export (dependency MIR)
+
+**Deferred until we actually need it.** Build the converter when codegen is
+mature enough that the bottleneck is missing MIR for std/dependencies, not
+missing codegen capabilities.
+
+Build a **nightly-only** rustc driver that compiles a crate (with
+`-Z always-encode-mir`), reads MIR via rustc queries, and translates to
+r-a's MIR format.
+
+### Serialization format
+
+The format must capture:
+- Monomorphized MIR bodies
+- Full type information sufficient to compute layouts on the r-a side
+- Static/const initializer bodies
+- Mangled symbol names matching rustc's output
+
+### Scope
+
+Run the converter on std + the dependency tree, cache the output.
+
+### Alternative: link against rustc-compiled objects directly
+
+For many cases, we don't need the MIR at all — we just need the symbol to
+exist in a `.rlib`/`.so`. Only functions we want to re-compile from source
+need their MIR. This may let us defer the converter even further.
+
+## Phase 5: Fill r-a's MIR gaps
+
+Incrementally improve r-a's native MIR lowering so fewer things need the
+rustc roundtrip:
+
+- `BinaryOp` as a real Rvalue (currently everything is `CheckedBinaryOp`)
+- `Downcast`, `SetDiscriminant`
 - async/await, inline asm, const blocks — as needed
 
 Each improvement means that function's MIR comes from r-a (Salsa-cached,
 incremental) instead of the converter (batch, from-scratch).
 
-## Phase 5: JIT + Incremental Daemon
+## Phase 6: JIT + Incremental Daemon
 
 Once AOT works, switch `cranelift-object` for `cranelift-jit`. This is
 where the speed payoff happens — no linker, no disk I/O, no object files.
 
-- Dependencies (std, crates) loaded once as dylibs via `libloading`
-  (one-time `cargo build` with appropriate flags to produce dylibs, then
-  cached). cg_clif's JIT driver does this in ~50 lines.
+- Dependencies loaded once as dylibs via `libloading`
 - `cranelift-jit` compiles functions into executable memory
 - Salsa-driven invalidation: recompile only changed functions
 - Function pointer swaps for hot reload
 - Lazy compilation: compile functions on first call
-- Sub-10ms edit-to-running-code
 
 ### Linking is eliminated, not optimized
 
@@ -146,17 +169,17 @@ dylib load for dependencies, which happens once at startup.
 
 ## Proc Macros
 
-Proc macros (including `#[derive(...)]`, `serde`, `tokio::main`, etc.) must
-run during compilation. r-a already handles proc macro expansion via a
-separate proc macro server process. The rac compilation path should reuse
-r-a's existing proc macro infrastructure rather than building a separate
-solution.
+r-a already handles proc macro expansion via a separate proc macro server
+process. The rac compilation path reuses that infrastructure.
 
 ## Open Questions
 
-- How to handle the serialization format for MIR interchange — needs to be
-  fast to read, stable enough across versions, and capture the full
-  information listed in Phase 1
-- How much of std should come from the converter vs r-a's native lowering
+- Can we link against rustc-compiled `.rlib` objects without the full
+  ra-mir-export converter? (Just need symbol resolution, not MIR.)
+- How to populate `TargetSpec` correctly — parse rustc's target JSON?
+  Hardcode common targets? Query `rustc --print target-spec-json`?
+- `is_transparent` in `TyAbiInterface` — the trait provides no `cx`.
+  Options: add a thread-local, change rac-abi's trait, or accept the
+  limitation.
 - When to add debug info (DWARF) support
 - When to add unwinding support (`panic=unwind`)
