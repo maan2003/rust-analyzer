@@ -1751,7 +1751,7 @@ impl Variant {
             layout::Variants::Multiple { variants, .. } => Layout(
                 {
                     let lookup = self.id.lookup(db);
-                    let rustc_enum_variant_idx = RustcEnumVariantIdx(lookup.index as usize);
+                    let rustc_enum_variant_idx = RustcEnumVariantIdx::from_usize(lookup.index as usize);
                     Arc::new(variants[rustc_enum_variant_idx].clone())
                 },
                 db.target_data_layout(parent_enum.krate(db).into()).unwrap(),
@@ -6488,7 +6488,7 @@ impl Layout {
                 (i < count).then_some((stride * i).bytes())
             }
             layout::FieldsShape::Arbitrary { ref offsets, .. } => {
-                Some(offsets.get(RustcFieldIdx(field.id))?.bytes())
+                Some(offsets.get(RustcFieldIdx::from_u32(u32::from(field.id.into_raw())))?.bytes())
             }
         }
     }
@@ -6502,7 +6502,7 @@ impl Layout {
                 (i < count).then_some((stride * i).bytes())
             }
             layout::FieldsShape::Arbitrary { ref offsets, .. } => {
-                Some(offsets.get(RustcFieldIdx::new(field))?.bytes())
+                Some(offsets.get(RustcFieldIdx::from_usize(field))?.bytes())
             }
         }
     }
@@ -6518,7 +6518,7 @@ impl Layout {
             }),
             layout::FieldsShape::Arbitrary { ref offsets, ref memory_index } => {
                 let tail = memory_index.last_index()?;
-                let tail_field_size = field_size(tail.0.into_raw().into_u32() as usize)?;
+                let tail_field_size = field_size(tail.as_usize())?;
                 let offset = offsets.get(tail)?.bytes();
                 self.0.size.bytes().checked_sub(offset)?.checked_sub(tail_field_size)
             }

@@ -46,6 +46,8 @@ ra-ap-rustc_next_trait_solver.workspace = true
 tracing-subscriber.workspace = true
 tracing-tree.workspace = true
 
+rac-abi.path = "../rac-abi"
+
 # local deps
 stdx.workspace = true
 macros.workspace = true

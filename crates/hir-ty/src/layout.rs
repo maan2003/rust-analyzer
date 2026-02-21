@@ -7,8 +7,6 @@ use hir_def::{
     attrs::AttrFlags,
     layout::{LayoutCalculatorError, LayoutData},
 };
-use la_arena::{Idx, RawIdx};
-
 use rustc_abi::{
     AddressSpace, Float, Integer, LayoutCalculator, Primitive, ReprOptions, Scalar, StructKind,
     TargetDataLayout, WrappingRange,
@@ -37,37 +35,7 @@ pub use self::{adt::layout_of_adt_query, target::target_data_layout_query};
 pub(crate) mod adt;
 pub(crate) mod target;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RustcEnumVariantIdx(pub usize);
-
-impl rustc_index::Idx for RustcEnumVariantIdx {
-    fn new(idx: usize) -> Self {
-        RustcEnumVariantIdx(idx)
-    }
-
-    fn index(self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RustcFieldIdx(pub LocalFieldId);
-
-impl RustcFieldIdx {
-    pub fn new(idx: usize) -> Self {
-        RustcFieldIdx(Idx::from_raw(RawIdx::from(idx as u32)))
-    }
-}
-
-impl rustc_index::Idx for RustcFieldIdx {
-    fn new(idx: usize) -> Self {
-        RustcFieldIdx(Idx::from_raw(RawIdx::from(idx as u32)))
-    }
-
-    fn index(self) -> usize {
-        u32::from(self.0.into_raw()) as usize
-    }
-}
+pub use rac_abi::{FieldIdx as RustcFieldIdx, VariantIdx as RustcEnumVariantIdx};
 
 pub type Layout = LayoutData<RustcFieldIdx, RustcEnumVariantIdx>;
 pub type TagEncoding = hir_def::layout::TagEncoding<RustcEnumVariantIdx>;

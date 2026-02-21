@@ -842,7 +842,7 @@ impl<'db> Evaluator<'db> {
                         Variants::Multiple { variants, .. } => {
                             &variants[match f.parent {
                                 hir_def::VariantId::EnumVariantId(it) => {
-                                    RustcEnumVariantIdx(it.lookup(self.db).index as usize)
+                                    RustcEnumVariantIdx::from_usize(it.lookup(self.db).index as usize)
                                 }
                                 _ => {
                                     return Err(MirEvalError::InternalError(
@@ -1668,7 +1668,7 @@ impl<'db> Evaluator<'db> {
             Variants::Empty => unreachable!(),
             Variants::Single { index } => {
                 let r =
-                    self.const_eval_discriminant(e.enum_variants(self.db).variants[index.0].0)?;
+                    self.const_eval_discriminant(e.enum_variants(self.db).variants[index.as_usize()].0)?;
                 Ok(r)
             }
             Variants::Multiple { tag, tag_encoding, variants, .. } => {
@@ -1690,8 +1690,8 @@ impl<'db> Evaluator<'db> {
                             .map(|(it, _)| it)
                             .filter(|it| it != untagged_variant)
                             .nth(candidate_tag)
-                            .unwrap_or(*untagged_variant)
-                            .0;
+                            .unwrap_or(*untagged_variant);
+                        let idx = idx.as_usize();
                         let result =
                             self.const_eval_discriminant(e.enum_variants(self.db).variants[idx].0)?;
                         Ok(result)
@@ -1837,7 +1837,7 @@ impl<'db> Evaluator<'db> {
                 };
                 let mut discriminant = self.const_eval_discriminant(enum_variant_id)?;
                 let lookup = enum_variant_id.lookup(self.db);
-                let rustc_enum_variant_idx = RustcEnumVariantIdx(lookup.index as usize);
+                let rustc_enum_variant_idx = RustcEnumVariantIdx::from_usize(lookup.index as usize);
                 let variant_layout = variants[rustc_enum_variant_idx].clone();
                 let have_tag = match tag_encoding {
                     TagEncoding::Direct => true,

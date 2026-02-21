@@ -9,6 +9,6 @@ pub mod callconv;
 pub mod spec;
 
 pub use layout_ty::{
-    FIRST_VARIANT, FieldIdx, Layout, TyAbiInterface, TyAndLayout, VariantIdx,
+    FIRST_VARIANT, FieldIdx, Interned, Layout, TyAbiInterface, TyAndLayout, VariantIdx,
 };
 pub use abi_callconv::{Heterogeneous, HomogeneousAggregate};

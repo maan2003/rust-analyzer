@@ -1100,6 +1100,7 @@ dependencies = [
  "ra-ap-rustc_next_trait_solver",
  "ra-ap-rustc_pattern_analysis",
  "ra-ap-rustc_type_ir",
+ "rac-abi",
  "rustc-hash 2.1.1",
  "rustc_apfloat",
  "salsa",
