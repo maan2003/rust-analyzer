@@ -1,0 +1,12 @@
+[package]
+name = "rac-abi"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.86"
+
+[dependencies]
+# Package renaming so copied code can still say `rustc_abi::...`
+rustc_abi = { package = "ra-ap-rustc_abi", version = "0.143", default-features = false }
+rustc_index = { package = "ra-ap-rustc_index", version = "0.143", default-features = false }
+bitflags = "2.4.1"
+tracing = "0.1"
