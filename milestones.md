@@ -75,16 +75,22 @@ IntToInt, FloatToInt, IntToFloat, FloatToFloat, PtrToPtr,
 PointerExposeProvenance, PointerWithExposedProvenance, Transmute
 all working for scalar types.
 
-### M3.3: Aggregates (partial — tuples only)
+### M3.3: Aggregates ✅
 
-Tuple aggregates working (Scalar, ScalarPair, and memory-repr fast
-paths). Tuple field projections via `CPlace::place_field`. Deref
+Tuple and ADT aggregates working (Scalar, ScalarPair, and memory-repr
+fast paths). Field projections via `CPlace::place_field`. Deref
 projection, Downcast projection (Direct tag encoding), Discriminant
 rvalue (Direct tag), Ref/AddressOf, Len for fixed-size arrays.
 
-Still missing: ADT aggregate construction (struct/enum), ADT field
-type resolution (needs generic substitution), closure field types,
-niche-encoded discriminants, `SetDiscriminant` statement.
+ADT support: struct/enum aggregate construction, field type resolution
+with generic substitution (`db.field_types` + `instantiate`),
+`SetDiscriminant` statement (Direct tag encoding), and enum variant
+constructor calls (`CallableDefId::StructId`/`EnumVariantId`).
+Multi-variant enums on register places (Var/VarPair) spill to memory
+for correct field offset handling.
+
+Niche-encoded discriminants (read + write) ported from upstream.
+Still missing: closure field types, explicit discriminant values (`A = 100`).
 
 ### M3.4: Remaining scalar ops ✅
 

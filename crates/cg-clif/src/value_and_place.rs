@@ -228,6 +228,12 @@ impl CPlace {
         }
     }
 
+    /// Returns true if this place is stored in registers (Var or VarPair),
+    /// not in memory (Addr).
+    pub(crate) fn is_register(&self) -> bool {
+        matches!(self.inner, CPlaceInner::Var(_) | CPlaceInner::VarPair(_, _))
+    }
+
     pub(crate) fn to_ptr(&self) -> Pointer {
         match self.inner {
             CPlaceInner::Addr(ptr) => ptr,
@@ -376,8 +382,10 @@ impl CPlace {
                     _ => panic!("field index {field_idx} out of range for VarPair"),
                 }
             }
-            CPlaceInner::Var(_) => {
-                panic!("cannot project field on a single-variable CPlace (Var)")
+            CPlaceInner::Var(var) => {
+                // Scalar wrapper struct: field 0 is the scalar itself
+                assert_eq!(field_idx, 0, "field index {field_idx} out of range for single Var");
+                CPlace { inner: CPlaceInner::Var(var), layout: field_layout }
             }
             CPlaceInner::Addr(ptr) => {
                 let offset = self.layout.fields.offset(field_idx);

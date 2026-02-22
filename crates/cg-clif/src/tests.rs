@@ -1097,3 +1097,141 @@ fn main() -> ! {
     );
     assert_eq!(code, 42);
 }
+
+// ---------------------------------------------------------------------------
+// Struct / enum / ADT tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_struct_field_access() {
+    let result = jit_run::<i32>(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+fn foo() -> i32 {
+    let p = Point { x: 10, y: 20 };
+    p.x + p.y
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 30);
+}
+
+#[test]
+fn jit_struct_single_field() {
+    let result = jit_run::<i32>(
+        r#"
+struct Wrapper {
+    val: i32,
+}
+fn foo() -> i32 {
+    let w = Wrapper { val: 99 };
+    w.val
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn jit_struct_pass_and_return() {
+    let result = jit_run::<i32>(
+        r#"
+struct Pair {
+    a: i32,
+    b: i32,
+}
+fn swap(p: Pair) -> Pair {
+    Pair { a: p.b, b: p.a }
+}
+fn foo() -> i32 {
+    let p = Pair { a: 3, b: 7 };
+    let q = swap(p);
+    q.a * 10 + q.b
+}
+"#,
+        &["swap", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 73);
+}
+
+#[test]
+fn jit_enum_match() {
+    let result = jit_run::<i32>(
+        r#"
+enum AB {
+    A(i32),
+    B(i32),
+}
+fn extract(x: AB) -> i32 {
+    match x {
+        AB::A(v) => v,
+        AB::B(v) => v + 100,
+    }
+}
+fn foo() -> i32 {
+    let a = AB::A(10);
+    let b = AB::B(20);
+    extract(a) + extract(b)
+}
+"#,
+        &["extract", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 10 + 120);
+}
+
+#[test]
+fn jit_enum_unit_variants() {
+    let result = jit_run::<i32>(
+        r#"
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+fn to_int(c: Color) -> i32 {
+    match c {
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Blue => 3,
+    }
+}
+fn foo() -> i32 {
+    to_int(Color::Red) * 100 + to_int(Color::Green) * 10 + to_int(Color::Blue)
+}
+"#,
+        &["to_int", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 123);
+}
+
+#[test]
+fn jit_generic_struct() {
+    let result = jit_run::<i32>(
+        r#"
+struct Pair<T> {
+    first: T,
+    second: T,
+}
+fn sum(p: Pair<i32>) -> i32 {
+    p.first + p.second
+}
+fn foo() -> i32 {
+    let p = Pair { first: 17, second: 25 };
+    sum(p)
+}
+"#,
+        &["sum", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}

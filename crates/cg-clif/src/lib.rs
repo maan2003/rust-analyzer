@@ -14,7 +14,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{CallableDefId, ItemContainerId};
+use hir_def::{CallableDefId, ItemContainerId, Lookup, VariantId};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
@@ -22,7 +22,7 @@ use hir_ty::mir::{
     ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use either::Either;
-use hir_ty::next_solver::{Const, ConstKind, GenericArgs, IntoKind, StoredTy, TyKind};
+use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
 use rac_abi::VariantIdx;
@@ -341,6 +341,16 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                 cur_ty = inner_ty.store();
             }
             ProjectionElem::Downcast(variant_idx) => {
+                // For multi-variant enums in registers, spill to memory so
+                // field projections use correct offsets (tag vs payload).
+                if cplace.is_register() {
+                    use rustc_abi::Variants;
+                    if matches!(&cplace.layout.variants, Variants::Multiple { .. }) {
+                        let cval = cplace.to_cvalue(fx);
+                        let ptr = cval.force_stack(fx);
+                        cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                    }
+                }
                 let variant_layout = variant_layout(
                     fx.db,
                     &cur_ty,
@@ -372,7 +382,7 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
 
 /// Get the type of a field from a parent type.
 fn field_type(
-    _db: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     parent_ty: &StoredTy,
     field: &Either<hir_def::FieldId, hir_def::TupleFieldId>,
 ) -> StoredTy {
@@ -386,8 +396,15 @@ fn field_type(
             };
             tys.as_slice()[idx].store()
         }
-        TyKind::Adt(_adt_id, _args) => {
-            todo!("field_type for ADT types (coming in M3.3)")
+        TyKind::Adt(_adt_id, args) => {
+            let Either::Left(field_id) = field else {
+                panic!("TupleFieldId on ADT type");
+            };
+            let interner = DbInterner::new_no_crate(db);
+            db.field_types(field_id.parent)[field_id.local_id]
+                .get()
+                .instantiate(interner, args)
+                .store()
         }
         _ => todo!("field_type for {:?}", parent_ty.as_ref().kind()),
     }
@@ -424,6 +441,59 @@ fn variant_layout(
     }
 }
 
+/// Build a layout for a tag scalar (used for discriminant field access).
+fn tag_scalar_layout(dl: &TargetDataLayout, tag: &Scalar) -> TArc<Layout> {
+    let mut ly = Layout::scalar(dl, *tag);
+    ly.size = tag.size(dl);
+    TArc::new(ly)
+}
+
+/// Compare a Cranelift value against an i128 immediate.
+/// Ported from upstream cg_clif/src/common.rs `codegen_icmp_imm`.
+fn codegen_icmp_imm(
+    fx: &mut FunctionCx<'_, impl Module>,
+    intcc: IntCC,
+    lhs: Value,
+    rhs: i128,
+) -> Value {
+    let lhs_ty = fx.bcx.func.dfg.value_type(lhs);
+    if lhs_ty == types::I128 {
+        let (lhs_lsb, lhs_msb) = fx.bcx.ins().isplit(lhs);
+        let (rhs_lsb, rhs_msb) = (rhs as u128 as u64 as i64, (rhs as u128 >> 64) as u64 as i64);
+        match intcc {
+            IntCC::Equal => {
+                let lsb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_lsb, rhs_lsb);
+                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
+                fx.bcx.ins().band(lsb_eq, msb_eq)
+            }
+            IntCC::NotEqual => {
+                let lsb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_lsb, rhs_lsb);
+                let msb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_msb, rhs_msb);
+                fx.bcx.ins().bor(lsb_ne, msb_ne)
+            }
+            _ => {
+                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
+                let lsb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_lsb, rhs_lsb);
+                let msb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_msb, rhs_msb);
+                fx.bcx.ins().select(msb_eq, lsb_cc, msb_cc)
+            }
+        }
+    } else {
+        fx.bcx.ins().icmp_imm(intcc, lhs, rhs as i64)
+    }
+}
+
+/// Convert a `VariantId` to a `VariantIdx`.
+fn variant_id_to_idx(db: &dyn HirDatabase, variant_id: VariantId) -> VariantIdx {
+    match variant_id {
+        VariantId::EnumVariantId(ev) => {
+            let lookup = ev.lookup(db);
+            VariantIdx::from_u32(lookup.index)
+        }
+        VariantId::StructId(_) | VariantId::UnionId(_) => VariantIdx::from_u32(0),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
@@ -436,7 +506,10 @@ fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, stmt:
         StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
         StatementKind::Nop | StatementKind::FakeRead(_) => {}
         StatementKind::Deinit(_) => {}
-        StatementKind::SetDiscriminant { .. } => todo!("SetDiscriminant"),
+        StatementKind::SetDiscriminant { place, variant_index } => {
+            let dest = codegen_place(fx, body, place);
+            codegen_set_discriminant(fx, &dest, *variant_index);
+        }
     }
 }
 
@@ -556,8 +629,78 @@ fn codegen_aggregate(
                 field_place.write_cvalue(fx, field_cval);
             }
         }
-        AggregateKind::Adt(_, _) => {
-            todo!("ADT aggregate (coming in M3.3)")
+        AggregateKind::Adt(variant_id, _subst) => {
+            use rustc_abi::Variants;
+            let variant_idx = variant_id_to_idx(fx.db, *variant_id);
+            let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
+
+            // Fast path: Scalar ADT with single variant (wrapper struct)
+            if is_single_variant {
+                if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
+                    let non_zst: Vec<_> = operands
+                        .iter()
+                        .map(|op| codegen_operand(fx, body, &op.kind))
+                        .filter(|cv| !cv.layout.is_zst())
+                        .collect();
+                    assert_eq!(non_zst.len(), 1, "Scalar ADT aggregate expects 1 non-ZST operand");
+                    dest.write_cvalue(fx, non_zst.into_iter().next().unwrap());
+                    codegen_set_discriminant(fx, &dest, variant_idx);
+                    return;
+                }
+
+                // Fast path: ScalarPair ADT with single variant (two-field struct)
+                if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
+                    let non_zst: Vec<_> = operands
+                        .iter()
+                        .map(|op| codegen_operand(fx, body, &op.kind))
+                        .filter(|cv| !cv.layout.is_zst())
+                        .collect();
+                    assert_eq!(non_zst.len(), 2, "ScalarPair ADT aggregate expects 2 non-ZST operands");
+                    let val0 = non_zst[0].load_scalar(fx);
+                    let val1 = non_zst[1].load_scalar(fx);
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(val0, val1, dest.layout.clone()),
+                    );
+                    codegen_set_discriminant(fx, &dest, variant_idx);
+                    return;
+                }
+            }
+
+            // General case: for multi-variant enums on register places,
+            // spill to memory so field projections use correct offsets.
+            let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
+                && dest.is_register();
+            let (work_dest, original_dest) = if use_temp {
+                let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
+                (tmp, Some(dest))
+            } else {
+                (dest, None)
+            };
+
+            let variant_ly = match &work_dest.layout.variants {
+                Variants::Single { .. } => work_dest.layout.clone(),
+                Variants::Multiple { variants, .. } => TArc::new(variants[variant_idx].clone()),
+                Variants::Empty => panic!("aggregate on empty variants"),
+            };
+            let variant_dest = work_dest.downcast_variant(variant_ly);
+
+            for (i, operand) in operands.iter().enumerate() {
+                let field_cval = codegen_operand(fx, body, &operand.kind);
+                if field_cval.layout.is_zst() {
+                    continue;
+                }
+                let field_layout = field_cval.layout.clone();
+                let field_place = variant_dest.place_field(fx, i, field_layout);
+                field_place.write_cvalue(fx, field_cval);
+            }
+
+            codegen_set_discriminant(fx, &work_dest, variant_idx);
+
+            if let Some(orig) = original_dest {
+                let cval = work_dest.to_cvalue(fx);
+                orig.write_cvalue(fx, cval);
+            }
         }
         AggregateKind::Union(_, _) => {
             todo!("Union aggregate")
@@ -568,6 +711,8 @@ fn codegen_aggregate(
     }
 }
 
+/// Read the discriminant of an enum place.
+/// Follows upstream cg_clif/src/discriminant.rs `codegen_get_discriminant`.
 fn codegen_get_discriminant(
     fx: &mut FunctionCx<'_, impl Module>,
     place: &CPlace,
@@ -581,26 +726,35 @@ fn codegen_get_discriminant(
 
     match &place.layout.variants {
         Variants::Single { index } => {
-            // Single-variant enum or struct: for types with no explicit
-            // discriminant values the variant index IS the discriminant.
-            // TODO: enums with explicit discriminant values (e.g. `A = 100`)
-            // need db.const_eval_discriminant() lookup here.
+            // TODO: Use db.const_eval_discriminant() for explicit discriminant values
             let discr_val = index.as_u32();
             fx.bcx.ins().iconst(dest_clif_ty, i64::from(discr_val))
         }
         Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
             use rustc_abi::TagEncoding;
-            // Read the tag field
-            let tag_offset = place.layout.fields.offset(tag_field.as_usize());
             let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
-            let tag_ptr = place.to_ptr().offset_i64(
-                &mut fx.bcx,
-                fx.pointer_type,
-                i64::try_from(tag_offset.bytes()).unwrap(),
-            );
-            let mut flags = MemFlags::new();
-            flags.set_notrap();
-            let tag_val = tag_ptr.load(&mut fx.bcx, tag_clif_ty, flags);
+
+            // Read the tag value — handle register and memory places
+            let tag_val = match place.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    place.to_cvalue(fx).load_scalar(fx)
+                }
+                BackendRepr::ScalarPair(_, _) => {
+                    let (a, b) = place.to_cvalue(fx).load_scalar_pair(fx);
+                    if tag_field.as_usize() == 0 { a } else { b }
+                }
+                _ => {
+                    let tag_offset = place.layout.fields.offset(tag_field.as_usize());
+                    let tag_ptr = place.to_ptr().offset_i64(
+                        &mut fx.bcx,
+                        fx.pointer_type,
+                        i64::try_from(tag_offset.bytes()).unwrap(),
+                    );
+                    let mut flags = MemFlags::new();
+                    flags.set_notrap();
+                    tag_ptr.load(&mut fx.bcx, tag_clif_ty, flags)
+                }
+            };
 
             match tag_encoding {
                 TagEncoding::Direct => {
@@ -610,16 +764,112 @@ fn codegen_get_discriminant(
                     };
                     codegen_intcast(fx, tag_val, dest_clif_ty, signed)
                 }
-                TagEncoding::Niche { .. } => {
-                    todo!("niche-encoded discriminant")
+                TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                    let relative_max =
+                        niche_variants.end().as_u32() - niche_variants.start().as_u32();
+
+                    // Algorithm (from upstream):
+                    // relative_tag = tag - niche_start
+                    // is_niche = relative_tag <= (ule) relative_max
+                    // discr = if is_niche {
+                    //     cast(relative_tag) + niche_variants.start()
+                    // } else {
+                    //     untagged_variant
+                    // }
+
+                    let (is_niche, tagged_discr, delta) = if relative_max == 0 {
+                        // Single niche variant: just compare tag == niche_start
+                        let is_niche = codegen_icmp_imm(
+                            fx,
+                            IntCC::Equal,
+                            tag_val,
+                            *niche_start as i128,
+                        );
+                        let tagged_discr = fx.bcx.ins().iconst(
+                            dest_clif_ty,
+                            niche_variants.start().as_u32() as i64,
+                        );
+                        (is_niche, tagged_discr, 0)
+                    } else {
+                        // General case: compute relative_tag, check range
+                        let niche_start_val =
+                            fx.bcx.ins().iconst(tag_clif_ty, *niche_start as i64);
+                        let relative_discr = fx.bcx.ins().isub(tag_val, niche_start_val);
+                        let cast_tag =
+                            codegen_intcast(fx, relative_discr, dest_clif_ty, false);
+                        let is_niche = codegen_icmp_imm(
+                            fx,
+                            IntCC::UnsignedLessThanOrEqual,
+                            relative_discr,
+                            i128::from(relative_max),
+                        );
+                        (is_niche, cast_tag, niche_variants.start().as_u32() as u128)
+                    };
+
+                    let tagged_discr = if delta == 0 {
+                        tagged_discr
+                    } else {
+                        let delta_val = fx.bcx.ins().iconst(dest_clif_ty, delta as i64);
+                        fx.bcx.ins().iadd(tagged_discr, delta_val)
+                    };
+
+                    let untagged_variant_val = fx.bcx.ins().iconst(
+                        dest_clif_ty,
+                        i64::from(untagged_variant.as_u32()),
+                    );
+                    fx.bcx.ins().select(is_niche, tagged_discr, untagged_variant_val)
                 }
             }
         }
         Variants::Empty => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
-            // Unreachable, but need a value for cranelift
             fx.bcx.ins().iconst(dest_clif_ty, 0)
         }
+    }
+}
+
+/// Set the discriminant for an enum place.
+/// Follows upstream cg_clif/src/discriminant.rs `codegen_set_discriminant`.
+fn codegen_set_discriminant(
+    fx: &mut FunctionCx<'_, impl Module>,
+    place: &CPlace,
+    variant_index: VariantIdx,
+) {
+    use rustc_abi::{TagEncoding, Variants};
+    match &place.layout.variants {
+        Variants::Single { index } => {
+            assert_eq!(*index, variant_index);
+        }
+        Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
+            let tag_layout = tag_scalar_layout(fx.dl, tag);
+
+            match tag_encoding {
+                TagEncoding::Direct => {
+                    let ptr = place.place_field(fx, tag_field.as_usize(), tag_layout);
+                    let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
+                    // TODO: Use db.const_eval_discriminant() for explicit discriminant values
+                    let discr_val = variant_index.as_u32();
+                    let to = fx.bcx.ins().iconst(tag_clif_ty, i64::from(discr_val));
+                    ptr.write_cvalue(fx, CValue::by_val(to, ptr.layout.clone()));
+                }
+                TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                    if variant_index != *untagged_variant {
+                        let niche = place.place_field(fx, tag_field.as_usize(), tag_layout);
+                        let niche_type = scalar_to_clif_type(fx.dl, tag);
+                        let niche_value =
+                            variant_index.as_u32() - niche_variants.start().as_u32();
+                        let niche_value = (niche_value as u128).wrapping_add(*niche_start);
+                        let niche_value =
+                            fx.bcx.ins().iconst(niche_type, niche_value as i64);
+                        niche.write_cvalue(
+                            fx,
+                            CValue::by_val(niche_value, niche.layout.clone()),
+                        );
+                    }
+                }
+            }
+        }
+        Variants::Empty => unreachable!("SetDiscriminant on empty variants"),
     }
 }
 
@@ -1022,10 +1272,118 @@ fn codegen_call(
                         target,
                     );
                 }
-                _ => todo!("struct/enum constructor calls"),
+                CallableDefId::StructId(struct_id) => {
+                    codegen_adt_constructor_call(
+                        fx, body, VariantId::StructId(struct_id), generic_args,
+                        args, destination, target,
+                    );
+                }
+                CallableDefId::EnumVariantId(variant_id) => {
+                    codegen_adt_constructor_call(
+                        fx, body, VariantId::EnumVariantId(variant_id), generic_args,
+                        args, destination, target,
+                    );
+                }
             }
         }
         _ => todo!("non-FnDef call (fn pointers, closures)"),
+    }
+}
+
+/// Handle struct/enum variant constructor "calls" — these aren't real function
+/// calls but rather aggregate construction lowered as Call terminators.
+fn codegen_adt_constructor_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    variant_id: VariantId,
+    _generic_args: GenericArgs<'_>,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    use rustc_abi::Variants;
+    let dest = codegen_place(fx, body, destination);
+    if !dest.layout.is_zst() {
+        let variant_idx = variant_id_to_idx(fx.db, variant_id);
+        let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
+
+        // Fast path: Scalar ADT with single variant
+        if is_single_variant {
+            if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
+                let non_zst: Vec<_> = args
+                    .iter()
+                    .map(|op| codegen_operand(fx, body, &op.kind))
+                    .filter(|cv| !cv.layout.is_zst())
+                    .collect();
+                assert_eq!(non_zst.len(), 1);
+                dest.write_cvalue(fx, non_zst.into_iter().next().unwrap());
+                codegen_set_discriminant(fx, &dest, variant_idx);
+                if let Some(target) = target {
+                    let block = fx.clif_block(*target);
+                    fx.bcx.ins().jump(block, &[]);
+                }
+                return;
+            }
+            if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
+                let non_zst: Vec<_> = args
+                    .iter()
+                    .map(|op| codegen_operand(fx, body, &op.kind))
+                    .filter(|cv| !cv.layout.is_zst())
+                    .collect();
+                assert_eq!(non_zst.len(), 2);
+                let val0 = non_zst[0].load_scalar(fx);
+                let val1 = non_zst[1].load_scalar(fx);
+                dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
+                codegen_set_discriminant(fx, &dest, variant_idx);
+                if let Some(target) = target {
+                    let block = fx.clif_block(*target);
+                    fx.bcx.ins().jump(block, &[]);
+                }
+                return;
+            }
+        }
+
+        // For multi-variant enums on Var/VarPair places, use a temp stack
+        // slot so field projections use correct memory offsets, then write
+        // back to the original variable.
+        let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
+            && dest.is_register();
+        let (work_dest, original_dest) = if use_temp {
+            let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
+            (tmp, Some(dest))
+        } else {
+            (dest, None)
+        };
+
+        let variant_ly = match &work_dest.layout.variants {
+            Variants::Single { .. } => work_dest.layout.clone(),
+            Variants::Multiple { variants, .. } => TArc::new(variants[variant_idx].clone()),
+            Variants::Empty => panic!("constructor on empty variants"),
+        };
+        let variant_dest = work_dest.downcast_variant(variant_ly);
+
+        for (i, arg) in args.iter().enumerate() {
+            let field_cval = codegen_operand(fx, body, &arg.kind);
+            if field_cval.layout.is_zst() {
+                continue;
+            }
+            let field_layout = field_cval.layout.clone();
+            let field_place = variant_dest.place_field(fx, i, field_layout);
+            field_place.write_cvalue(fx, field_cval);
+        }
+
+        codegen_set_discriminant(fx, &work_dest, variant_idx);
+
+        // Read back from stack slot into the original variable place
+        if let Some(orig) = original_dest {
+            let cval = work_dest.to_cvalue(fx);
+            orig.write_cvalue(fx, cval);
+        }
+    }
+
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
     }
 }
 

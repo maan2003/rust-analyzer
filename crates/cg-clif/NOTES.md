@@ -40,11 +40,20 @@ What works:
 - **Non-scalar locals** — Memory-repr types allocated as stack slots.
 - **Tuple aggregates** — `Rvalue::Aggregate(Tuple)` constructs tuples,
   with fast paths for Scalar and ScalarPair representations.
-- **Field projections** — `ProjectionElem::Field` on tuples via
+- **ADT aggregates** — `Rvalue::Aggregate(Adt)` constructs structs and enums.
+  Scalar/ScalarPair fast paths for single-variant ADTs. Multi-variant enums
+  spill to memory temp for correct field offsets, then read back. ADT field
+  type resolution uses `db.field_types` + `instantiate` for generic substitution.
+- **ADT constructor calls** — `CallableDefId::StructId`/`EnumVariantId` handled
+  as inline aggregate construction (not real function calls).
+- **SetDiscriminant** — writes enum tag via `place_field(tag_field)` (unified
+  for Var/VarPair/Addr). Supports Direct and Niche tag encodings.
+- **Field projections** — `ProjectionElem::Field` on tuples and ADTs via
   `CPlace::place_field`. VarPair splits into individual Vars for
   ScalarPair fields; Addr offsets by field layout offset.
 - **Rvalue::Ref/AddressOf** — takes address of a place.
-- **Rvalue::Discriminant** — reads enum discriminant (Direct tag encoding).
+- **Rvalue::Discriminant** — reads enum discriminant. Supports Direct and
+  Niche tag encodings. Handles Scalar, ScalarPair, and memory-repr places.
 - **Rvalue::Len** — returns fixed-size array length as a constant.
 
 ## Upstream comparison (`./cg_clif`)
@@ -60,6 +69,18 @@ Recently aligned with upstream:
 - **Pointer distance intrinsics match upstream behavior** — we now lower
   `ptr_offset_from` and `ptr_offset_from_unsigned` as pointer subtraction
   divided by pointee size, consistent with `cg_clif/src/intrinsics/mod.rs`.
+- **ADT aggregate construction matches upstream pattern** — both downcast
+  to variant layout, write fields, then set discriminant. Upstream does this
+  in `base.rs:875-898` with `lval.downcast_variant()` + `place_field()` +
+  `codegen_set_discriminant()`. We follow the same structure.
+- **SetDiscriminant matches upstream** — both use `place.place_field(tag_field)`
+  to access the tag field uniformly (`discriminant.rs:31,56`). Our version
+  handles Var/VarPair/Addr via `place_field` without manual backend_repr
+  dispatch. Both Direct and Niche tag encodings implemented.
+- **GetDiscriminant matches upstream** — both read the tag and decode it.
+  Direct encoding uses intcast (`discriminant.rs:126-134`). Niche encoding
+  uses relative_tag/is_niche/select pattern (`discriminant.rs:135-216`).
+  `codegen_icmp_imm` ported from `common.rs:105-147` for I128 support.
 
 Still diverges from upstream:
 - **Pointer coercion casts are incomplete** — upstream handles
@@ -73,7 +94,24 @@ Still diverges from upstream:
 - **Cast edge semantics are still simplified** — upstream handles i128
   conversion libcalls and float->int nuances (NaN behavior / saturating cast
   details) that we have not fully ported.
-
+- **VarPair multi-variant enums spill to memory** — upstream's
+  `place_field()` handles VarPair field projections natively after
+  `downcast_variant()` because its layout system computes field indices
+  within the overall ScalarPair. Our simpler `place_field()` maps
+  `field_idx` directly to VarPair elements, which is wrong after
+  downcast (variant field 0 ≠ VarPair element 0 when a tag occupies
+  element 0). We work around this by spilling Var/VarPair places to a
+  stack slot before downcast/field access on multi-variant enums, then
+  reading back. Correct but adds a round-trip through memory.
+- **ADT constructor calls handled differently** — upstream treats
+  `CallableDefId::StructId`/`EnumVariantId` as normal function calls
+  through its full ABI machinery. We handle them as inline aggregate
+  construction since we don't have the full call ABI for constructors.
+- **Explicit discriminant values not supported** — upstream uses
+  `layout.ty.discriminant_for_variant(fx.tcx, variant_index)` to get
+  the actual discriminant value (e.g. `A = 100` → 100). We use the
+  variant index directly, so `A = 100` would incorrectly write 0.
+  Needs `db.const_eval_discriminant()`.
 Known bugs (divergence from upstream cg_clif):
 - **Constants only handle small scalars** — `const_to_i64` extracts raw bytes
   into i64. Missing: pointer constants (references to allocations/statics),
@@ -88,8 +126,6 @@ Known bugs (divergence from upstream cg_clif):
   explicit discriminant values (e.g. `A = 100`) the codegen returns the
   variant index (0) instead of the discriminant value (100). Needs
   `db.const_eval_discriminant()` lookup.
-- **Niche-encoded discriminant not implemented** — `TagEncoding::Niche`
-  hits `todo!()` at runtime.
 - **JIT helper compiles only explicitly listed roots** — calls from a tested
   function into other local functions not listed in `jit_run(..., fn_names, ...)`
   remain unresolved at runtime (`can't resolve symbol ...`). This especially
@@ -97,21 +133,17 @@ Known bugs (divergence from upstream cg_clif):
   unless tests use direct intrinsic calls or object-only compile checks.
 
 What's missing:
-- ADT aggregate construction (struct/enum `Rvalue::Aggregate`)
-- ADT field type resolution (needs generic substitution via `StoredEarlyBinder`)
 - Closure field type resolution
-- Niche-encoded discriminant reading
-- `SetDiscriminant` statement
+- Explicit discriminant values (`A = 100`) — need `db.const_eval_discriminant()`
 - Union and RawPtr aggregates
 - Indirect calls (fn pointers, closures)
-- Struct/enum constructor calls (`CallableDefId::StructId`/`EnumVariantId`)
 - Remaining casts (`DynStar`, wide-pointer coercions)
 - Intrinsics beyond pointer offset/distance
 - Drop glue
 
 Next steps (easiest to port):
-1. ADT aggregate support (struct/enum locals, field projections with substitution)
-2. `SetDiscriminant` and niche-encoded discriminants
+1. Explicit discriminant values via `db.const_eval_discriminant()`
+2. Closure field type resolution
 3. Remaining cast/intrinsic/drop-glue coverage
 
 ## Original cg_clif architecture
