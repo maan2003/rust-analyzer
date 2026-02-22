@@ -58,6 +58,7 @@
 //!     phantom_data:
 //!     pin:
 //!     pointee: copy, send, sync, ord, hash, unpin, phantom_data
+//!     ptr_offset: sized
 //!     range:
 //!     new_range:
 //!     receiver: deref
@@ -559,6 +560,25 @@ pub mod ptr {
         &raw mut $place
     }
     // endregion:addr_of
+
+    // region:ptr_offset
+    mod ptr_offset_intrinsics {
+        #[rustc_intrinsic]
+        pub fn offset<T>(dst: *const T, offset: isize) -> *const T;
+    }
+
+    impl<T: crate::marker::PointeeSized> *const T {
+        pub unsafe fn offset(self, count: isize) -> *const T {
+            unsafe { ptr_offset_intrinsics::offset(self, count) }
+        }
+    }
+
+    impl<T: crate::marker::PointeeSized> *mut T {
+        pub unsafe fn offset(self, count: isize) -> *mut T {
+            unsafe { ptr_offset_intrinsics::offset(self as *const T, count) as *mut T }
+        }
+    }
+    // endregion:ptr_offset
 }
 
 pub mod ops {

@@ -141,7 +141,7 @@ All `Infallible` stubs have been removed from MIR types.
 - **Downcast**: Correctly emitted before field access on enum variants in pattern matching.
 - **AddressOf**: Correctly emitted for `&raw const/mut` and `addr_of!` coercions.
 - **LogicOp**: `&&`/`||` lowered as `BitAnd`/`BitOr` (not short-circuit). Has a FIXME.
-- **Source-level raw-pointer `offset` in fixtures**: In the lightweight `TestDB` fixture used by `crates/cg-clif` tests, calling `p.offset(n)` currently fails MIR lowering with `UnresolvedMethod("offset")`. The intrinsic path remains lowerable, but this blocks a direct source-level regression for `BinOp::Offset`.
+- **Source-level raw-pointer `offset` in fixtures**: Bare fixtures can fail with `UnresolvedMethod(\"offset\")` because they do not model full core pointer inherent impls. For test scenarios, `minicore` now exposes a `ptr_offset` slice so method resolution can work when explicitly enabled.
 
 ## Expressions not lowered (`not_supported!`)
 
@@ -160,4 +160,4 @@ These are intentional gaps — uncommon or unstable features.
 2. `Intrinsic` statement -- `assume`, `copy_nonoverlapping`.
 3. `UnwindAction` enum -- rustc uses this instead of `Option<BasicBlockId>` for unwind. Only matters for panic=unwind.
 4. Lower more intrinsics to MIR constructs (e.g. `offset` → `BinOp::Offset`) as needed by codegen.
-5. Fix raw-pointer inherent method resolution for `offset` in the test/fixture path so source-level `p.offset(n)` can exercise `BinOp::Offset` end-to-end.
+5. Plumb `minicore: ptr_offset` into integration-style test harnesses (like `crates/cg-clif` helpers) when source-level `p.offset(n)` coverage is needed.

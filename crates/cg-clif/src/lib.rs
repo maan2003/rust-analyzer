@@ -354,7 +354,21 @@ fn codegen_binop(
                     .db
                     .layout_of_ty(pointee_ty.store(), fx.env.clone())
                     .expect("layout error for pointee type");
-                let byte_offset = fx.bcx.ins().imul_imm(rhs_val, pointee_layout.size.bytes() as i64);
+                let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
+                let rhs_ty = fx.bcx.func.dfg.value_type(rhs_val);
+                let rhs_signed = ty_is_signed_int(operand_ty(body, &rhs.kind));
+                let rhs = if rhs_ty == ptr_ty {
+                    rhs_val
+                } else if ptr_ty.wider_or_equal(rhs_ty) {
+                    if rhs_signed {
+                        fx.bcx.ins().sextend(ptr_ty, rhs_val)
+                    } else {
+                        fx.bcx.ins().uextend(ptr_ty, rhs_val)
+                    }
+                } else {
+                    fx.bcx.ins().ireduce(ptr_ty, rhs_val)
+                };
+                let byte_offset = fx.bcx.ins().imul_imm(rhs, pointee_layout.size.bytes() as i64);
                 fx.bcx.ins().iadd(lhs_val, byte_offset)
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {

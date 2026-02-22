@@ -249,7 +249,7 @@ fn foo() -> i32 {
 
 /// Helper: compile a function named "foo" from source and assert it produces a valid object file.
 fn compile_fn_to_object(src: &str) -> Vec<u8> {
-    let full_src = format!("//- /main.rs\n{src}");
+    let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
     attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
@@ -280,8 +280,11 @@ fn compile_fn_to_object(src: &str) -> Vec<u8> {
 /// fn test() -> i32 { add(3, 4) }
 /// // jit_run::<i32>(src, &["add", "test"], "test") → 7
 /// ```
+///
+/// `src` may also be a full test fixture (e.g. with `//- minicore: ...` and
+/// explicit file entries).
 fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
-    let full_src = format!("//- /main.rs\n{src}");
+    let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
     attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
@@ -337,7 +340,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
 /// Helper: compile multiple functions from source into one object module.
 /// `fn_names` lists function names to compile, in order.
 fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
-    let full_src = format!("//- /main.rs\n{src}");
+    let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
     attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
@@ -381,6 +384,11 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
 
         obj_bytes
     })
+}
+
+fn fixture_src(src: &str) -> String {
+    let trimmed = src.trim_start();
+    if trimmed.starts_with("//-") { src.to_owned() } else { format!("//- /main.rs\n{src}") }
 }
 
 #[test]
@@ -732,6 +740,22 @@ fn foo() -> usize {
         "foo",
     );
     assert_eq!(result, 0x1000);
+}
+
+#[test]
+fn jit_accepts_full_fixture_input() {
+    let result = jit_run::<i32>(
+        r#"
+//- minicore: sized
+//- /main.rs
+fn foo() -> i32 {
+    7
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 7);
 }
 
 #[test]

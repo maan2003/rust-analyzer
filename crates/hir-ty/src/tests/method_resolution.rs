@@ -25,6 +25,19 @@ fn test(x: &[u8]) {
 }
 
 #[test]
+fn resolve_raw_ptr_offset_method_from_minicore() {
+    check_types(
+        r#"
+//- minicore: ptr_offset
+fn test(p: *const i32) {
+    let _q = unsafe { p.offset(2) };
+                    //^^^^^^^^^^^ *const i32
+}
+        "#,
+    );
+}
+
+#[test]
 fn cross_crate_primitive_method() {
     check_types(
         r#"
