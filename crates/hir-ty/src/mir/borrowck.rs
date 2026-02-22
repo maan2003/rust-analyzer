@@ -187,7 +187,7 @@ fn moved_out_of_ref<'db>(
                             for_operand(op, statement.span);
                         }
                     }
-                    Rvalue::ThreadLocalRef(n) => match *n {},
+                    Rvalue::ThreadLocalRef(_) => (),
                 },
                 StatementKind::FakeRead(_)
                 | StatementKind::Deinit(_)
@@ -209,9 +209,6 @@ fn moved_out_of_ref<'db>(
                 | TerminatorKind::Return
                 | TerminatorKind::Unreachable
                 | TerminatorKind::Drop { .. } => (),
-                TerminatorKind::DropAndReplace { value, .. } => {
-                    for_operand(value, terminator.span);
-                }
                 TerminatorKind::Call { func, args, .. } => {
                     for_operand(func, terminator.span);
                     args.iter().for_each(|it| for_operand(it, terminator.span));
@@ -280,7 +277,7 @@ fn partially_moved<'db>(
                             for_operand(op, statement.span);
                         }
                     }
-                    Rvalue::ThreadLocalRef(n) => match *n {},
+                    Rvalue::ThreadLocalRef(_) => (),
                 },
                 StatementKind::FakeRead(_)
                 | StatementKind::Deinit(_)
@@ -302,9 +299,6 @@ fn partially_moved<'db>(
                 | TerminatorKind::Return
                 | TerminatorKind::Unreachable
                 | TerminatorKind::Drop { .. } => (),
-                TerminatorKind::DropAndReplace { value, .. } => {
-                    for_operand(value, terminator.span);
-                }
                 TerminatorKind::Call { func, args, .. } => {
                     for_operand(func, terminator.span);
                     args.iter().for_each(|it| for_operand(it, terminator.span));
@@ -352,7 +346,6 @@ fn borrow_regions(db: &dyn HirDatabase, body: &MirBody) -> Vec<BorrowRegion> {
                 | TerminatorKind::Return
                 | TerminatorKind::Unreachable
                 | TerminatorKind::Drop { .. } => (),
-                TerminatorKind::DropAndReplace { .. } => {}
                 TerminatorKind::Call { .. } => {}
                 _ => (),
             },
@@ -479,8 +472,7 @@ fn ever_initialized_map(
                         .chain(unwind)
                         .for_each(|&it| process(it, is_ever_initialized));
                 }
-                TerminatorKind::DropAndReplace { .. }
-                | TerminatorKind::Assert { .. }
+                TerminatorKind::Assert { .. }
                 | TerminatorKind::Yield { .. }
                 | TerminatorKind::CoroutineDrop
                 | TerminatorKind::FalseEdge { .. }
@@ -584,7 +576,7 @@ fn mutability_of_locals<'db>(
                             }
                         }
                         Rvalue::ShallowInitBox(_, _) | Rvalue::ShallowInitBoxWithAlloc(_) => (),
-                        Rvalue::ThreadLocalRef(n) => match *n {},
+                        Rvalue::ThreadLocalRef(_) => (),
                     }
                     if let Rvalue::Ref(
                         BorrowKind::Mut {
@@ -623,7 +615,6 @@ fn mutability_of_locals<'db>(
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::Drop { .. }
-            | TerminatorKind::DropAndReplace { .. }
             | TerminatorKind::Assert { .. }
             | TerminatorKind::Yield { .. } => (),
             TerminatorKind::SwitchInt { discr, targets: _ } => {

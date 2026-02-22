@@ -706,7 +706,42 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 let callee_ty = self.expr_ty_after_adjustments(*callee);
                 match callee_ty.kind() {
-                    TyKind::FnDef(..) => {
+                    TyKind::FnDef(def, _) => {
+                        // Lower transmute intrinsic to Cast(Transmute) instead of a call
+                        if let CallableDefId::FunctionId(func_id) = def.0 {
+                            if hir_def::signatures::FunctionSignature::is_intrinsic(
+                                self.db,
+                                func_id,
+                            ) {
+                                let fn_data = self.db.function_signature(func_id);
+                                if fn_data.name.as_str() == "transmute"
+                                    || fn_data.name.as_str() == "transmute_unchecked"
+                                {
+                                    let &[arg] = &**args else {
+                                        return Err(MirLowerError::TypeError(
+                                            "transmute expects exactly one argument",
+                                        ));
+                                    };
+                                    let Some((operand, current)) =
+                                        self.lower_expr_to_some_operand(arg, current)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    let target_ty = self.expr_ty_after_adjustments(expr_id);
+                                    self.push_assignment(
+                                        current,
+                                        place,
+                                        Rvalue::Cast(
+                                            CastKind::Transmute,
+                                            operand,
+                                            target_ty.store(),
+                                        ),
+                                        expr_id.into(),
+                                    );
+                                    return Ok(Some(current));
+                                }
+                            }
+                        }
                         let func = Operand::from_bytes(Box::default(), callee_ty);
                         self.lower_call_and_args(
                             func,
@@ -2108,9 +2143,9 @@ fn cast_kind<'db>(
     let cast = CastTy::from_ty(db, target_ty);
     Ok(match (from, cast) {
         (Some(CastTy::Ptr(..) | CastTy::FnPtr), Some(CastTy::Int(_))) => {
-            CastKind::PointerExposeAddress
+            CastKind::PointerExposeProvenance
         }
-        (Some(CastTy::Int(_)), Some(CastTy::Ptr(..))) => CastKind::PointerFromExposedAddress,
+        (Some(CastTy::Int(_)), Some(CastTy::Ptr(..))) => CastKind::PointerWithExposedProvenance,
         (Some(CastTy::Int(_)), Some(CastTy::Int(_))) => CastKind::IntToInt,
         (Some(CastTy::FnPtr), Some(CastTy::Ptr(..))) => CastKind::FnPtrToPtr,
         (Some(CastTy::Float), Some(CastTy::Int(_))) => CastKind::FloatToInt,

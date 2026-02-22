@@ -158,7 +158,8 @@ impl<'db> Filler<'db> {
                             match ak {
                                 super::AggregateKind::Array(ty)
                                 | super::AggregateKind::Tuple(ty)
-                                | super::AggregateKind::Closure(ty) => self.fill_ty(ty)?,
+                                | super::AggregateKind::Closure(ty)
+                                | super::AggregateKind::RawPtr(ty, _) => self.fill_ty(ty)?,
                                 super::AggregateKind::Adt(_, subst) => self.fill_args(subst)?,
                                 super::AggregateKind::Union(_, _) => (),
                             }
@@ -181,7 +182,7 @@ impl<'db> Filler<'db> {
                         | Rvalue::UnaryOp(_, _)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
-                        Rvalue::ThreadLocalRef(n) => match *n {},
+                        Rvalue::ThreadLocalRef(_) => (),
                     },
                     StatementKind::Deinit(_)
                     | StatementKind::SetDiscriminant { .. }
@@ -208,7 +209,6 @@ impl<'db> Filler<'db> {
                     | TerminatorKind::Return
                     | TerminatorKind::Unreachable
                     | TerminatorKind::Drop { .. }
-                    | TerminatorKind::DropAndReplace { .. }
                     | TerminatorKind::Assert { .. }
                     | TerminatorKind::Yield { .. }
                     | TerminatorKind::CoroutineDrop

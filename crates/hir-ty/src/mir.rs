@@ -362,6 +362,10 @@ pub enum AggregateKind {
     Union(UnionId, FieldId),
     Closure(StoredTy),
     //Coroutine(LocalDefId, SubstsRef, Movability),
+    /// Construct a raw pointer from data pointer and metadata.
+    /// The `StoredTy` is the pointee type, `Mutability` indicates `*const` vs `*mut`.
+    /// Operands: [data_ptr, metadata] (metadata is `()` for thin pointers).
+    RawPtr(StoredTy, Mutability),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -508,43 +512,6 @@ pub enum TerminatorKind {
     /// > the place or one of its "parents" occurred more recently than a move out of it. This does not
     /// > consider indirect assignments.
     Drop { place: Place, target: BasicBlockId, unwind: Option<BasicBlockId> },
-
-    /// Drops the place and assigns a new value to it.
-    ///
-    /// This first performs the exact same operation as the pre drop-elaboration `Drop` terminator;
-    /// it then additionally assigns the `value` to the `place` as if by an assignment statement.
-    /// This assignment occurs both in the unwind and the regular code paths. The semantics are best
-    /// explained by the elaboration:
-    ///
-    /// ```ignore (MIR)
-    /// BB0 {
-    ///   DropAndReplace(P <- V, goto BB1, unwind BB2)
-    /// }
-    /// ```
-    ///
-    /// becomes
-    ///
-    /// ```ignore (MIR)
-    /// BB0 {
-    ///   Drop(P, goto BB1, unwind BB2)
-    /// }
-    /// BB1 {
-    ///   // P is now uninitialized
-    ///   P <- V
-    /// }
-    /// BB2 {
-    ///   // P is now uninitialized -- its dtor panicked
-    ///   P <- V
-    /// }
-    /// ```
-    ///
-    /// Disallowed after drop elaboration.
-    DropAndReplace {
-        place: Place,
-        value: Operand,
-        target: BasicBlockId,
-        unwind: Option<BasicBlockId>,
-    },
 
     /// Roughly speaking, evaluates the `func` operand and the arguments, and starts execution of
     /// the referred to function. The operand types must match the argument types of the function.
@@ -901,11 +868,11 @@ impl From<Operand> for Rvalue {
 pub enum CastKind {
     /// An exposing pointer to address cast. A cast between a pointer and an integer type, or
     /// between a function pointer and an integer type.
-    /// See the docs on `expose_addr` for more details.
-    PointerExposeAddress,
+    /// See the docs on `expose_provenance` for more details.
+    PointerExposeProvenance,
     /// An address-to-pointer cast that picks up an exposed provenance.
-    /// See the docs on `from_exposed_addr` for more details.
-    PointerFromExposedAddress,
+    /// See the docs on `with_exposed_provenance` for more details.
+    PointerWithExposedProvenance,
     /// All sorts of pointer-to-pointer casts. Note that reference-to-raw-ptr casts are
     /// translated into `&raw mut/const *r`, i.e., they are not actually casts.
     PtrToPtr,
@@ -918,6 +885,8 @@ pub enum CastKind {
     FloatToFloat,
     IntToFloat,
     FnPtrToPtr,
+    /// Reinterpret the bits of the input as a different type.
+    Transmute,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -950,8 +919,7 @@ pub enum Rvalue {
     ///
     /// **Needs clarification**: Are there weird additional semantics here related to the runtime
     /// nature of this operation?
-    // ThreadLocalRef(DefId),
-    ThreadLocalRef(std::convert::Infallible),
+    ThreadLocalRef(StaticId),
 
     /// Creates a pointer with the indicated mutability to the place.
     ///
@@ -1145,7 +1113,7 @@ impl MirBody {
                                 }
                             }
                             Rvalue::AddressOf(_, p) => f(p, &mut self.projection_store),
-                            Rvalue::ThreadLocalRef(n) => match *n {},
+                            Rvalue::ThreadLocalRef(_) => (),
                         }
                     }
                     StatementKind::FakeRead(p)
@@ -1173,10 +1141,6 @@ impl MirBody {
                     | TerminatorKind::Unreachable => (),
                     TerminatorKind::Drop { place, .. } => {
                         f(place, &mut self.projection_store);
-                    }
-                    TerminatorKind::DropAndReplace { place, value, .. } => {
-                        f(place, &mut self.projection_store);
-                        for_operand(value, &mut f, &mut self.projection_store);
                     }
                     TerminatorKind::Call { func, args, destination, .. } => {
                         for_operand(func, &mut f, &mut self.projection_store);
