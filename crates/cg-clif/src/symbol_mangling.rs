@@ -8,6 +8,7 @@
 //! `dyn Trait` / fn-pointer encoding, punycode, trait-impl paths (`X`),
 //! closure/coroutine encoding.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use base_db::Crate;
@@ -22,12 +23,17 @@ use hir_ty::next_solver::Mutability;
 // ---------------------------------------------------------------------------
 
 /// Produce a v0-mangled symbol name for a monomorphic function instance.
+///
+/// `ext_crate_disambiguators` maps crate names to their real disambiguator
+/// values extracted from sysroot rlibs. For local crates (not in the map),
+/// the FileId index is used as the disambiguator.
 pub fn mangle_function(
     db: &dyn HirDatabase,
     func_id: FunctionId,
     generic_args: GenericArgs<'_>,
+    ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> String {
-    let mut m = SymbolMangler { db, out: String::from("_R") };
+    let mut m = SymbolMangler { db, out: String::from("_R"), ext_crate_disambiguators };
 
     let container = func_id.loc(db).container;
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
@@ -72,6 +78,7 @@ pub fn mangle_function(
 struct SymbolMangler<'a> {
     db: &'a dyn HirDatabase,
     out: String,
+    ext_crate_disambiguators: &'a HashMap<String, u64>,
 }
 
 impl<'a> SymbolMangler<'a> {
@@ -106,17 +113,24 @@ impl<'a> SymbolMangler<'a> {
 
     fn print_crate(&mut self, krate: Crate) {
         self.out.push('C');
-        // Disambiguator: hash crate root FileId (internally consistent).
-        let root_file = krate.data(self.db).root_file_id;
-        let dis = root_file.index() as u64;
-        self.push_disambiguator(dis);
         // Crate name
         let extra = krate.extra_data(self.db);
+        let root_file = krate.data(self.db).root_file_id;
+        let file_dis = root_file.index() as u64;
         let name = extra
             .display_name
             .as_ref()
             .map(|dn| dn.crate_name().to_string())
-            .unwrap_or_else(|| format!("crate{}", dis));
+            .unwrap_or_else(|| format!("crate{}", file_dis));
+
+        // Use real disambiguator from rlib symbols for external crates,
+        // fall back to FileId index for local crates.
+        let dis = if let Some(&ext_dis) = self.ext_crate_disambiguators.get(&name) {
+            ext_dis
+        } else {
+            file_dis
+        };
+        self.push_disambiguator(dis);
         self.push_ident(&name);
     }
 
@@ -323,6 +337,16 @@ fn push_integer_62(x: u64, output: &mut String) {
         base_62_encode(x, output);
     }
     output.push('_');
+}
+
+/// Push a v0 disambiguator encoding to `output`.
+/// Public so the allocator shim generator can produce correct mangled names.
+pub fn push_disambiguator_raw(output: &mut String, dis: u64) {
+    // Same as push_opt_integer_62("s", dis):
+    if let Some(x) = dis.checked_sub(1) {
+        output.push('s');
+        push_integer_62(x, output);
+    }
 }
 
 fn push_ident(ident: &str, output: &mut String) {

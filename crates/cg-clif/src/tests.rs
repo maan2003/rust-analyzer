@@ -216,7 +216,8 @@ fn get_target_data_layout(db: &TestDB, func_id: hir_def::FunctionId) -> triomphe
 fn mangled_name(db: &TestDB, func_id: hir_def::FunctionId) -> String {
     let interner = DbInterner::new_no_crate(db);
     let generic_args = GenericArgs::empty(interner);
-    symbol_mangling::mangle_function(db, func_id, generic_args)
+    let empty_map = std::collections::HashMap::new();
+    symbol_mangling::mangle_function(db, func_id, generic_args, &empty_map)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +242,8 @@ fn foo() -> i32 {
         let fn_name = mangled_name(&db, func_id);
 
         let obj_bytes =
-            crate::compile_to_object(&db, &dl, &env, &body, &fn_name).expect("compilation failed");
+            crate::compile_to_object(&db, &dl, &env, &body, &fn_name, func_id.krate(&db))
+                .expect("compilation failed");
 
         // Verify we got a non-empty object file
         assert!(!obj_bytes.is_empty(), "object file should not be empty");
@@ -269,7 +271,8 @@ fn compile_fn_to_object(src: &str) -> Vec<u8> {
         let fn_name = mangled_name(&db, func_id);
 
         let obj_bytes =
-            crate::compile_to_object(&db, &dl, &env, &body, &fn_name).expect("compilation failed");
+            crate::compile_to_object(&db, &dl, &env, &body, &fn_name, func_id.krate(&db))
+                .expect("compilation failed");
         assert!(!obj_bytes.is_empty());
 
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
@@ -300,12 +303,17 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
     attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
         let isa = crate::build_host_isa(false);
+        let empty_map = std::collections::HashMap::new();
 
         let mut jit_builder =
             cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
+
+        // Use the first function's crate as local_crate (all test fns are in same crate)
+        let first_func = find_fn(&db, file_id, fn_names[0]);
+        let local_crate = first_func.krate(&db);
 
         for &name in fn_names {
             let func_id = find_fn(&db, file_id, name);
@@ -322,6 +330,8 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
                 &body,
                 &fn_name,
                 cranelift_module::Linkage::Export,
+                local_crate,
+                &empty_map,
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
         }
@@ -358,6 +368,7 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
     attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
         let isa = crate::build_host_isa(true);
+        let empty_map = std::collections::HashMap::new();
 
         let builder = cranelift_object::ObjectBuilder::new(
             isa.clone(),
@@ -366,6 +377,9 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
         )
         .expect("ObjectBuilder");
         let mut module = cranelift_object::ObjectModule::new(builder);
+
+        let first_func = find_fn(&db, file_id, fn_names[0]);
+        let local_crate = first_func.krate(&db);
 
         let mut mangled_names = Vec::new();
         for &name in fn_names {
@@ -383,6 +397,8 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
                 &body,
                 &fn_name,
                 cranelift_module::Linkage::Export,
+                local_crate,
+                &empty_map,
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
             mangled_names.push(fn_name);
@@ -955,7 +971,8 @@ fn mangle_fn(src: &str, name: &str) -> String {
         let func_id = find_fn(&db, file_id, name);
         let interner = DbInterner::new_no_crate(&db);
         let generic_args = GenericArgs::empty(interner);
-        symbol_mangling::mangle_function(&db, func_id, generic_args)
+        let empty_map = std::collections::HashMap::new();
+        symbol_mangling::mangle_function(&db, func_id, generic_args, &empty_map)
     })
 }
 
@@ -1234,4 +1251,26 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 42);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-crate calls into std
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compile_and_run_std_exit() {
+    let code = compile_and_run(
+        r#"
+//- /std.rs crate:std
+pub mod process {
+    pub fn exit(code: i32) -> ! { loop {} }
+}
+//- /main.rs crate:main deps:std
+fn main() -> ! {
+    std::process::exit(42)
+}
+"#,
+        "std_exit",
+    );
+    assert_eq!(code, 42);
 }

@@ -3,6 +3,8 @@
 //! Translates r-a's MIR representation to Cranelift IR and emits object files
 //! via cranelift-object. Based on patterns from cg_clif (rustc's Cranelift backend).
 
+use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,7 +16,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{CallableDefId, ItemContainerId, Lookup, VariantId};
+use hir_def::{CallableDefId, HasModule, ItemContainerId, Lookup, VariantId};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
@@ -86,6 +88,11 @@ struct FunctionCx<'a, M: Module> {
     db: &'a dyn HirDatabase,
     dl: &'a TargetDataLayout,
     env: StoredParamEnvAndCrate,
+
+    /// The crate being compiled (used to detect cross-crate calls).
+    local_crate: base_db::Crate,
+    /// Crate name → disambiguator from sysroot rlib symbols.
+    ext_crate_disambiguators: &'a HashMap<String, u64>,
 
     /// MIR basic block → Cranelift block
     block_map: ArenaMap<BasicBlockId, Block>,
@@ -1405,6 +1412,7 @@ fn codegen_direct_call(
         callee_func_id.loc(fx.db).container,
         ItemContainerId::ExternBlockId(_)
     );
+    let is_cross_crate = callee_func_id.krate(fx.db) != fx.local_crate;
 
     let (callee_sig, callee_name) = if is_extern {
         // Extern functions: build signature from type info, use raw symbol name
@@ -1412,15 +1420,32 @@ fn codegen_direct_call(
             .expect("extern fn sig");
         let name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
         (sig, name)
+    } else if is_cross_crate {
+        // Cross-crate Rust functions: build signature from type info,
+        // use v0 mangled name with real disambiguator from rlib
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+            .expect("cross-crate fn sig");
+        let name = symbol_mangling::mangle_function(
+            fx.db,
+            callee_func_id,
+            generic_args,
+            fx.ext_crate_disambiguators,
+        );
+        (sig, name)
     } else {
-        // Regular functions: build signature from MIR, use v0 mangled name
+        // Local functions: build signature from MIR, use v0 mangled name
         let callee_body = fx
             .db
             .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
             .expect("failed to get callee MIR");
         let sig =
             build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
-        let name = symbol_mangling::mangle_function(fx.db, callee_func_id, generic_args);
+        let name = symbol_mangling::mangle_function(
+            fx.db,
+            callee_func_id,
+            generic_args,
+            fx.ext_crate_disambiguators,
+        );
         (sig, name)
     };
 
@@ -1677,10 +1702,18 @@ fn build_fn_sig_from_ty(
         let ret_layout = db
             .layout_of_ty(output.store(), env.clone())
             .map_err(|e| format!("return type layout error: {:?}", e))?;
-        if let BackendRepr::Scalar(scalar) = ret_layout.backend_repr {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+        match ret_layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
+            }
+            _ => {
+                // ZST or Memory — no return params
+            }
         }
-        // ZST returns → no return param (already handled by not pushing)
     }
 
     // Parameter types
@@ -1688,12 +1721,18 @@ fn build_fn_sig_from_ty(
         let param_layout = db
             .layout_of_ty(param_ty.store(), env.clone())
             .map_err(|e| format!("param layout error: {:?}", e))?;
-        if let BackendRepr::Scalar(scalar) = param_layout.backend_repr {
-            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-        } else if param_layout.is_zst() {
-            // ZST params ignored
-        } else {
-            return Err("unsupported param type: non-scalar, non-ZST".into());
+        match param_layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
+            }
+            _ if param_layout.is_zst() => {}
+            _ => {
+                return Err("unsupported param type: non-scalar, non-ZST, non-pair".into());
+            }
         }
     }
 
@@ -1710,6 +1749,8 @@ pub fn compile_fn(
     body: &MirBody,
     fn_name: &str,
     linkage: Linkage,
+    local_crate: base_db::Crate,
+    ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> Result<FuncId, String> {
     let pointer_type = pointer_ty(dl);
     let sig = build_fn_sig(isa, db, dl, env, body)?;
@@ -1824,6 +1865,8 @@ pub fn compile_fn(
             db,
             dl,
             env: env.clone(),
+            local_crate,
+            ext_crate_disambiguators,
             block_map,
             local_map,
         };
@@ -1864,15 +1907,20 @@ pub fn compile_to_object(
     env: &StoredParamEnvAndCrate,
     body: &MirBody,
     fn_name: &str,
+    local_crate: base_db::Crate,
 ) -> Result<Vec<u8>, String> {
     let isa = build_host_isa(true);
+    let empty_map = HashMap::new();
 
     let builder =
         ObjectBuilder::new(isa.clone(), "rac_output", cranelift_module::default_libcall_names())
             .map_err(|e| format!("ObjectBuilder: {e}"))?;
     let mut module = ObjectModule::new(builder);
 
-    compile_fn(&mut module, &*isa, db, dl, env, body, fn_name, Linkage::Export)?;
+    compile_fn(
+        &mut module, &*isa, db, dl, env, body, fn_name, Linkage::Export,
+        local_crate, &empty_map,
+    )?;
 
     let product = module.finish();
     let bytes = product.emit().map_err(|e| format!("emit: {e}"))?;
@@ -1929,12 +1977,14 @@ pub fn emit_entry_point(
     Ok(())
 }
 
-/// Collect all non-extern, non-intrinsic functions reachable from `root` by
+/// Collect all non-extern, non-intrinsic, local functions reachable from `root` by
 /// walking MIR call terminators. Returns them in BFS order with `root` first.
+/// Cross-crate functions are skipped (they are already compiled in rlibs).
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     root: hir_def::FunctionId,
+    local_crate: base_db::Crate,
 ) -> Vec<hir_def::FunctionId> {
     use std::collections::{HashSet, VecDeque};
 
@@ -1959,6 +2009,11 @@ fn collect_reachable_fns(
 
         // Skip intrinsics (handled inline during codegen)
         if FunctionSignature::is_intrinsic(db, func_id) {
+            continue;
+        }
+
+        // Skip cross-crate functions (already compiled in rlibs)
+        if func_id.krate(db) != local_crate {
             continue;
         }
 
@@ -1987,6 +2042,210 @@ fn collect_reachable_fns(
     result
 }
 
+/// Emit the allocator shim symbols that the standard library expects.
+/// These are normally generated by `rustc`'s codegen backend.
+/// The symbols are v0-mangled names in the `__rustc` crate.
+fn emit_allocator_shim(
+    module: &mut ObjectModule,
+    isa: &dyn TargetIsa,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> Result<(), String> {
+    let ptr_ty = module.target_config().pointer_type();
+
+    // Get the __rustc crate disambiguator to construct the correct mangled names.
+    // Note: the crate name is "__rustc" (2 underscores), but in mangled form it
+    // appears as "7___rustc" (7 = length, first _ = separator since name starts with _).
+    let rustc_dis = ext_crate_disambiguators.get("__rustc").copied().unwrap_or(0);
+
+    // Build the mangled prefix: _RNvC + disambiguator + ident("__rustc")
+    // The crate name "__rustc" starts with '_', so it needs a '_' separator:
+    // length=7, '_' separator, then "__rustc" → "7___rustc"
+    let prefix = {
+        let mut s = String::from("_RNvC");
+        symbol_mangling::push_disambiguator_raw(&mut s, rustc_dis);
+        s.push_str("7___rustc");
+        s
+    };
+
+    // Helper to make a full mangled name for a symbol in __rustc.
+    // Function names like "__rust_alloc" start with '_', so they need a separator too.
+    let mangle = |raw_name: &str| -> String {
+        let mut s = prefix.clone();
+        // Encode as ident: length + '_' separator (name starts with '_') + name
+        write!(s, "{}_{}", raw_name.len(), raw_name).unwrap();
+        s
+    };
+
+    let alloc_sym = mangle("__rust_alloc");
+    let dealloc_sym = mangle("__rust_dealloc");
+    let realloc_sym = mangle("__rust_realloc");
+    let alloc_zeroed_sym = mangle("__rust_alloc_zeroed");
+    let no_shim_sym = mangle("__rust_no_alloc_shim_is_unstable_v2");
+
+    // __rust_alloc(size: usize, align: usize) -> *mut u8  →  malloc(size)
+    {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(ptr_ty)); // size
+        sig.params.push(AbiParam::new(ptr_ty)); // align
+        sig.returns.push(AbiParam::new(ptr_ty)); // ptr
+
+        let mut malloc_sig = Signature::new(isa.default_call_conv());
+        malloc_sig.params.push(AbiParam::new(ptr_ty)); // size
+        malloc_sig.returns.push(AbiParam::new(ptr_ty));
+
+        let func_id = module.declare_function(&alloc_sym, Linkage::Export, &sig)
+            .map_err(|e| format!("declare alloc: {e}"))?;
+        let malloc_id = module.declare_function("malloc", Linkage::Import, &malloc_sig)
+            .map_err(|e| format!("declare malloc: {e}"))?;
+
+        let mut func = cranelift_codegen::ir::Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()), sig,
+        );
+        let mut func_ctx = FunctionBuilderContext::new();
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        bcx.append_block_params_for_function_params(block);
+        let size = bcx.block_params(block)[0];
+        let malloc_ref = module.declare_func_in_func(malloc_id, bcx.func);
+        let call = bcx.ins().call(malloc_ref, &[size]);
+        let result = bcx.inst_results(call)[0];
+        bcx.ins().return_(&[result]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        module.define_function(func_id, &mut ctx).map_err(|e| format!("define alloc: {e}"))?;
+    }
+
+    // __rust_dealloc(ptr: *mut u8, size: usize, align: usize)  →  free(ptr)
+    {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(ptr_ty)); // ptr
+        sig.params.push(AbiParam::new(ptr_ty)); // size
+        sig.params.push(AbiParam::new(ptr_ty)); // align
+
+        let mut free_sig = Signature::new(isa.default_call_conv());
+        free_sig.params.push(AbiParam::new(ptr_ty));
+
+        let func_id = module.declare_function(&dealloc_sym, Linkage::Export, &sig)
+            .map_err(|e| format!("declare dealloc: {e}"))?;
+        let free_id = module.declare_function("free", Linkage::Import, &free_sig)
+            .map_err(|e| format!("declare free: {e}"))?;
+
+        let mut func = cranelift_codegen::ir::Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()), sig,
+        );
+        let mut func_ctx = FunctionBuilderContext::new();
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        bcx.append_block_params_for_function_params(block);
+        let ptr = bcx.block_params(block)[0];
+        let free_ref = module.declare_func_in_func(free_id, bcx.func);
+        bcx.ins().call(free_ref, &[ptr]);
+        bcx.ins().return_(&[]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        module.define_function(func_id, &mut ctx).map_err(|e| format!("define dealloc: {e}"))?;
+    }
+
+    // __rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8
+    //   → realloc(ptr, new_size)
+    {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(ptr_ty)); // ptr
+        sig.params.push(AbiParam::new(ptr_ty)); // old_size
+        sig.params.push(AbiParam::new(ptr_ty)); // align
+        sig.params.push(AbiParam::new(ptr_ty)); // new_size
+        sig.returns.push(AbiParam::new(ptr_ty));
+
+        let mut realloc_sig = Signature::new(isa.default_call_conv());
+        realloc_sig.params.push(AbiParam::new(ptr_ty));
+        realloc_sig.params.push(AbiParam::new(ptr_ty));
+        realloc_sig.returns.push(AbiParam::new(ptr_ty));
+
+        let func_id = module.declare_function(&realloc_sym, Linkage::Export, &sig)
+            .map_err(|e| format!("declare realloc: {e}"))?;
+        let realloc_id = module.declare_function("realloc", Linkage::Import, &realloc_sig)
+            .map_err(|e| format!("declare realloc import: {e}"))?;
+
+        let mut func = cranelift_codegen::ir::Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()), sig,
+        );
+        let mut func_ctx = FunctionBuilderContext::new();
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        bcx.append_block_params_for_function_params(block);
+        let ptr = bcx.block_params(block)[0];
+        let new_size = bcx.block_params(block)[3];
+        let realloc_ref = module.declare_func_in_func(realloc_id, bcx.func);
+        let call = bcx.ins().call(realloc_ref, &[ptr, new_size]);
+        let result = bcx.inst_results(call)[0];
+        bcx.ins().return_(&[result]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        module.define_function(func_id, &mut ctx).map_err(|e| format!("define realloc: {e}"))?;
+    }
+
+    // __rust_alloc_zeroed(size: usize, align: usize) -> *mut u8  →  calloc(1, size)
+    {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(ptr_ty)); // size
+        sig.params.push(AbiParam::new(ptr_ty)); // align
+        sig.returns.push(AbiParam::new(ptr_ty));
+
+        let mut calloc_sig = Signature::new(isa.default_call_conv());
+        calloc_sig.params.push(AbiParam::new(ptr_ty)); // nmemb
+        calloc_sig.params.push(AbiParam::new(ptr_ty)); // size
+        calloc_sig.returns.push(AbiParam::new(ptr_ty));
+
+        let func_id = module.declare_function(&alloc_zeroed_sym, Linkage::Export, &sig)
+            .map_err(|e| format!("declare alloc_zeroed: {e}"))?;
+        let calloc_id = module.declare_function("calloc", Linkage::Import, &calloc_sig)
+            .map_err(|e| format!("declare calloc: {e}"))?;
+
+        let mut func = cranelift_codegen::ir::Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()), sig,
+        );
+        let mut func_ctx = FunctionBuilderContext::new();
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        bcx.append_block_params_for_function_params(block);
+        let size = bcx.block_params(block)[0];
+        let one = bcx.ins().iconst(ptr_ty, 1);
+        let calloc_ref = module.declare_func_in_func(calloc_id, bcx.func);
+        let call = bcx.ins().call(calloc_ref, &[one, size]);
+        let result = bcx.inst_results(call)[0];
+        bcx.ins().return_(&[result]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        module.define_function(func_id, &mut ctx).map_err(|e| format!("define alloc_zeroed: {e}"))?;
+    }
+
+    // __rust_no_alloc_shim_is_unstable_v2 — a global byte set to 0
+    {
+        let data_id = module.declare_data(&no_shim_sym, Linkage::Export, false, false)
+            .map_err(|e| format!("declare no_alloc_shim: {e}"))?;
+        let mut data = cranelift_module::DataDescription::new();
+        data.define_zeroinit(1);
+        module.define_data(data_id, &data).map_err(|e| format!("define no_alloc_shim: {e}"))?;
+    }
+
+    // Note: __rust_alloc_error_handler is already defined in std's rlib,
+    // so we don't emit it here.
+
+    Ok(())
+}
+
 /// Compile a crate to an executable: discover reachable functions from main,
 /// compile them all, emit entry point, link.
 pub fn compile_executable(
@@ -2000,22 +2259,32 @@ pub fn compile_executable(
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
     let empty_args = GenericArgs::empty(interner);
 
+    // Extract real crate disambiguators from sysroot rlibs
+    let ext_crate_disambiguators = link::extract_crate_disambiguators(
+        &link::find_target_libdir()?,
+    )?;
+    let local_crate = main_func_id.krate(db);
+
     let builder =
         ObjectBuilder::new(isa.clone(), "rac_output", cranelift_module::default_libcall_names())
             .map_err(|e| format!("ObjectBuilder: {e}"))?;
     let mut module = ObjectModule::new(builder);
 
-    // Discover and compile all reachable functions
-    let reachable = collect_reachable_fns(db, env, main_func_id);
+    // Discover and compile all reachable local functions
+    let reachable = collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 
     for &func_id in &reachable {
         let body = db
             .monomorphized_mir_body(func_id.into(), empty_args.store(), env.clone())
             .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
-        let fn_name = symbol_mangling::mangle_function(db, func_id, empty_args);
-        let func_clif_id =
-            compile_fn(&mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export)?;
+        let fn_name = symbol_mangling::mangle_function(
+            db, func_id, empty_args, &ext_crate_disambiguators,
+        );
+        let func_clif_id = compile_fn(
+            &mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export,
+            local_crate, &ext_crate_disambiguators,
+        )?;
 
         if func_id == main_func_id {
             user_main_id = Some(func_clif_id);
@@ -2024,6 +2293,7 @@ pub fn compile_executable(
 
     let user_main_id = user_main_id.expect("main not in reachable functions");
     emit_entry_point(&mut module, &*isa, user_main_id)?;
+    emit_allocator_shim(&mut module, &*isa, &ext_crate_disambiguators)?;
 
     // Emit object file to a temp path
     let product = module.finish();
