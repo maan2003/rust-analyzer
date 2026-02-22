@@ -565,17 +565,37 @@ pub mod ptr {
     mod ptr_offset_intrinsics {
         #[rustc_intrinsic]
         pub fn offset<T>(dst: *const T, offset: isize) -> *const T;
+        #[rustc_intrinsic]
+        pub fn ptr_offset_from<T>(ptr: *const T, base: *const T) -> isize;
+        #[rustc_intrinsic]
+        pub fn ptr_offset_from_unsigned<T>(ptr: *const T, base: *const T) -> usize;
     }
 
     impl<T: crate::marker::PointeeSized> *const T {
         pub unsafe fn offset(self, count: isize) -> *const T {
             unsafe { ptr_offset_intrinsics::offset(self, count) }
         }
+
+        pub unsafe fn offset_from(self, origin: *const T) -> isize {
+            unsafe { ptr_offset_intrinsics::ptr_offset_from(self, origin) }
+        }
+
+        pub unsafe fn offset_from_unsigned(self, origin: *const T) -> usize {
+            unsafe { ptr_offset_intrinsics::ptr_offset_from_unsigned(self, origin) }
+        }
     }
 
     impl<T: crate::marker::PointeeSized> *mut T {
         pub unsafe fn offset(self, count: isize) -> *mut T {
             unsafe { ptr_offset_intrinsics::offset(self as *const T, count) as *mut T }
+        }
+
+        pub unsafe fn offset_from(self, origin: *const T) -> isize {
+            unsafe { ptr_offset_intrinsics::ptr_offset_from(self as *const T, origin) }
+        }
+
+        pub unsafe fn offset_from_unsigned(self, origin: *const T) -> usize {
+            unsafe { ptr_offset_intrinsics::ptr_offset_from_unsigned(self as *const T, origin) }
         }
     }
     // endregion:ptr_offset

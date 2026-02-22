@@ -759,6 +759,102 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn jit_pointer_offset_scales_by_pointee_size() {
+    let result = jit_run::<usize>(
+        r#"
+extern "rust-intrinsic" {
+    pub fn offset<Ptr, Delta>(dst: Ptr, offset: Delta) -> Ptr;
+}
+
+fn foo() -> usize {
+    let p = 0x1000usize as *const i32;
+    let q = unsafe { offset(p, 2isize) };
+    q as usize - p as usize
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 8);
+}
+
+#[test]
+fn compile_pointer_offset_method_via_minicore() {
+    compile_fn_to_object(
+        r#"
+//- minicore: ptr_offset
+//- /main.rs
+fn foo() -> usize {
+    let p = 0x1000usize as *const i32;
+    let q = unsafe { p.offset(2) };
+    q as usize - p as usize
+}
+"#,
+    );
+}
+
+#[test]
+fn jit_pointer_arith_offset_signed() {
+    let result = jit_run::<usize>(
+        r#"
+extern "rust-intrinsic" {
+    pub fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;
+}
+
+fn foo() -> usize {
+    let p = 0x1000usize as *const i32;
+    let q = unsafe { arith_offset(arith_offset(p, 3), -1) };
+    q as usize - p as usize
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 8);
+}
+
+#[test]
+fn jit_pointer_offset_from_intrinsics() {
+    let result = jit_run::<isize>(
+        r#"
+extern "rust-intrinsic" {
+    pub fn ptr_offset_from<T>(ptr: *const T, base: *const T) -> isize;
+    pub fn ptr_offset_from_unsigned<T>(ptr: *const T, base: *const T) -> usize;
+}
+
+fn foo() -> isize {
+    let base = 0x1000usize as *const i32;
+    let ptr = 0x1018usize as *const i32;
+    let r1 = unsafe { ptr_offset_from(ptr, base) };
+    let r2 = unsafe { ptr_offset_from(base, ptr) };
+    let r3 = unsafe { ptr_offset_from_unsigned(ptr, base) } as isize;
+    r3 * 100 + r1 * 10 + r2
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 654);
+}
+
+#[test]
+fn compile_pointer_offset_from_methods_via_minicore() {
+    compile_fn_to_object(
+        r#"
+//- minicore: ptr_offset
+//- /main.rs
+fn foo() -> isize {
+    let base = 0x1000usize as *const i32;
+    let ptr = 0x1018usize as *const i32;
+    let r1 = unsafe { ptr.offset_from(base) };
+    let r2 = unsafe { ptr.offset_from_unsigned(base) } as isize;
+    r2 * 10 + r1
+}
+"#,
+    );
+}
+
+#[test]
 fn jit_bitwise_ops() {
     let result = jit_run::<u32>(
         r#"

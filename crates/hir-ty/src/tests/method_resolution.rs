@@ -38,6 +38,21 @@ fn test(p: *const i32) {
 }
 
 #[test]
+fn resolve_raw_ptr_offset_from_methods_from_minicore() {
+    check_types(
+        r#"
+//- minicore: ptr_offset
+fn test(base: *const i32, ptr: *const i32) {
+    let _a = unsafe { ptr.offset_from(base) };
+                    //^^^^^^^^^^^^^^^^^^^^^ isize
+    let _b = unsafe { ptr.offset_from_unsigned(base) };
+                    //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ usize
+}
+        "#,
+    );
+}
+
+#[test]
 fn cross_crate_primitive_method() {
     check_types(
         r#"

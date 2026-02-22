@@ -14,6 +14,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::CallableDefId;
+use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, Rvalue,
@@ -626,6 +627,10 @@ fn codegen_direct_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
+    if codegen_intrinsic_call(fx, body, callee_func_id, args, destination, target) {
+        return;
+    }
+
     // Get callee MIR to determine its signature
     let callee_body = fx
         .db
@@ -669,20 +674,118 @@ fn codegen_direct_call(
     let call = fx.bcx.ins().call(callee_ref, &call_args);
 
     // Store return value
-    assert!(destination.projection.is_empty(), "call destination projections not yet supported");
     let results = fx.bcx.inst_results(call);
-    match fx.local_storage(destination.local) {
-        LocalStorage::Zst => {}
-        LocalStorage::Var(var, _) => {
-            fx.bcx.def_var(*var, results[0]);
-        }
-    }
+    write_call_destination(fx, destination, results.get(0).copied());
 
     // Jump to continuation block
     if let Some(target) = target {
         let block = fx.clif_block(*target);
         fx.bcx.ins().jump(block, &[]);
     }
+}
+
+fn write_call_destination(
+    fx: &mut FunctionCx<'_, impl Module>,
+    destination: &Place,
+    result: Option<Value>,
+) {
+    assert!(
+        destination.projection.is_empty(),
+        "call destination projections not yet supported"
+    );
+    match fx.local_storage(destination.local) {
+        LocalStorage::Zst => {}
+        LocalStorage::Var(var, _) => {
+            if let Some(val) = result {
+                fx.bcx.def_var(*var, val);
+            }
+        }
+    }
+}
+
+fn codegen_intrinsic_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    callee_func_id: hir_def::FunctionId,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) -> bool {
+    if !FunctionSignature::is_intrinsic(fx.db, callee_func_id) {
+        return false;
+    }
+
+    let sig = fx.db.function_signature(callee_func_id);
+    let name = sig.name.as_str();
+    let result = match name {
+        "offset" | "arith_offset" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+
+            let ptr = codegen_operand(fx, body, &args[0].kind);
+            let offset = codegen_operand(fx, body, &args[1].kind);
+
+            let ptr_ty = operand_ty(body, &args[0].kind);
+            let pointee_ty = ptr_ty
+                .as_ref()
+                .builtin_deref(true)
+                .expect("offset intrinsic first argument must be a pointer");
+            let pointee_layout = fx
+                .db
+                .layout_of_ty(pointee_ty.store(), fx.env.clone())
+                .expect("layout error for offset intrinsic pointee");
+
+            let ptr_clif_ty = fx.bcx.func.dfg.value_type(ptr);
+            let offset_clif_ty = fx.bcx.func.dfg.value_type(offset);
+            let offset_signed = ty_is_signed_int(operand_ty(body, &args[1].kind));
+            let offset = if offset_clif_ty == ptr_clif_ty {
+                offset
+            } else if ptr_clif_ty.wider_or_equal(offset_clif_ty) {
+                if offset_signed {
+                    fx.bcx.ins().sextend(ptr_clif_ty, offset)
+                } else {
+                    fx.bcx.ins().uextend(ptr_clif_ty, offset)
+                }
+            } else {
+                fx.bcx.ins().ireduce(ptr_clif_ty, offset)
+            };
+
+            let byte_offset = fx.bcx.ins().imul_imm(offset, pointee_layout.size.bytes() as i64);
+            Some(fx.bcx.ins().iadd(ptr, byte_offset))
+        }
+        "ptr_offset_from" | "ptr_offset_from_unsigned" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+
+            let ptr = codegen_operand(fx, body, &args[0].kind);
+            let base = codegen_operand(fx, body, &args[1].kind);
+
+            let ptr_ty = operand_ty(body, &args[0].kind);
+            let pointee_ty = ptr_ty
+                .as_ref()
+                .builtin_deref(true)
+                .expect("ptr_offset_from first argument must be a pointer");
+            let pointee_layout = fx
+                .db
+                .layout_of_ty(pointee_ty.store(), fx.env.clone())
+                .expect("layout error for ptr_offset_from intrinsic pointee");
+            let pointee_size = pointee_layout.size.bytes();
+            assert!(pointee_size != 0, "ptr_offset_from on ZST pointee is unsupported");
+
+            let diff_bytes = fx.bcx.ins().isub(ptr, base);
+            if name == "ptr_offset_from_unsigned" {
+                Some(fx.bcx.ins().udiv_imm(diff_bytes, pointee_size as i64))
+            } else {
+                Some(fx.bcx.ins().sdiv_imm(diff_bytes, pointee_size as i64))
+            }
+        }
+        _ => return false,
+    };
+
+    write_call_destination(fx, destination, result);
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

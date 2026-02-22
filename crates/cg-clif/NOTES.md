@@ -24,6 +24,8 @@ What works:
   args/returns). Resolves callee via TyKind::FnDef → CallableDefId,
   gets callee MIR, builds Cranelift sig, declares in module, emits call.
   ZST args filtered. Tested with call chains and calls combined with branches.
+  Includes direct lowering of pointer intrinsics used by raw-pointer methods:
+  `offset`, `arith_offset`, `ptr_offset_from`, `ptr_offset_from_unsigned`.
 - `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
 
 ## Upstream comparison (`./cg_clif`)
@@ -36,6 +38,9 @@ Recently aligned with upstream:
   libcalls (`fmodf`/`fmod`) from Cranelift codegen.
 - **Pointer `Offset` scaling now matches upstream** — we now multiply the
   offset by `pointee_size` before adding to the base pointer.
+- **Pointer distance intrinsics match upstream behavior** — we now lower
+  `ptr_offset_from` and `ptr_offset_from_unsigned` as pointer subtraction
+  divided by pointee size, consistent with `cg_clif/src/intrinsics/mod.rs`.
 
 Still diverges from upstream:
 - **Pointer coercion casts are incomplete** — upstream handles
@@ -60,6 +65,11 @@ Known bugs (divergence from upstream cg_clif):
   scalars or ZST. Upstream has `PassMode::Indirect` (pass-by-pointer for
   large structs), `PassMode::Pair` (scalar pairs like slices),
   `PassMode::Uniform`. Struct args/returns will produce wrong ABI.
+- **JIT helper compiles only explicitly listed roots** — calls from a tested
+  function into other local functions not listed in `jit_run(..., fn_names, ...)`
+  remain unresolved at runtime (`can't resolve symbol ...`). This especially
+  affects source-level minicore method calls (e.g. raw-pointer inherent methods)
+  unless tests use direct intrinsic calls or object-only compile checks.
 
 What's missing:
 - `CValue`/`CPlace` abstractions (currently using raw Cranelift `Value`)
