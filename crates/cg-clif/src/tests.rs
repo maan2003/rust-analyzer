@@ -1030,6 +1030,10 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 
 /// Helper: compile source to an executable, run it, return the exit code.
+///
+/// Uses disambiguators from `.mirdata` if available (via `RA_MIRDATA` env var
+/// or default sysroot location). Falls back to an empty map for tests that
+/// don't make cross-crate calls.
 fn compile_and_run(src: &str, test_name: &str) -> i32 {
     let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
@@ -1043,8 +1047,11 @@ fn compile_and_run(src: &str, test_name: &str) -> i32 {
         std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
         let output_path = tmp_dir.join(test_name);
 
+        // Try to load .mirdata; fall back to empty map for non-cross-crate tests
+        let disambiguators = crate::link::extract_crate_disambiguators()
+            .unwrap_or_default();
         let result = crate::compile_executable(
-            &db, &dl, &env, func_id, &output_path,
+            &db, &dl, &env, func_id, &output_path, &disambiguators,
         );
 
         let cleanup = || {

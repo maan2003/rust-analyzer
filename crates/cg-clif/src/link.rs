@@ -4,10 +4,23 @@
 //! The `.so` contains core, alloc, std, and the allocator shim — no need for
 //! rlib linking, `--start-group`, or allocator shim generation.
 //! Hardcoded for Linux x86_64 for now.
+//!
+//! Crate disambiguators are loaded from `.mirdata` files produced by
+//! `ra-mir-export`, which extracts `StableCrateId` from sysroot rlibs via
+//! a rustc driver.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+/// Crate name + StableCrateId, matching the format produced by `ra-mir-export`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CrateInfo {
+    pub name: String,
+    pub stable_crate_id: u64,
+}
 
 /// Get the target library directory from the host `rustc`.
 pub fn find_target_libdir() -> Result<PathBuf, String> {
@@ -80,164 +93,66 @@ pub fn link_executable(obj_path: &Path, output_path: &Path) -> Result<(), String
 }
 
 // ---------------------------------------------------------------------------
-// Crate disambiguator extraction from libstd.so symbols
+// Crate disambiguator loading from .mirdata files
 // ---------------------------------------------------------------------------
 
-/// Decode a base-62 encoded string (reverse of `base_62_encode` in symbol_mangling.rs).
-fn base_62_decode(s: &str) -> u64 {
-    s.bytes().fold(0u64, |acc, c| {
-        let d = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'z' => c - b'a' + 10,
-            b'A'..=b'Z' => c - b'A' + 36,
-            _ => panic!("invalid base-62 digit: {}", c as char),
-        };
-        acc * 62 + d as u64
-    })
-}
+/// Load crate disambiguators from a `.mirdata` file produced by `ra-mir-export`.
+///
+/// Returns a map of crate name → StableCrateId (as u64).
+pub fn load_crate_disambiguators(mirdata_path: &Path) -> Result<HashMap<String, u64>, String> {
+    let data = std::fs::read(mirdata_path)
+        .map_err(|e| format!("failed to read {}: {e}", mirdata_path.display()))?;
 
-/// Try to parse a crate root marker `C` at position `pos` in a v0 symbol (after `_R` prefix).
-/// Returns `(crate_name, disambiguator)` if successful.
-fn try_parse_crate_at(rest: &str, pos: usize) -> Option<(String, u64)> {
-    let after_c = &rest[pos + 1..];
-
-    let (dis, after_dis) = if after_c.starts_with('s') {
-        // Disambiguator present: 's' + integer_62
-        // integer_62 encoding: 0 → "_", n > 0 → base62(n-1) + "_"
-        // push_disambiguator(D) calls push_opt_integer_62("s", D) which
-        // writes "s" + integer_62(D-1). So: D = decode_integer_62(...) + 1.
-        let after_s = &after_c[1..];
-        let underscore = after_s.find('_')?;
-        let dis_str = &after_s[..underscore];
-        // Validate all chars are base-62 digits
-        if !dis_str.bytes().all(|c| c.is_ascii_alphanumeric()) {
-            return None;
-        }
-        // Reverse integer_62: empty → 0, non-empty → base_62_decode + 1
-        let integer_62_val = if dis_str.is_empty() {
-            0
-        } else {
-            base_62_decode(dis_str) + 1
-        };
-        // Reverse push_opt_integer_62: D = integer_62_val + 1
-        let dis = integer_62_val + 1;
-        (dis, &after_s[underscore + 1..])
-    } else if after_c.starts_with(|c: char| c.is_ascii_digit()) {
-        // No 's' — disambiguator is 0, next must be a digit (start of ident length)
-        (0, after_c)
-    } else {
-        return None;
-    };
-
-    // Parse ident: decimal length followed by the name
-    let digit_end = after_dis
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_dis.len());
-    if digit_end == 0 {
-        return None;
-    }
-    let len: usize = after_dis[..digit_end].parse().ok()?;
-    let mut name_start = digit_end;
-    // Handle optional '_' separator (when ident starts with '_' or digit)
-    if after_dis[name_start..].starts_with('_') {
-        name_start += 1;
-    }
-    if name_start + len > after_dis.len() {
-        return None;
-    }
-    let name = &after_dis[name_start..name_start + len];
-    Some((name.to_owned(), dis))
-}
-
-/// Find the disambiguator for a specific crate name in a v0 mangled symbol.
-/// Scans all `C` markers in the symbol to find one matching the target crate name.
-fn find_crate_disambiguator(symbol: &str, target_crate: &str) -> Option<u64> {
-    let rest = symbol.strip_prefix("_R")?;
-
-    for (pos, _) in rest.char_indices().filter(|&(_, c)| c == 'C') {
-        if let Some((name, dis)) = try_parse_crate_at(rest, pos) {
-            if name == target_crate {
-                return Some(dis);
-            }
-        }
-    }
-    None
-}
-
-/// Scan `libstd-*.so` dynamic symbols to extract crate name → disambiguator mapping.
-/// The single .so contains symbols from core, alloc, std, and __rustc.
-pub fn extract_crate_disambiguators(libdir: &Path) -> Result<HashMap<String, u64>, String> {
-    use object::{Object, ObjectSymbol};
-
-    let so_path = find_libstd_so(libdir)?;
-    let data = std::fs::read(&so_path)
-        .map_err(|e| format!("failed to read {}: {e}", so_path.display()))?;
-    let obj = object::read::File::parse(&*data)
-        .map_err(|e| format!("failed to parse {}: {e}", so_path.display()))?;
+    let infos: Vec<CrateInfo> = postcard::from_bytes(&data)
+        .map_err(|e| format!("failed to deserialize {}: {e}", mirdata_path.display()))?;
 
     let mut map = HashMap::new();
-    // Crates we expect to find in the std .so
-    let target_crates = ["std", "core", "alloc", "__rustc"];
+    for info in infos {
+        map.insert(info.name, info.stable_crate_id);
+    }
+    Ok(map)
+}
 
-    for sym in obj.dynamic_symbols() {
-        let Ok(name) = sym.name() else { continue };
-        if !name.starts_with("_R") {
-            continue;
+/// Find the `.mirdata` file path.
+///
+/// Uses `RA_MIRDATA` environment variable, or looks for `sysroot.mirdata`
+/// next to the sysroot libdir.
+pub fn find_mirdata_path() -> Result<PathBuf, String> {
+    // Check environment variable first
+    if let Ok(path) = std::env::var("RA_MIRDATA") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
         }
-        for &crate_name in &target_crates {
-            if map.contains_key(crate_name) {
-                continue;
-            }
-            if let Some(dis) = find_crate_disambiguator(name, crate_name) {
-                map.insert(crate_name.to_owned(), dis);
-            }
-        }
-        if map.len() == target_crates.len() {
-            break;
-        }
+        return Err(format!("RA_MIRDATA set to {} but file does not exist", p.display()));
     }
 
-    Ok(map)
+    // Look next to the sysroot libdir
+    let libdir = find_target_libdir()?;
+    let mirdata = libdir.join("sysroot.mirdata");
+    if mirdata.exists() {
+        return Ok(mirdata);
+    }
+
+    Err(format!(
+        "no .mirdata file found. Run `ra-mir-export` to generate it, \
+         or set RA_MIRDATA environment variable.\n\
+         Looked at: {}",
+        mirdata.display()
+    ))
+}
+
+/// Load crate disambiguators from the `.mirdata` file.
+///
+/// Finds the mirdata file via `find_mirdata_path()` and deserializes it.
+pub fn extract_crate_disambiguators() -> Result<HashMap<String, u64>, String> {
+    let mirdata_path = find_mirdata_path()?;
+    load_crate_disambiguators(&mirdata_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn find_std_disambiguator() {
-        let sym = "_RNvNtCs6FpuVETr9fs_3std7process4exit";
-        let dis = find_crate_disambiguator(sym, "std").unwrap();
-        assert!(dis > 0, "std disambiguator should be non-zero, got {dis}");
-    }
-
-    #[test]
-    fn find_core_in_std_symbol() {
-        // Symbol from std rlib that references core
-        let sym = "_RINvMNtCsi96gERPWvbJ_4core3stre12trim_matchesNvMNtNtB5_4char7methodsc13is_whitespaceECs6FpuVETr9fs_3std";
-        let core_dis = find_crate_disambiguator(sym, "core").unwrap();
-        assert!(core_dis > 0);
-        let std_dis = find_crate_disambiguator(sym, "std").unwrap();
-        assert!(std_dis > 0);
-    }
-
-    #[test]
-    fn find_zero_disambiguator() {
-        let sym = "_RNvC4main4func";
-        let dis = find_crate_disambiguator(sym, "main").unwrap();
-        assert_eq!(dis, 0);
-    }
-
-    #[test]
-    fn base_62_roundtrip() {
-        assert_eq!(base_62_decode("0"), 0);
-        assert_eq!(base_62_decode("9"), 9);
-        assert_eq!(base_62_decode("a"), 10);
-        assert_eq!(base_62_decode("z"), 35);
-        assert_eq!(base_62_decode("A"), 36);
-        assert_eq!(base_62_decode("Z"), 61);
-        assert_eq!(base_62_decode("10"), 62);
-    }
 
     #[test]
     fn find_libstd_so_in_sysroot() {
@@ -247,10 +162,17 @@ mod tests {
     }
 
     #[test]
-    fn extract_disambiguators_from_sysroot() {
-        let libdir = find_target_libdir().expect("rustc not available");
-        let map = extract_crate_disambiguators(&libdir).expect("extraction failed");
-        assert!(map.contains_key("std"), "should find std crate, got keys: {:?}", map.keys().collect::<Vec<_>>());
-        assert!(map.contains_key("core"), "should find core crate, got keys: {:?}", map.keys().collect::<Vec<_>>());
+    fn mirdata_roundtrip() {
+        let infos = vec![
+            CrateInfo { name: "std".to_string(), stable_crate_id: 0x1234 },
+            CrateInfo { name: "core".to_string(), stable_crate_id: 0x5678 },
+        ];
+        let data = postcard::to_allocvec(&infos).expect("serialize");
+        let decoded: Vec<CrateInfo> = postcard::from_bytes(&data).expect("deserialize");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].name, "std");
+        assert_eq!(decoded[0].stable_crate_id, 0x1234);
+        assert_eq!(decoded[1].name, "core");
+        assert_eq!(decoded[1].stable_crate_id, 0x5678);
     }
 }

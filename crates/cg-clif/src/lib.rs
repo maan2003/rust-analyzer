@@ -2050,13 +2050,9 @@ pub fn compile_executable(
     env: &StoredParamEnvAndCrate,
     main_func_id: hir_def::FunctionId,
     output_path: &Path,
+    ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> Result<(), String> {
     let isa = build_host_isa(true);
-
-    // Extract real crate disambiguators from sysroot rlibs
-    let ext_crate_disambiguators = link::extract_crate_disambiguators(
-        &link::find_target_libdir()?,
-    )?;
     let local_crate = main_func_id.krate(db);
 
     let builder =
@@ -2073,11 +2069,11 @@ pub fn compile_executable(
             .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
             .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
         let fn_name = symbol_mangling::mangle_function(
-            db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
+            db, *func_id, generic_args.as_ref(), ext_crate_disambiguators,
         );
         let func_clif_id = compile_fn(
             &mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export,
-            local_crate, &ext_crate_disambiguators,
+            local_crate, ext_crate_disambiguators,
         )?;
 
         if *func_id == main_func_id {

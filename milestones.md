@@ -176,11 +176,10 @@ fn main() -> ! {
 Calls `std::process::exit` through v0-mangled symbol resolved from the
 real std rlib at link time. Required:
 
-- **Crate disambiguator extraction** (`link.rs`): scans archive symbol
-  tables of sysroot rlibs, parses v0 crate root markers (`Cs<base62>_`)
-  to build a crate name → disambiguator map. Uses rlib filename to know
-  which crate to look for. Temporary bridge until MIR export (M13+)
-  provides `StableCrateId` directly.
+- **Crate disambiguator extraction** (`link.rs`): loads `StableCrateId`
+  values from `.mirdata` files produced by `ra-mir-export`, a rustc
+  driver that extracts `StableCrateId` from sysroot crates. Maps crate
+  names to disambiguator values for v0 symbol mangling.
 - **Cross-crate call detection** (`lib.rs`): `codegen_direct_call` checks
   `func_id.krate(db) != local_crate`; cross-crate calls use type-based
   signatures (`build_fn_sig_from_ty`) and v0 mangled names with real
