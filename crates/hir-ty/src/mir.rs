@@ -54,7 +54,7 @@ use super::consteval::try_const_usize;
 pub type BasicBlockId = Idx<BasicBlock>;
 pub type LocalId = Idx<Local>;
 
-fn return_slot() -> LocalId {
+pub fn return_slot() -> LocalId {
     LocalId::from_raw(RawIdx::from(0))
 }
 
@@ -83,7 +83,7 @@ pub struct Local {
 /// validator.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Operand {
-    kind: OperandKind,
+    pub kind: OperandKind,
     // FIXME : This should actually just be of type `MirSpan`.
     span: Option<MirSpan>,
 }

@@ -1,0 +1,34 @@
+[package]
+name = "cg-clif"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# Cranelift
+cranelift-codegen = { version = "0.128.3", default-features = false, features = ["std", "timing", "unwind", "all-native-arch"] }
+cranelift-frontend = { version = "0.128.3" }
+cranelift-module = { version = "0.128.3" }
+cranelift-native = { version = "0.128.3" }
+cranelift-object = { version = "0.128.3" }
+target-lexicon = "0.13"
+object = { version = "0.37.3", default-features = false, features = ["std", "read_core", "write", "archive", "coff", "elf", "macho", "pe"] }
+
+# r-a crates
+hir-ty.path = "../hir-ty"
+hir-def.path = "../hir-def"
+rac-abi.path = "../rac-abi"
+rustc_abi = { package = "ra-ap-rustc_abi", version = "0.143" }
+intern.path = "../intern"
+
+[dev-dependencies]
+test-fixture.path = "../test-fixture"
+test-utils.path = "../test-utils"
+base-db.path = "../base-db"
+hir-expand.path = "../hir-expand"
+span.path = "../span"
+salsa = { version = "0.25.2", default-features = false, features = ["salsa_unstable"] }
+salsa-macros = "0.25.2"
+triomphe = { version = "0.1.14", default-features = false, features = ["std"] }

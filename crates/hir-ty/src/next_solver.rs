@@ -43,6 +43,7 @@ pub use ty::*;
 use crate::db::HirDatabase;
 pub use crate::lower::ImplTraitIdx;
 pub use rustc_ast_ir::Mutability;
+pub use rustc_type_ir::inherent::IntoKind;
 
 pub type Binder<'db, T> = rustc_type_ir::Binder<DbInterner<'db>, T>;
 pub type EarlyBinder<'db, T> = rustc_type_ir::EarlyBinder<DbInterner<'db>, T>;

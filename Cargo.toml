@@ -1,6 +1,6 @@
 [workspace]
-members = ["xtask/", "lib/*", "lib/ungrammar/ungrammar2json", "crates/*", "cg_clif"]
-exclude = ["crates/proc-macro-srv/proc-macro-test/imp"]
+members = ["xtask/", "lib/*", "lib/ungrammar/ungrammar2json", "crates/*"]
+exclude = ["crates/proc-macro-srv/proc-macro-test/imp", "cg_clif"]
 resolver = "2"
 
 [workspace.package]
