@@ -5,22 +5,24 @@
 
 use std::sync::Arc;
 
-use cranelift_codegen::ir::{
-    AbiParam, Block, InstBuilder, Signature, Type, Value, types,
-};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, Signature, Type, Value, types};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use hir_def::CallableDefId;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
-    BasicBlockId, LocalId, MirBody, OperandKind, Place, Rvalue, StatementKind, TerminatorKind,
+    BasicBlockId, BinOp, LocalId, MirBody, Operand, OperandKind, Place, Rvalue, StatementKind,
+    TerminatorKind, UnOp,
 };
-use hir_ty::next_solver::{Const, ConstKind, IntoKind};
+use hir_ty::next_solver::{Const, ConstKind, GenericArgs, IntoKind, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
-use rustc_abi::{BackendRepr, Scalar, Size, TargetDataLayout};
+use la_arena::ArenaMap;
+use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 
 mod pointer;
 
@@ -62,40 +64,35 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
 // FunctionCx: per-function codegen state
 // ---------------------------------------------------------------------------
 
-struct FunctionCx<'a> {
+struct FunctionCx<'a, M: Module> {
     bcx: FunctionBuilder<'a>,
+    module: &'a mut M,
+    isa: &'a dyn TargetIsa,
     pointer_type: Type,
     db: &'a dyn HirDatabase,
     dl: &'a TargetDataLayout,
     env: StoredParamEnvAndCrate,
 
     /// MIR basic block → Cranelift block
-    block_map: Vec<(BasicBlockId, Block)>,
-    /// MIR local → Cranelift variable (for scalar locals) or stack slot
-    local_vars: Vec<(LocalId, LocalStorage)>,
+    block_map: ArenaMap<BasicBlockId, Block>,
+    /// MIR local → Cranelift variable (for scalar locals) or ZST
+    local_map: ArenaMap<LocalId, LocalStorage>,
 }
 
 #[derive(Clone)]
 enum LocalStorage {
     Var(Variable, Type),
+    Zst,
     // Stack(StackSlot),
 }
 
-impl FunctionCx<'_> {
+impl<M: Module> FunctionCx<'_, M> {
     fn clif_block(&self, bb: BasicBlockId) -> Block {
-        self.block_map
-            .iter()
-            .find(|(id, _)| *id == bb)
-            .map(|(_, b)| *b)
-            .expect("block not found in block_map")
+        self.block_map[bb]
     }
 
     fn local_storage(&self, local: LocalId) -> &LocalStorage {
-        self.local_vars
-            .iter()
-            .find(|(id, _)| *id == local)
-            .map(|(_, s)| s)
-            .expect("local not found")
+        &self.local_map[local]
     }
 }
 
@@ -118,10 +115,64 @@ fn const_to_i64(konst: Const<'_>, size: Size) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Type helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the stored type from an operand.
+fn operand_ty(body: &MirBody, kind: &OperandKind) -> StoredTy {
+    match kind {
+        OperandKind::Constant { ty, .. } => ty.clone(),
+        OperandKind::Copy(place) | OperandKind::Move(place) => {
+            assert!(place.projection.is_empty(), "projections not yet supported");
+            body.locals[place.local].ty.clone()
+        }
+        OperandKind::Static(_) => todo!("static operand type"),
+    }
+}
+
+/// Get the scalar representation of an operand's type.
+fn operand_scalar(fx: &FunctionCx<'_, impl Module>, body: &MirBody, kind: &OperandKind) -> Scalar {
+    let ty = operand_ty(body, kind);
+    let layout = fx.db.layout_of_ty(ty, fx.env.clone()).expect("layout error");
+    match layout.backend_repr {
+        BackendRepr::Scalar(scalar) => scalar,
+        _ => panic!("expected scalar type for operand"),
+    }
+}
+
+fn bin_op_to_intcc(op: &BinOp, signed: bool) -> IntCC {
+    match op {
+        BinOp::Eq => IntCC::Equal,
+        BinOp::Ne => IntCC::NotEqual,
+        BinOp::Lt if signed => IntCC::SignedLessThan,
+        BinOp::Lt => IntCC::UnsignedLessThan,
+        BinOp::Le if signed => IntCC::SignedLessThanOrEqual,
+        BinOp::Le => IntCC::UnsignedLessThanOrEqual,
+        BinOp::Gt if signed => IntCC::SignedGreaterThan,
+        BinOp::Gt => IntCC::UnsignedGreaterThan,
+        BinOp::Ge if signed => IntCC::SignedGreaterThanOrEqual,
+        BinOp::Ge => IntCC::UnsignedGreaterThanOrEqual,
+        _ => unreachable!("not a comparison: {:?}", op),
+    }
+}
+
+fn bin_op_to_floatcc(op: &BinOp) -> FloatCC {
+    match op {
+        BinOp::Eq => FloatCC::Equal,
+        BinOp::Ne => FloatCC::NotEqual,
+        BinOp::Lt => FloatCC::LessThan,
+        BinOp::Le => FloatCC::LessThanOrEqual,
+        BinOp::Gt => FloatCC::GreaterThan,
+        BinOp::Ge => FloatCC::GreaterThanOrEqual,
+        _ => unreachable!("not a float comparison: {:?}", op),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_statement(fx: &mut FunctionCx<'_>, body: &MirBody, stmt: &StatementKind) {
+fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, stmt: &StatementKind) {
     match stmt {
         StatementKind::Assign(place, rvalue) => {
             codegen_assign(fx, body, place, rvalue);
@@ -133,8 +184,13 @@ fn codegen_statement(fx: &mut FunctionCx<'_>, body: &MirBody, stmt: &StatementKi
     }
 }
 
-fn codegen_assign(fx: &mut FunctionCx<'_>, body: &MirBody, place: &Place, rvalue: &Rvalue) {
+fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &Place, rvalue: &Rvalue) {
     assert!(place.projection.is_empty(), "projections not yet supported");
+
+    match fx.local_storage(place.local) {
+        LocalStorage::Zst => return,
+        LocalStorage::Var(_, _) => {}
+    }
 
     let val = codegen_rvalue(fx, body, rvalue);
 
@@ -142,32 +198,173 @@ fn codegen_assign(fx: &mut FunctionCx<'_>, body: &MirBody, place: &Place, rvalue
         LocalStorage::Var(var, _) => {
             fx.bcx.def_var(*var, val);
         }
+        LocalStorage::Zst => unreachable!(),
     }
 }
 
-fn codegen_rvalue(fx: &mut FunctionCx<'_>, body: &MirBody, rvalue: &Rvalue) -> Value {
+fn codegen_rvalue(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, rvalue: &Rvalue) -> Value {
     match rvalue {
         Rvalue::Use(operand) => codegen_operand(fx, body, &operand.kind),
-        Rvalue::BinaryOp(op, lhs, rhs) => {
-            let _ = (op, lhs, rhs);
-            todo!("BinaryOp")
-        }
+        Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, body, op, lhs, rhs),
+        Rvalue::UnaryOp(op, operand) => codegen_unop(fx, body, op, operand),
         _ => todo!("rvalue: {:?}", rvalue),
     }
 }
 
-fn codegen_operand(fx: &mut FunctionCx<'_>, _body: &MirBody, kind: &OperandKind) -> Value {
+fn codegen_binop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    op: &BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Value {
+    let lhs_val = codegen_operand(fx, body, &lhs.kind);
+    let rhs_val = codegen_operand(fx, body, &rhs.kind);
+    let scalar = operand_scalar(fx, body, &lhs.kind);
+
+    match scalar.primitive() {
+        Primitive::Int(_, signed) => codegen_int_binop(fx, op, lhs_val, rhs_val, signed),
+        Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
+        Primitive::Pointer(_) => match op {
+            BinOp::Offset => fx.bcx.ins().iadd(lhs_val, rhs_val),
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
+                let cc = bin_op_to_intcc(op, false);
+                fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+            }
+            _ => todo!("pointer binop: {:?}", op),
+        },
+    }
+}
+
+fn codegen_int_binop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    op: &BinOp,
+    lhs: Value,
+    rhs: Value,
+    signed: bool,
+) -> Value {
+    let b = &mut fx.bcx;
+    match op {
+        BinOp::Add | BinOp::AddUnchecked => b.ins().iadd(lhs, rhs),
+        BinOp::Sub | BinOp::SubUnchecked => b.ins().isub(lhs, rhs),
+        BinOp::Mul | BinOp::MulUnchecked => b.ins().imul(lhs, rhs),
+        BinOp::Div => {
+            if signed {
+                b.ins().sdiv(lhs, rhs)
+            } else {
+                b.ins().udiv(lhs, rhs)
+            }
+        }
+        BinOp::Rem => {
+            if signed {
+                b.ins().srem(lhs, rhs)
+            } else {
+                b.ins().urem(lhs, rhs)
+            }
+        }
+        BinOp::BitXor => b.ins().bxor(lhs, rhs),
+        BinOp::BitAnd => b.ins().band(lhs, rhs),
+        BinOp::BitOr => b.ins().bor(lhs, rhs),
+        BinOp::Shl | BinOp::ShlUnchecked => b.ins().ishl(lhs, rhs),
+        BinOp::Shr | BinOp::ShrUnchecked => {
+            if signed {
+                b.ins().sshr(lhs, rhs)
+            } else {
+                b.ins().ushr(lhs, rhs)
+            }
+        }
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
+            let cc = bin_op_to_intcc(op, signed);
+            b.ins().icmp(cc, lhs, rhs)
+        }
+        BinOp::Cmp => {
+            // Three-way comparison: (lhs > rhs) as i8 - (lhs < rhs) as i8
+            let (gt_cc, lt_cc) = if signed {
+                (IntCC::SignedGreaterThan, IntCC::SignedLessThan)
+            } else {
+                (IntCC::UnsignedGreaterThan, IntCC::UnsignedLessThan)
+            };
+            let gt = b.ins().icmp(gt_cc, lhs, rhs);
+            let lt = b.ins().icmp(lt_cc, lhs, rhs);
+            b.ins().isub(gt, lt)
+        }
+        BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
+            todo!("overflow binops (need CValue pairs)")
+        }
+        BinOp::Offset => unreachable!("Offset on integer type"),
+    }
+}
+
+fn codegen_float_binop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    op: &BinOp,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let b = &mut fx.bcx;
+    match op {
+        BinOp::Add | BinOp::AddUnchecked => b.ins().fadd(lhs, rhs),
+        BinOp::Sub | BinOp::SubUnchecked => b.ins().fsub(lhs, rhs),
+        BinOp::Mul | BinOp::MulUnchecked => b.ins().fmul(lhs, rhs),
+        BinOp::Div => b.ins().fdiv(lhs, rhs),
+        BinOp::Rem => todo!("float rem (needs libcall)"),
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
+            let cc = bin_op_to_floatcc(op);
+            b.ins().fcmp(cc, lhs, rhs)
+        }
+        _ => todo!("float binop: {:?}", op),
+    }
+}
+
+fn codegen_unop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    op: &UnOp,
+    operand: &Operand,
+) -> Value {
+    let val = codegen_operand(fx, body, &operand.kind);
+    match op {
+        UnOp::Not => {
+            let ty = operand_ty(body, &operand.kind);
+            if ty.as_ref().kind() == TyKind::Bool {
+                fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0)
+            } else {
+                fx.bcx.ins().bnot(val)
+            }
+        }
+        UnOp::Neg => {
+            let scalar = operand_scalar(fx, body, &operand.kind);
+            match scalar.primitive() {
+                Primitive::Int(_, _) => fx.bcx.ins().ineg(val),
+                Primitive::Float(_) => fx.bcx.ins().fneg(val),
+                Primitive::Pointer(_) => unreachable!("neg on pointer"),
+            }
+        }
+    }
+}
+
+fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, _body: &MirBody, kind: &OperandKind) -> Value {
     match kind {
         OperandKind::Constant { konst, ty } => {
-            let ty = ty.as_ref();
             let layout = fx
                 .db
-                .layout_of_ty(ty.store(), fx.env.clone())
+                .layout_of_ty(ty.clone(), fx.env.clone())
                 .expect("layout error for constant type");
             if let BackendRepr::Scalar(scalar) = layout.backend_repr {
-                let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
-                let val = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
-                fx.bcx.ins().iconst(clif_ty, val)
+                let raw = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
+                match scalar.primitive() {
+                    Primitive::Float(rustc_abi::Float::F32) => {
+                        fx.bcx.ins().f32const(f32::from_bits(raw as u32))
+                    }
+                    Primitive::Float(rustc_abi::Float::F64) => {
+                        fx.bcx.ins().f64const(f64::from_bits(raw as u64))
+                    }
+                    Primitive::Float(_) => todo!("f16/f128 constants"),
+                    _ => {
+                        let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
+                        fx.bcx.ins().iconst(clif_ty, raw)
+                    }
+                }
             } else {
                 todo!("non-scalar constant")
             }
@@ -176,6 +373,7 @@ fn codegen_operand(fx: &mut FunctionCx<'_>, _body: &MirBody, kind: &OperandKind)
             assert!(place.projection.is_empty(), "projections not yet supported");
             match fx.local_storage(place.local) {
                 LocalStorage::Var(var, _) => fx.bcx.use_var(*var),
+                LocalStorage::Zst => unreachable!("cannot produce a Value from ZST local"),
             }
         }
         OperandKind::Static(_) => todo!("static operand"),
@@ -186,23 +384,17 @@ fn codegen_operand(fx: &mut FunctionCx<'_>, _body: &MirBody, kind: &OperandKind)
 // Terminator codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_terminator(fx: &mut FunctionCx<'_>, body: &MirBody, term: &TerminatorKind) {
+fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term: &TerminatorKind) {
     match term {
         TerminatorKind::Return => {
             let ret_local = hir_ty::mir::return_slot();
-            let ret_ty = &body.locals[ret_local].ty;
-            let layout = fx
-                .db
-                .layout_of_ty(ret_ty.clone(), fx.env.clone())
-                .expect("return type layout error");
-            if layout.is_zst() {
-                fx.bcx.ins().return_(&[]);
-            } else {
-                match fx.local_storage(ret_local) {
-                    LocalStorage::Var(var, _) => {
-                        let val = fx.bcx.use_var(*var);
-                        fx.bcx.ins().return_(&[val]);
-                    }
+            match fx.local_storage(ret_local) {
+                LocalStorage::Zst => {
+                    fx.bcx.ins().return_(&[]);
+                }
+                LocalStorage::Var(var, _) => {
+                    let val = fx.bcx.use_var(*var);
+                    fx.bcx.ins().return_(&[val]);
                 }
             }
         }
@@ -213,7 +405,131 @@ fn codegen_terminator(fx: &mut FunctionCx<'_>, body: &MirBody, term: &Terminator
         TerminatorKind::Unreachable => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
         }
+        TerminatorKind::SwitchInt { discr, targets } => {
+            let discr_val = codegen_operand(fx, body, &discr.kind);
+            let otherwise = fx.clif_block(targets.otherwise());
+
+            let mut switch = Switch::new();
+            for (val, target) in targets.iter() {
+                let block = fx.clif_block(target);
+                switch.set_entry(val, block);
+            }
+            switch.emit(&mut fx.bcx, discr_val, otherwise);
+        }
+        TerminatorKind::Call { func, args, destination, target, .. } => {
+            codegen_call(fx, body, func, args, destination, target);
+        }
+        TerminatorKind::Drop { target, .. } => {
+            // For scalar types, drop is a no-op — just jump to target.
+            // TODO: call drop glue for types that need it.
+            let block = fx.clif_block(*target);
+            fx.bcx.ins().jump(block, &[]);
+        }
         _ => todo!("terminator: {:?}", term),
+    }
+}
+
+fn codegen_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    func: &Operand,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    // Extract the function type from the func operand
+    let fn_ty = match &func.kind {
+        OperandKind::Constant { ty, .. } => ty.as_ref(),
+        _ => todo!("indirect/fn-pointer calls"),
+    };
+
+    match fn_ty.kind() {
+        TyKind::FnDef(def, generic_args) => {
+            let callable_def: CallableDefId = def.0;
+            match callable_def {
+                CallableDefId::FunctionId(callee_func_id) => {
+                    codegen_direct_call(
+                        fx,
+                        body,
+                        callee_func_id,
+                        generic_args,
+                        args,
+                        destination,
+                        target,
+                    );
+                }
+                _ => todo!("struct/enum constructor calls"),
+            }
+        }
+        _ => todo!("non-FnDef call (fn pointers, closures)"),
+    }
+}
+
+fn codegen_direct_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    callee_func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    // Get callee MIR to determine its signature
+    let callee_body = fx
+        .db
+        .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
+        .expect("failed to get callee MIR");
+
+    // Build callee's Cranelift signature
+    let callee_sig =
+        build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
+
+    // Get callee name (simple unmangled name for now)
+    let callee_name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+
+    // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
+    let callee_id = fx
+        .module
+        .declare_function(&callee_name, Linkage::Import, &callee_sig)
+        .expect("declare callee");
+
+    // Import into current function to get a FuncRef
+    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+
+    // Build argument values (skip ZST args that have no Cranelift representation)
+    let call_args: Vec<Value> = args
+        .iter()
+        .filter_map(|arg| {
+            let ty = operand_ty(body, &arg.kind);
+            let layout = fx
+                .db
+                .layout_of_ty(ty, fx.env.clone())
+                .expect("arg layout");
+            if layout.is_zst() {
+                None
+            } else {
+                Some(codegen_operand(fx, body, &arg.kind))
+            }
+        })
+        .collect();
+
+    // Emit the call
+    let call = fx.bcx.ins().call(callee_ref, &call_args);
+
+    // Store return value
+    assert!(destination.projection.is_empty(), "call destination projections not yet supported");
+    let results = fx.bcx.inst_results(call);
+    match fx.local_storage(destination.local) {
+        LocalStorage::Zst => {}
+        LocalStorage::Var(var, _) => {
+            fx.bcx.def_var(*var, results[0]);
+        }
+    }
+
+    // Jump to continuation block
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
     }
 }
 
@@ -222,9 +538,9 @@ fn codegen_terminator(fx: &mut FunctionCx<'_>, body: &MirBody, term: &Terminator
 // ---------------------------------------------------------------------------
 
 /// Build a Cranelift ISA for the host machine.
-pub fn build_host_isa() -> Arc<dyn TargetIsa> {
+pub fn build_host_isa(is_pic: bool) -> Arc<dyn TargetIsa> {
     let mut flags_builder = settings::builder();
-    flags_builder.set("is_pic", "true").unwrap();
+    flags_builder.set("is_pic", if is_pic { "true" } else { "false" }).unwrap();
     flags_builder.set("opt_level", "none").unwrap();
     let flags = settings::Flags::new(flags_builder);
 
@@ -232,23 +548,18 @@ pub fn build_host_isa() -> Arc<dyn TargetIsa> {
     isa_builder.finish(flags).expect("failed to build ISA")
 }
 
-/// Compile a single MIR body to a named function in an ObjectModule.
-pub fn compile_fn(
-    module: &mut ObjectModule,
+/// Build a Cranelift signature from a MIR body's locals (return type + params).
+fn build_fn_sig(
     isa: &dyn TargetIsa,
     db: &dyn HirDatabase,
     dl: &TargetDataLayout,
     env: &StoredParamEnvAndCrate,
     body: &MirBody,
-    fn_name: &str,
-    linkage: Linkage,
-) -> Result<FuncId, String> {
-    let pointer_type = pointer_ty(dl);
-
-    let ret_local = &body.locals[hir_ty::mir::return_slot()];
+) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
 
     // Return type
+    let ret_local = &body.locals[hir_ty::mir::return_slot()];
     let ret_layout = db
         .layout_of_ty(ret_local.ty.clone(), env.clone())
         .map_err(|e| format!("return type layout error: {:?}", e))?;
@@ -271,6 +582,23 @@ pub fn compile_fn(
         }
     }
 
+    Ok(sig)
+}
+
+/// Compile a single MIR body to a named function in a Module (ObjectModule or JITModule).
+pub fn compile_fn(
+    module: &mut impl Module,
+    isa: &dyn TargetIsa,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    body: &MirBody,
+    fn_name: &str,
+    linkage: Linkage,
+) -> Result<FuncId, String> {
+    let pointer_type = pointer_ty(dl);
+    let sig = build_fn_sig(isa, db, dl, env, body)?;
+
     // Declare function in module
     let func_id = module
         .declare_function(fn_name, linkage, &sig)
@@ -286,23 +614,19 @@ pub fn compile_fn(
         let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
 
         // Create Cranelift blocks for MIR basic blocks
-        let mut block_map = Vec::new();
+        let mut block_map = ArenaMap::new();
         for (bb_id, _bb) in body.basic_blocks.iter() {
             let block = bcx.create_block();
-            block_map.push((bb_id, block));
+            block_map.insert(bb_id, block);
         }
 
         // Set up entry block
-        let entry_block = block_map
-            .iter()
-            .find(|(id, _)| *id == body.start_block)
-            .map(|(_, b)| *b)
-            .unwrap();
+        let entry_block = block_map[body.start_block];
         bcx.switch_to_block(entry_block);
         bcx.append_block_params_for_function_params(entry_block);
 
         // Set up locals as Cranelift variables
-        let mut local_vars = Vec::new();
+        let mut local_map = ArenaMap::new();
 
         for (local_id, local) in body.locals.iter() {
             let local_layout = db
@@ -312,10 +636,9 @@ pub fn compile_fn(
             if let BackendRepr::Scalar(scalar) = local_layout.backend_repr {
                 let clif_ty = scalar_to_clif_type(dl, &scalar);
                 let var = bcx.declare_var(clif_ty);
-                local_vars.push((local_id, LocalStorage::Var(var, clif_ty)));
+                local_map.insert(local_id, LocalStorage::Var(var, clif_ty));
             } else if local_layout.is_zst() {
-                let var = bcx.declare_var(types::I8);
-                local_vars.push((local_id, LocalStorage::Var(var, types::I8)));
+                local_map.insert(local_id, LocalStorage::Zst);
             } else {
                 // TODO: stack slot for non-scalar types
                 return Err(format!("unsupported local type: non-scalar, non-ZST"));
@@ -326,24 +649,25 @@ pub fn compile_fn(
         let block_params: Vec<Value> = bcx.block_params(entry_block).to_vec();
         let mut param_idx = 0;
         for &param_local in &body.param_locals {
-            if let Some((_, LocalStorage::Var(var, _))) =
-                local_vars.iter().find(|(id, _)| *id == param_local)
-            {
-                if param_idx < block_params.len() {
+            match &local_map[param_local] {
+                LocalStorage::Var(var, _) => {
                     bcx.def_var(*var, block_params[param_idx]);
                     param_idx += 1;
                 }
+                LocalStorage::Zst => {}
             }
         }
 
         let mut fx = FunctionCx {
             bcx,
+            module,
+            isa,
             pointer_type,
             db,
             dl,
             env: env.clone(),
-            block_map: block_map.clone(),
-            local_vars,
+            block_map,
+            local_map,
         };
 
         // Codegen each basic block
@@ -383,7 +707,7 @@ pub fn compile_to_object(
     body: &MirBody,
     fn_name: &str,
 ) -> Result<Vec<u8>, String> {
-    let isa = build_host_isa();
+    let isa = build_host_isa(true);
 
     let builder =
         ObjectBuilder::new(isa.clone(), "rac_output", cranelift_module::default_libcall_names())

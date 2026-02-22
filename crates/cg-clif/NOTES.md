@@ -10,19 +10,49 @@ What works:
 - Scalar locals as Cranelift variables, ZST locals
 - Scalar params and return types
 - `pointer.rs` ported (Pointer abstraction over addr/stack/dangling)
+- `Rvalue::BinaryOp` — all integer arithmetic (add/sub/mul/div/rem),
+  bitwise ops, shifts, comparisons, three-way `Cmp`. Float arithmetic
+  (add/sub/mul/div) and comparisons. Pointer offset and comparisons.
+  Unchecked variants handled. Overflow variants (`AddWithOverflow` etc.)
+  stubbed — need CValue pairs.
+- `Rvalue::UnaryOp` — `Neg` (ineg/fneg), `Not` (bnot for ints, icmp_imm for bool)
+- `TerminatorKind::SwitchInt` — multi-way branching via `cranelift_frontend::Switch`
+- `TerminatorKind::Call` — direct function calls (FnDef with scalar
+  args/returns). Resolves callee via TyKind::FnDef → CallableDefId,
+  gets callee MIR, builds Cranelift sig, declares in module, emits call.
+  ZST args filtered. Tested with call chains and calls combined with branches.
+- `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
+
+Known bugs (divergence from upstream cg_clif):
+- **Pointer `Offset` missing size scaling** — our `BinOp::Offset` does
+  `iadd(ptr, offset)` but upstream does `iadd(ptr, imul_imm(offset, pointee_size))`.
+  `ptr.offset(2)` should advance by `2 * sizeof(T)` bytes, not 2 bytes.
+- **Constants only handle small scalars** — `const_to_i64` extracts raw bytes
+  into i64. Missing: pointer constants (references to allocations/statics),
+  slice constants (fat pointers), i128 (upstream uses `iconcat(lsb, msb)`),
+  indirect constants (stored in allocations). String literals, `const &[T]`,
+  etc. won't work.
+- **No `PassMode` / ABI handling in calls** — we assume all args are by-val
+  scalars or ZST. Upstream has `PassMode::Indirect` (pass-by-pointer for
+  large structs), `PassMode::Pair` (scalar pairs like slices),
+  `PassMode::Uniform`. Struct args/returns will produce wrong ABI.
 
 What's missing:
-- Arithmetic: `BinaryOp`, `CheckedBinaryOp`, `UnaryOp` rvalues
-- Control flow: `SwitchInt` terminator (needed for if/match)
-- Function calls: `Call` terminator
-- Aggregates: non-scalar locals (need stack slots), projections
 - `CValue`/`CPlace` abstractions (currently using raw Cranelift `Value`)
-- Casts, discriminants, intrinsics, drops, etc.
+- Overflow binops: `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow`
+  (return tuple, need CValue pairs)
+- Float `Rem` (needs libcall to fmod/fmodf)
+- Indirect calls (fn pointers, closures)
+- Struct/enum constructor calls (`CallableDefId::StructId`/`EnumVariantId`)
+- Aggregates: non-scalar locals (need stack slots), projections
+- Casts, discriminants, intrinsics, drop glue, etc.
 
 Next steps (easiest to port):
-1. `BinaryOp`/`CheckedBinaryOp` — port `num.rs` patterns for arithmetic
-2. `SwitchInt` terminator — Cranelift block jumps
-3. `Call` terminator — function calls
+1. Fix pointer `Offset` — one-line fix, multiply offset by pointee size
+2. `CValue`/`CPlace` — value-with-layout abstraction (enables aggregates,
+   overflow ops, projections)
+3. Casts (`Rvalue::Cast`)
+4. Aggregate support (struct/enum locals, field projections)
 
 ## Original cg_clif architecture
 

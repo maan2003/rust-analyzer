@@ -1,5 +1,7 @@
 use std::{fmt, panic, sync::Mutex};
 
+use cranelift_module::Module;
+
 use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Nonce, RootQueryDb,
     SourceDatabase, SourceRoot, SourceRootId, SourceRootInput,
@@ -238,4 +240,474 @@ fn foo() -> i32 {
             .collect();
         assert!(!symbols.is_empty(), "symbol 'foo' not found in object file");
     });
+}
+
+/// Helper: compile a function named "foo" from source and assert it produces a valid object file.
+fn compile_fn_to_object(src: &str) -> Vec<u8> {
+    let full_src = format!("//- /main.rs\n{src}");
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, "foo");
+        let (body, env) = get_mir_and_env(&db, func_id);
+        let dl = get_target_data_layout(&db, func_id);
+
+        let obj_bytes =
+            crate::compile_to_object(&db, &dl, &env, &body, "foo").expect("compilation failed");
+        assert!(!obj_bytes.is_empty());
+
+        let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
+        use object::{Object, ObjectSymbol};
+        assert!(obj.symbols().any(|s| s.name() == Ok("foo")), "symbol 'foo' not found");
+
+        obj_bytes
+    })
+}
+
+/// Helper: JIT-compile functions from source, execute a no-arg entry function,
+/// and return its result. Follows the cg_clif JIT pattern:
+/// JITBuilder → JITModule → compile_fn → finalize → get_finalized_function → transmute → call.
+///
+/// The `entry` function must take no arguments and return `R`. Tests that need
+/// to pass arguments should write a wrapper function in the source:
+/// ```ignore
+/// fn add(a: i32, b: i32) -> i32 { a + b }
+/// fn test() -> i32 { add(3, 4) }
+/// // jit_run::<i32>(src, &["add", "test"], "test") → 7
+/// ```
+fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
+    let full_src = format!("//- /main.rs\n{src}");
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let isa = crate::build_host_isa(false);
+
+        let jit_builder =
+            cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
+
+        for &name in fn_names {
+            let func_id = find_fn(&db, file_id, name);
+            let (body, env) = get_mir_and_env(&db, func_id);
+            let dl = get_target_data_layout(&db, func_id);
+
+            crate::compile_fn(
+                &mut jit_module,
+                &*isa,
+                &db,
+                &dl,
+                &env,
+                &body,
+                name,
+                cranelift_module::Linkage::Export,
+            )
+            .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
+        }
+
+        // Finalize: make all compiled code executable
+        jit_module.finalize_definitions().unwrap();
+
+        // Look up the entry function pointer
+        let entry_func_id = find_fn(&db, file_id, entry);
+        let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
+        let dl = get_target_data_layout(&db, entry_func_id);
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
+
+        let entry_id = jit_module
+            .declare_function(entry, cranelift_module::Linkage::Import, &sig)
+            .expect("declare entry");
+        let code_ptr = jit_module.get_finalized_function(entry_id);
+
+        // SAFETY: The entry function is `extern "C" fn() -> R`. The JITModule
+        // stays alive until after we call f(), so the code is still mapped.
+        unsafe {
+            let f: extern "C" fn() -> R = std::mem::transmute(code_ptr);
+            f()
+        }
+    })
+}
+
+/// Helper: compile multiple functions from source into one object module.
+/// `fn_names` lists function names to compile, in order.
+fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
+    let full_src = format!("//- /main.rs\n{src}");
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let isa = crate::build_host_isa(true);
+
+        let builder = cranelift_object::ObjectBuilder::new(
+            isa.clone(),
+            "rac_output",
+            cranelift_module::default_libcall_names(),
+        )
+        .expect("ObjectBuilder");
+        let mut module = cranelift_object::ObjectModule::new(builder);
+
+        for &name in fn_names {
+            let func_id = find_fn(&db, file_id, name);
+            let (body, env) = get_mir_and_env(&db, func_id);
+            let dl = get_target_data_layout(&db, func_id);
+
+            crate::compile_fn(
+                &mut module,
+                &*isa,
+                &db,
+                &dl,
+                &env,
+                &body,
+                name,
+                cranelift_module::Linkage::Export,
+            )
+            .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
+        }
+
+        let product = module.finish();
+        let obj_bytes = product.emit().expect("emit");
+        assert!(!obj_bytes.is_empty());
+
+        let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
+        use object::{Object, ObjectSymbol};
+        for &name in fn_names {
+            assert!(obj.symbols().any(|s| s.name() == Ok(name)), "symbol '{name}' not found");
+        }
+
+        obj_bytes
+    })
+}
+
+#[test]
+fn compile_int_arithmetic() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_int_sub_mul_div() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32, b: i32) -> i32 {
+    (a - b) * b / (b + 1)
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_bitwise_ops() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: u32, b: u32) -> u32 {
+    (a & b) | (a ^ b)
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_shift_ops() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: u32, b: u32) -> u32 {
+    (a << b) >> b
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_negation() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32) -> i32 {
+    -a
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_float_arithmetic() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: f64, b: f64) -> f64 {
+    a + b * a - b / a
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_float_negation() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: f64) -> f64 {
+    -a
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_comparison() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32, b: i32) -> bool {
+    a < b
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_if_else() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32) -> i32 {
+    if a > 0 { a } else { 0 }
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_multiple_branches() {
+    compile_fn_to_object(
+        r#"
+fn foo(a: i32) -> i32 {
+    if a > 10 {
+        1
+    } else if a > 0 {
+        2
+    } else {
+        3
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn compile_direct_call() {
+    compile_fns_to_object(
+        r#"
+fn bar(x: i32) -> i32 {
+    x + 1
+}
+fn foo(a: i32) -> i32 {
+    bar(a)
+}
+"#,
+        &["bar", "foo"],
+    );
+}
+
+#[test]
+fn compile_call_chain() {
+    compile_fns_to_object(
+        r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+fn double(x: i32) -> i32 {
+    add(x, x)
+}
+fn foo(n: i32) -> i32 {
+    double(add(n, 1))
+}
+"#,
+        &["add", "double", "foo"],
+    );
+}
+
+#[test]
+fn compile_call_with_branch() {
+    compile_fns_to_object(
+        r#"
+fn abs(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+fn foo(a: i32) -> i32 {
+    abs(a) + abs(-a)
+}
+"#,
+        &["abs", "foo"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// JIT execution tests — actually run the compiled code and verify results
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_return_constant() {
+    let result = jit_run::<i32>(
+        r#"
+fn foo() -> i32 {
+    42
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_arithmetic() {
+    let result = jit_run::<i32>(
+        r#"
+fn foo() -> i32 {
+    3 + 4 * 2 - 1
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 3 + 4 * 2 - 1);
+}
+
+#[test]
+fn jit_if_else() {
+    // Test the "then" branch
+    let result = jit_run::<i32>(
+        r#"
+fn pick(x: i32) -> i32 {
+    if x > 0 { 100 } else { 200 }
+}
+fn foo() -> i32 {
+    pick(5)
+}
+"#,
+        &["pick", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 100);
+}
+
+#[test]
+fn jit_if_else_negative() {
+    // Test the "else" branch
+    let result = jit_run::<i32>(
+        r#"
+fn pick(x: i32) -> i32 {
+    if x > 0 { 100 } else { 200 }
+}
+fn foo() -> i32 {
+    pick(-3)
+}
+"#,
+        &["pick", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 200);
+}
+
+#[test]
+fn jit_function_call() {
+    let result = jit_run::<i32>(
+        r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+fn foo() -> i32 {
+    add(10, 32)
+}
+"#,
+        &["add", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_call_chain() {
+    let result = jit_run::<i32>(
+        r#"
+fn square(x: i32) -> i32 {
+    x * x
+}
+fn sum_of_squares(a: i32, b: i32) -> i32 {
+    square(a) + square(b)
+}
+fn foo() -> i32 {
+    sum_of_squares(3, 4)
+}
+"#,
+        &["square", "sum_of_squares", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 25); // 9 + 16
+}
+
+#[test]
+fn jit_recursive_like_call() {
+    // Not actual recursion (that needs the same function to call itself),
+    // but a chain that exercises multiple calls and branches.
+    let result = jit_run::<i32>(
+        r#"
+fn abs(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+fn max(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+fn foo() -> i32 {
+    max(abs(-10), abs(7))
+}
+"#,
+        &["abs", "max", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 10);
+}
+
+#[test]
+fn jit_float_arithmetic() {
+    let result = jit_run::<f64>(
+        r#"
+fn foo() -> f64 {
+    1.5 + 2.5
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 4.0);
+}
+
+#[test]
+fn jit_bitwise_ops() {
+    let result = jit_run::<u32>(
+        r#"
+fn foo() -> u32 {
+    (0xFF00u32 & 0x0FF0u32) | 0x000Fu32
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, (0xFF00u32 & 0x0FF0u32) | 0x000Fu32);
+}
+
+#[test]
+fn jit_bool_not() {
+    let result = jit_run::<i32>(
+        r#"
+fn check(x: bool) -> i32 {
+    if !x { 1 } else { 0 }
+}
+fn foo() -> i32 {
+    check(false)
+}
+"#,
+        &["check", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 1);
 }

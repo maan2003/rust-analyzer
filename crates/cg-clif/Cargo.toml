@@ -13,6 +13,7 @@ cranelift-frontend = { version = "0.128.3" }
 cranelift-module = { version = "0.128.3" }
 cranelift-native = { version = "0.128.3" }
 cranelift-object = { version = "0.128.3" }
+cranelift-jit = { version = "0.128.3" }
 target-lexicon = "0.13"
 object = { version = "0.37.3", default-features = false, features = ["std", "read_core", "write", "archive", "coff", "elf", "macho", "pe"] }
 
@@ -21,6 +22,7 @@ hir-ty.path = "../hir-ty"
 hir-def.path = "../hir-def"
 rac-abi.path = "../rac-abi"
 rustc_abi = { package = "ra-ap-rustc_abi", version = "0.143" }
+la-arena.workspace = true
 intern.path = "../intern"
 
 [dev-dependencies]
