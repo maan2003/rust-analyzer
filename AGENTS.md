@@ -1,6 +1,7 @@
 read goal.md for high level goal
 
 plan.md contains the high level plan
+milestones.md contains the current status
 
 cg_clif/ is the original rustc cranelift backend (git subtree). Read-only reference.
 

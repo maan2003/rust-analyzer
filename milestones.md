@@ -22,43 +22,68 @@ for r-a's `Ty` (via `AbiTy` newtype), `HasDataLayout`, `HasTargetSpec`,
 Aligned r-a's MIR data structures with rustc so cg_clif can translate them:
 `BinaryOp` with overflow/unchecked variants, `AddressOf`, `Downcast`
 projection, `SetDiscriminant` statement. Removed dead stubs (`NullaryOp`,
-old `BinaryOp(Infallible)`).
+old `BinaryOp(Infallible)`). Later: removed `DropAndReplace`, added
+`CastKind::Transmute`, `AggregateKind::RawPtr`, renamed provenance casts,
+`ThreadLocalRef(StaticId)`. See `MIR_STATUS.md` for full alignment status.
 
 ---
 
-## Phase 1: Single-function codegen spike
+## Phase 1: Single-function codegen spike ✅
 
-### M1: One function → object file
+### M1: One function → object file ✅
 
-Create `ra-codegen` crate. Take `fn foo() -> i32 { 42 }`, get its MIR from
-r-a, translate to Cranelift IR, emit via `cranelift-object`. Verify with
-`objdump` that the function exists and has sane instructions.
+Created `cg-clif` crate. Translates r-a MIR to Cranelift IR, emits via
+`cranelift-object`. 14 object-file tests verify compilation of scalars,
+arithmetic, control flow, and function calls.
 
-Proves: the MIR→CLIF translation path works at all. Surfaces type
-mismatches, missing MIR constructs, layout issues early.
+### M2: Call the compiled function ✅
 
-### M2: Call the compiled function
+Used `cranelift-jit` instead of dlopen — compiles and executes functions
+in-memory. 10 JIT tests assert correct return values.
 
-Build a test harness that compiles a function to a shared object, loads it
-with `dlopen`/`dlsym`, and calls it. Assert `foo() == 42`.
+### M3: Arithmetic and locals ✅
 
-Proves: the generated code actually runs and produces correct values. ABI
-is right (return value in correct register).
+Full scalar codegen working:
+- `BinaryOp`: all integer arithmetic (add/sub/mul/div/rem), bitwise ops,
+  shifts, comparisons, three-way `Cmp`. Float arithmetic and comparisons.
+  Pointer offset and comparisons. Unchecked variants handled.
+- `UnaryOp`: `Neg` (int/float), `Not` (bnot for ints, icmp_imm for bool).
+- Scalar locals as Cranelift variables, ZST locals, scalar params/returns.
+- `SwitchInt` multi-way branching, direct function calls (call chains,
+  calls combined with branches), `Drop` as no-op jump.
 
-### M3: Arithmetic and locals
+Known bugs: pointer `Offset` missing size scaling, constants limited to
+small scalars, no `PassMode`/ABI handling. See `crates/cg-clif/NOTES.md`.
 
-```rust
-fn bar(a: i32, b: i32) -> i32 {
-    let x = a + b;
-    x * 2
-}
-```
+---
 
-Compile, dlopen, call with args, check result.
+## Phase 1.5: Codegen completeness (current)
 
-Proves: `BinaryOp` translation, local variables, argument passing
-through the ABI layer. This is where `FnAbi`/`PassMode` gets exercised
-for real.
+Before linking against std, fill out codegen for the MIR constructs we'll
+encounter. These can all be tested via JIT without a linker.
+
+### M3.1: CValue/CPlace abstraction
+
+Port `value_and_place.rs` pattern: CValue (ByRef | ByVal | ByValPair),
+CPlace (Var | VarPair | Addr). Enables non-scalar locals (stack slots),
+overflow binops (return tuples), and field projections.
+
+### M3.2: Casts (`Rvalue::Cast`)
+
+IntToInt, FloatToInt, IntToFloat, FloatToFloat, PtrToPtr,
+PointerExposeProvenance, PointerWithExposedProvenance, Transmute.
+
+### M3.3: Aggregates
+
+Struct/enum/tuple locals on stack slots, `Aggregate` rvalue construction,
+`Field`/`TupleOrClosureField` projections, `Downcast` for enum variants,
+`Discriminant` rvalue, `SetDiscriminant` statement.
+
+### M3.4: Remaining scalar ops
+
+- Overflow binops (`AddWithOverflow` etc.) — need CValue pairs
+- Float `Rem` (libcall to fmod/fmodf)
+- Fix pointer `Offset` size scaling
 
 ---
 
@@ -94,7 +119,12 @@ symbols. Verify by checking exit code.
 
 ## Phase 3: Codegen breadth
 
-### M7: Control flow + function calls
+### M7: Control flow + function calls (partially done)
+
+`SwitchInt`, branching, and intra-crate direct calls already work for
+scalar types (tested via JIT in M3). What remains: linking compiled
+functions together in an object file, calling `std::process::exit`
+(extern/ABI), and running as a real executable.
 
 ```rust
 fn add(a: i32, b: i32) -> i32 {
@@ -105,8 +135,6 @@ fn main() -> ! {
     std::process::exit(add(19, 23));
 }
 ```
-
-Proves: `SwitchInt`, branching, multi-function compilation, intra-crate calls.
 
 ### M8: Structs and enums
 
