@@ -339,16 +339,6 @@ fn push_integer_62(x: u64, output: &mut String) {
     output.push('_');
 }
 
-/// Push a v0 disambiguator encoding to `output`.
-/// Public so the allocator shim generator can produce correct mangled names.
-pub fn push_disambiguator_raw(output: &mut String, dis: u64) {
-    // Same as push_opt_integer_62("s", dis):
-    if let Some(x) = dis.checked_sub(1) {
-        output.push('s');
-        push_integer_62(x, output);
-    }
-}
-
 fn push_ident(ident: &str, output: &mut String) {
     let _ = write!(output, "{}", ident.len());
     // Separator `_` needed when ident starts with a digit or `_`.

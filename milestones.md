@@ -56,7 +56,7 @@ See `crates/cg-clif/NOTES.md` for known bugs and upstream divergences.
 
 ---
 
-## Phase 1.5: Codegen completeness (current)
+## Phase 1.5: Codegen completeness
 
 Before linking against std, fill out codegen for the MIR constructs we'll
 encounter. These can all be tested via JIT without a linker.
@@ -114,9 +114,8 @@ names; 4 mangling tests + all existing JIT/object tests pass with v0 names.
 
 Deferred: backref caching, const generic encoding (placeholder `p`), dyn Trait,
 fn pointers, punycode, trait impl paths (`X`), closures. Crate disambiguator
-uses FileId index (internally consistent but won't match rustc's SVH-based
-hash). For calling into rustc-compiled crates: extract their crate disambiguator
-from any `_R`-prefixed symbol in their rlib, no rmeta parsing needed.
+uses FileId index for local crates; for external (sysroot) crates, real
+disambiguators are extracted from rlib archive symbol tables (see M7.5).
 
 Proves: symbols will resolve at link time.
 
@@ -156,27 +155,50 @@ raw symbol names, never type handling, linking against libc.
 
 ---
 
-## Phase 3: Codegen breadth
+## Phase 3: Codegen breadth (current)
 
-### M7: Control flow + function calls
+### M7: Multi-function executables ✅
 
 `SwitchInt`, branching, intra-crate direct calls, and extern `"C"` calls
 all work for scalar types (tested via JIT in M3, extern calls in M6).
-What remains: compiling multiple local functions into one executable and
-calling between them in a linked binary.
+Added `collect_reachable_fns()` BFS to discover all callees from main,
+compile them all into one object module. Integration test
+`compile_and_run_multi_fn` verifies multi-function binary.
+
+### M7.5: Cross-crate calls into std ✅
 
 ```rust
-extern "C" {
-    fn exit(code: i32) -> !;
-}
-fn add(a: i32, b: i32) -> i32 {
-    if a > 0 { a + b } else { b }
-}
-
 fn main() -> ! {
-    unsafe { exit(add(19, 23)) }
+    std::process::exit(42)
 }
 ```
+
+Calls `std::process::exit` through v0-mangled symbol resolved from the
+real std rlib at link time. Required:
+
+- **Crate disambiguator extraction** (`link.rs`): scans archive symbol
+  tables of sysroot rlibs, parses v0 crate root markers (`Cs<base62>_`)
+  to build a crate name → disambiguator map. Uses rlib filename to know
+  which crate to look for. Temporary bridge until MIR export (M13+)
+  provides `StableCrateId` directly.
+- **Cross-crate call detection** (`lib.rs`): `codegen_direct_call` checks
+  `func_id.krate(db) != local_crate`; cross-crate calls use type-based
+  signatures (`build_fn_sig_from_ty`) and v0 mangled names with real
+  disambiguators. `collect_reachable_fns` skips external functions.
+- **Allocator shim** (`lib.rs`): emits `__rust_alloc`, `__rust_dealloc`,
+  `__rust_realloc`, `__rust_alloc_zeroed`, and
+  `__rust_no_alloc_shim_is_unstable_v2` as wrappers around libc
+  malloc/free/realloc/calloc. Uses `__rustc` crate disambiguator
+  extracted from std's symbol table. Will be removed when switching to
+  `rustc` as linker driver.
+- **Linker hardening**: `--start-group`/`--end-group` for circular rlib
+  deps, `--gc-sections` to trim unused std code, filter out `rustc-dev`
+  symlinks (NixOS).
+- **ScalarPair support** in `build_fn_sig_from_ty` for functions that
+  take/return pairs (slices, wide pointers).
+
+Proves: v0 mangling produces symbols that match real rlibs, cross-crate
+function detection works, type-based signatures are correct.
 
 ### M8: Structs and enums
 

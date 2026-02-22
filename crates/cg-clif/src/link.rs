@@ -1,6 +1,8 @@
 //! Linker invocation for producing executables.
 //!
-//! Shells out to `cc` with sysroot rlibs from the host rustc toolchain.
+//! Links against `libstd-*.so` from the host rustc sysroot using dynamic linking.
+//! The `.so` contains core, alloc, std, and the allocator shim — no need for
+//! rlib linking, `--start-group`, or allocator shim generation.
 //! Hardcoded for Linux x86_64 for now.
 
 use std::collections::HashMap;
@@ -26,53 +28,37 @@ pub fn find_target_libdir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(path.trim()))
 }
 
-/// Collect all `.rlib` files in a directory, filtering out non-standard rlibs
-/// (e.g., `rustc-dev` crates that may be symlinked in on NixOS).
-pub fn collect_rlibs(libdir: &Path) -> Result<Vec<PathBuf>, String> {
+/// Find `libstd-*.so` in the sysroot libdir.
+pub fn find_libstd_so(libdir: &Path) -> Result<PathBuf, String> {
     let entries = std::fs::read_dir(libdir)
         .map_err(|e| format!("failed to read {}: {e}", libdir.display()))?;
 
-    let mut rlibs = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("readdir error: {e}"))?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "rlib") {
-            // Skip rlibs that are symlinks to rustc-dev (not part of std sysroot)
-            if let Ok(target) = std::fs::read_link(&path) {
-                let target_str = target.to_string_lossy();
-                if target_str.contains("rustc-dev") {
-                    continue;
-                }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("libstd-") && name.ends_with(".so") {
+                return Ok(path);
             }
-            rlibs.push(path);
         }
     }
-    rlibs.sort();
-    Ok(rlibs)
+    Err(format!("libstd-*.so not found in {}", libdir.display()))
 }
 
-/// Link an object file against the Rust sysroot to produce an executable.
+/// Link an object file against `libstd.so` to produce a dynamically-linked executable.
 pub fn link_executable(obj_path: &Path, output_path: &Path) -> Result<(), String> {
     let libdir = find_target_libdir()?;
-    let rlibs = collect_rlibs(&libdir)?;
+    let libstd_so = find_libstd_so(&libdir)?;
 
     let mut cmd = Command::new("cc");
     cmd.arg(obj_path);
     cmd.arg("-o").arg(output_path);
-    cmd.arg("-L").arg(&libdir);
 
-    // Add all rlibs inside a group to resolve circular dependencies
-    cmd.arg("-Wl,--start-group");
-    for rlib in &rlibs {
-        cmd.arg(rlib);
-    }
-    cmd.arg("-Wl,--end-group");
+    // Link against libstd.so (contains core + alloc + std + allocator shim)
+    cmd.arg(&libstd_so);
 
-    // System libraries needed by std on Linux
-    cmd.args(["-lc", "-lgcc_s", "-lpthread", "-lm", "-ldl", "-lrt"]);
-
-    // Garbage-collect unused sections — std pulls in a lot of code we don't need
-    cmd.arg("-Wl,--gc-sections");
+    // Embed rpath so the binary can find libstd.so at runtime
+    cmd.arg(format!("-Wl,-rpath,{}", libdir.display()));
 
     // Suppress unused library warnings if the linker supports it
     cmd.arg("-Wl,--as-needed");
@@ -94,7 +80,7 @@ pub fn link_executable(obj_path: &Path, output_path: &Path) -> Result<(), String
 }
 
 // ---------------------------------------------------------------------------
-// Crate disambiguator extraction from rlib symbols
+// Crate disambiguator extraction from libstd.so symbols
 // ---------------------------------------------------------------------------
 
 /// Decode a base-62 encoded string (reverse of `base_62_encode` in symbol_mangling.rs).
@@ -178,67 +164,36 @@ fn find_crate_disambiguator(symbol: &str, target_crate: &str) -> Option<u64> {
     None
 }
 
-/// Extract crate name from an rlib filename like `libstd-957b1fe07cf96b13.rlib` → `"std"`.
-fn crate_name_from_rlib(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let name = stem.strip_prefix("lib")?;
-    // Strip the hash suffix: everything after the last '-'
-    let crate_name = if let Some(pos) = name.rfind('-') {
-        &name[..pos]
-    } else {
-        name
-    };
-    Some(crate_name.replace('-', "_"))
-}
-
-/// Scan all rlibs in a sysroot libdir, extract crate name → disambiguator mapping.
-/// Uses the archive symbol table directly (avoids parsing individual object files).
+/// Scan `libstd-*.so` dynamic symbols to extract crate name → disambiguator mapping.
+/// The single .so contains symbols from core, alloc, std, and __rustc.
 pub fn extract_crate_disambiguators(libdir: &Path) -> Result<HashMap<String, u64>, String> {
-    let rlibs = collect_rlibs(libdir)?;
+    use object::{Object, ObjectSymbol};
+
+    let so_path = find_libstd_so(libdir)?;
+    let data = std::fs::read(&so_path)
+        .map_err(|e| format!("failed to read {}: {e}", so_path.display()))?;
+    let obj = object::read::File::parse(&*data)
+        .map_err(|e| format!("failed to parse {}: {e}", so_path.display()))?;
+
     let mut map = HashMap::new();
+    // Crates we expect to find in the std .so
+    let target_crates = ["std", "core", "alloc", "__rustc"];
 
-    for rlib_path in &rlibs {
-        let expected_crate = match crate_name_from_rlib(rlib_path) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        let data = std::fs::read(rlib_path)
-            .map_err(|e| format!("failed to read {}: {e}", rlib_path.display()))?;
-
-        let archive = object::read::archive::ArchiveFile::parse(&*data)
-            .map_err(|e| format!("failed to parse archive {}: {e}", rlib_path.display()))?;
-
-        // Read symbols from the archive symbol table (index at the start of the archive).
-        let symbols = match archive.symbols() {
-            Ok(Some(syms)) => syms,
-            _ => continue,
-        };
-
-        let mut found_expected = false;
-        for sym in symbols {
-            let Ok(sym) = sym else { continue };
-            let name = std::str::from_utf8(sym.name()).unwrap_or("");
-            if !name.starts_with("_R") {
+    for sym in obj.dynamic_symbols() {
+        let Ok(name) = sym.name() else { continue };
+        if !name.starts_with("_R") {
+            continue;
+        }
+        for &crate_name in &target_crates {
+            if map.contains_key(crate_name) {
                 continue;
             }
-            // Look for the expected crate (derived from rlib filename)
-            if !found_expected {
-                if let Some(dis) = find_crate_disambiguator(name, &expected_crate) {
-                    map.insert(expected_crate.clone(), dis);
-                    found_expected = true;
-                }
+            if let Some(dis) = find_crate_disambiguator(name, crate_name) {
+                map.insert(crate_name.to_owned(), dis);
             }
-            // Also extract __rustc crate disambiguator from any symbol that references it
-            // (the __rustc crate has no separate rlib)
-            if !map.contains_key("__rustc") {
-                if let Some(dis) = find_crate_disambiguator(name, "__rustc") {
-                    map.insert("__rustc".to_owned(), dis);
-                }
-            }
-            if found_expected && map.contains_key("__rustc") {
-                break;
-            }
+        }
+        if map.len() == target_crates.len() {
+            break;
         }
     }
 
@@ -285,11 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn crate_name_from_rlib_path() {
-        let p = Path::new("/some/path/libstd-957b1fe07cf96b13.rlib");
-        assert_eq!(crate_name_from_rlib(p).unwrap(), "std");
-        let p = Path::new("/some/path/libstd_detect-2b11eee15f93fb2f.rlib");
-        assert_eq!(crate_name_from_rlib(p).unwrap(), "std_detect");
+    fn find_libstd_so_in_sysroot() {
+        let libdir = find_target_libdir().expect("rustc not available");
+        let so_path = find_libstd_so(&libdir).expect("libstd.so not found");
+        assert!(so_path.exists(), "libstd.so path should exist: {}", so_path.display());
     }
 
     #[test]
