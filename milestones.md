@@ -89,10 +89,20 @@ Struct/enum/tuple locals on stack slots, `Aggregate` rvalue construction,
 
 ## Phase 2: End-to-end `fn main() {}`
 
-### M4: Symbol mangling
+### M4: Symbol mangling ✅
 
-Implement v0 mangling for a function. Test by mangling `main` in a known
-crate and comparing against `rustc`'s output.
+Implemented v0 symbol mangling (RFC 2603) in `crates/cg-clif/src/symbol_mangling.rs`.
+Ported encoding primitives from `rustc_symbol_mangling/src/v0.rs`. Handles
+crate paths, module paths, impl paths, trait paths, extern blocks, and
+type encoding (all scalar types, refs, raw ptrs, slices, arrays, tuples, ADTs).
+Generic instantiations wrapped with `I...E`. All codegen now emits mangled
+names; 4 mangling tests + all existing JIT/object tests pass with v0 names.
+
+Deferred: backref caching, const generic encoding (placeholder `p`), dyn Trait,
+fn pointers, punycode, trait impl paths (`X`), closures. Crate disambiguator
+uses FileId index (internally consistent but won't match rustc's SVH-based
+hash). For calling into rustc-compiled crates: extract their crate disambiguator
+from any `_R`-prefixed symbol in their rlib, no rmeta parsing needed.
 
 Proves: symbols will resolve at link time.
 

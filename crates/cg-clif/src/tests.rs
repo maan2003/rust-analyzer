@@ -26,6 +26,8 @@ unsafe extern "C" {
     fn fmod(x: f64, y: f64) -> f64;
 }
 
+use crate::symbol_mangling;
+
 // ---------------------------------------------------------------------------
 // TestDB (same pattern as hir-ty's test_db)
 // ---------------------------------------------------------------------------
@@ -210,6 +212,13 @@ fn get_target_data_layout(db: &TestDB, func_id: hir_def::FunctionId) -> triomphe
     db.target_data_layout(func_id.krate(db)).expect("no target data layout")
 }
 
+/// Get the v0-mangled name for a function (non-generic).
+fn mangled_name(db: &TestDB, func_id: hir_def::FunctionId) -> String {
+    let interner = DbInterner::new_no_crate(db);
+    let generic_args = GenericArgs::empty(interner);
+    symbol_mangling::mangle_function(db, func_id, generic_args)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -229,9 +238,10 @@ fn foo() -> i32 {
         let func_id = find_fn(&db, file_id, "foo");
         let (body, env) = get_mir_and_env(&db, func_id);
         let dl = get_target_data_layout(&db, func_id);
+        let fn_name = mangled_name(&db, func_id);
 
         let obj_bytes =
-            crate::compile_to_object(&db, &dl, &env, &body, "foo").expect("compilation failed");
+            crate::compile_to_object(&db, &dl, &env, &body, &fn_name).expect("compilation failed");
 
         // Verify we got a non-empty object file
         assert!(!obj_bytes.is_empty(), "object file should not be empty");
@@ -241,9 +251,9 @@ fn foo() -> i32 {
         use object::{Object, ObjectSymbol};
         let symbols: Vec<_> = obj
             .symbols()
-            .filter(|s| s.name() == Ok("foo"))
+            .filter(|s| s.name() == Ok(fn_name.as_str()))
             .collect();
-        assert!(!symbols.is_empty(), "symbol 'foo' not found in object file");
+        assert!(!symbols.is_empty(), "symbol '{fn_name}' not found in object file");
     });
 }
 
@@ -256,14 +266,15 @@ fn compile_fn_to_object(src: &str) -> Vec<u8> {
         let func_id = find_fn(&db, file_id, "foo");
         let (body, env) = get_mir_and_env(&db, func_id);
         let dl = get_target_data_layout(&db, func_id);
+        let fn_name = mangled_name(&db, func_id);
 
         let obj_bytes =
-            crate::compile_to_object(&db, &dl, &env, &body, "foo").expect("compilation failed");
+            crate::compile_to_object(&db, &dl, &env, &body, &fn_name).expect("compilation failed");
         assert!(!obj_bytes.is_empty());
 
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
         use object::{Object, ObjectSymbol};
-        assert!(obj.symbols().any(|s| s.name() == Ok("foo")), "symbol 'foo' not found");
+        assert!(obj.symbols().any(|s| s.name() == Ok(fn_name.as_str())), "symbol '{fn_name}' not found");
 
         obj_bytes
     })
@@ -300,6 +311,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
             let func_id = find_fn(&db, file_id, name);
             let (body, env) = get_mir_and_env(&db, func_id);
             let dl = get_target_data_layout(&db, func_id);
+            let fn_name = mangled_name(&db, func_id);
 
             crate::compile_fn(
                 &mut jit_module,
@@ -308,7 +320,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
                 &dl,
                 &env,
                 &body,
-                name,
+                &fn_name,
                 cranelift_module::Linkage::Export,
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
@@ -322,9 +334,10 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
         let dl = get_target_data_layout(&db, entry_func_id);
         let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
+        let entry_mangled = mangled_name(&db, entry_func_id);
 
         let entry_id = jit_module
-            .declare_function(entry, cranelift_module::Linkage::Import, &sig)
+            .declare_function(&entry_mangled, cranelift_module::Linkage::Import, &sig)
             .expect("declare entry");
         let code_ptr = jit_module.get_finalized_function(entry_id);
 
@@ -354,10 +367,12 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
         .expect("ObjectBuilder");
         let mut module = cranelift_object::ObjectModule::new(builder);
 
+        let mut mangled_names = Vec::new();
         for &name in fn_names {
             let func_id = find_fn(&db, file_id, name);
             let (body, env) = get_mir_and_env(&db, func_id);
             let dl = get_target_data_layout(&db, func_id);
+            let fn_name = mangled_name(&db, func_id);
 
             crate::compile_fn(
                 &mut module,
@@ -366,10 +381,11 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
                 &dl,
                 &env,
                 &body,
-                name,
+                &fn_name,
                 cranelift_module::Linkage::Export,
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
+            mangled_names.push(fn_name);
         }
 
         let product = module.finish();
@@ -378,8 +394,8 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
 
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
         use object::{Object, ObjectSymbol};
-        for &name in fn_names {
-            assert!(obj.symbols().any(|s| s.name() == Ok(name)), "symbol '{name}' not found");
+        for mangled in &mangled_names {
+            assert!(obj.symbols().any(|s| s.name() == Ok(mangled.as_str())), "symbol '{mangled}' not found");
         }
 
         obj_bytes
@@ -883,4 +899,70 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Symbol mangling tests
+// ---------------------------------------------------------------------------
+
+/// Helper: get the mangled name for a function by name.
+fn mangle_fn(src: &str, name: &str) -> String {
+    let full_src = format!("//- /main.rs\n{src}");
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, name);
+        let interner = DbInterner::new_no_crate(&db);
+        let generic_args = GenericArgs::empty(interner);
+        symbol_mangling::mangle_function(&db, func_id, generic_args)
+    })
+}
+
+#[test]
+fn mangle_crate_root_fn() {
+    let mangled = mangle_fn("fn main() {}", "main");
+    // Should start with _R (v0 prefix)
+    assert!(mangled.starts_with("_R"), "expected v0 prefix, got: {mangled}");
+    // Should contain the crate name "ra_test_fixture" (15 chars)
+    assert!(mangled.contains("15ra_test_fixture"), "expected crate name, got: {mangled}");
+    // Should contain the function name "main" (4 chars)
+    assert!(mangled.contains("4main"), "expected fn name, got: {mangled}");
+    // Should have the structure: _R N v C <dis> <crate> <dis> <fn>
+    // i.e. _RNvC...15ra_test_fixture...4main
+    assert!(mangled.contains("NvC"), "expected NvC path prefix, got: {mangled}");
+}
+
+#[test]
+fn mangle_different_fn_name() {
+    let mangled = mangle_fn("fn quux() -> i32 { 42 }", "quux");
+    assert!(mangled.starts_with("_R"));
+    assert!(mangled.contains("4quux"), "expected fn name 'quux', got: {mangled}");
+    assert!(mangled.contains("NvC"), "expected NvC path structure, got: {mangled}");
+}
+
+#[test]
+fn mangle_different_functions_differ() {
+    let mangled_a = mangle_fn("fn alpha() {}\nfn beta() {}", "alpha");
+    let mangled_b = mangle_fn("fn alpha() {}\nfn beta() {}", "beta");
+    assert_ne!(mangled_a, mangled_b, "different functions should have different mangled names");
+}
+
+#[test]
+fn jit_with_mangled_names() {
+    // Test that functions can call each other using mangled symbol names.
+    // The codegen_direct_call now uses mangled names, so this JIT test
+    // verifies that caller and callee agree on the mangled symbol.
+    let result = jit_run::<i32>(
+        r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+fn foo() -> i32 {
+    add(10, 32)
+}
+"#,
+        &["add", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
 }

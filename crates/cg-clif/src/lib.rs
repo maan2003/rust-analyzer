@@ -27,6 +27,7 @@ use la_arena::ArenaMap;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 
 mod pointer;
+pub mod symbol_mangling;
 
 // ---------------------------------------------------------------------------
 // Type mapping: r-a Ty → Cranelift Type
@@ -641,8 +642,8 @@ fn codegen_direct_call(
     let callee_sig =
         build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
 
-    // Get callee name (simple unmangled name for now)
-    let callee_name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+    // Get callee name using v0 symbol mangling
+    let callee_name = symbol_mangling::mangle_function(fx.db, callee_func_id, generic_args);
 
     // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
     let callee_id = fx

@@ -24,13 +24,13 @@ rac-abi.path = "../rac-abi"
 rustc_abi = { package = "ra-ap-rustc_abi", version = "0.143" }
 la-arena.workspace = true
 intern.path = "../intern"
+base-db.path = "../base-db"
+hir-expand.path = "../hir-expand"
+span.path = "../span"
 
 [dev-dependencies]
 test-fixture.path = "../test-fixture"
 test-utils.path = "../test-utils"
-base-db.path = "../base-db"
-hir-expand.path = "../hir-expand"
-span.path = "../span"
 salsa = { version = "0.25.2", default-features = false, features = ["salsa_unstable"] }
 salsa-macros = "0.25.2"
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
