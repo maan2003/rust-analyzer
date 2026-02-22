@@ -12,10 +12,13 @@ What works:
 - `pointer.rs` ported (Pointer abstraction over addr/stack/dangling)
 - `Rvalue::BinaryOp` — all integer arithmetic (add/sub/mul/div/rem),
   bitwise ops, shifts, comparisons, three-way `Cmp`. Float arithmetic
-  (add/sub/mul/div) and comparisons. Pointer offset and comparisons.
+  (add/sub/mul/div/rem via `fmod`/`fmodf` libcalls) and comparisons.
+  Pointer offset and comparisons (offset now scales by pointee size).
   Unchecked variants handled. Overflow variants (`AddWithOverflow` etc.)
-  stubbed — need CValue pairs.
+  still stubbed — need CValue pairs.
 - `Rvalue::UnaryOp` — `Neg` (ineg/fneg), `Not` (bnot for ints, icmp_imm for bool)
+- `Rvalue::Cast` for scalar casts: int<->int, int<->float, float<->float,
+  ptr<->ptr/int (`PtrToPtr`, provenance casts, `FnPtrToPtr`), scalar transmute
 - `TerminatorKind::SwitchInt` — multi-way branching via `cranelift_frontend::Switch`
 - `TerminatorKind::Call` — direct function calls (FnDef with scalar
   args/returns). Resolves callee via TyKind::FnDef → CallableDefId,
@@ -23,10 +26,31 @@ What works:
   ZST args filtered. Tested with call chains and calls combined with branches.
 - `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
 
+## Upstream comparison (`./cg_clif`)
+
+Recently aligned with upstream:
+- **Integer cast skeleton matches upstream** — our `codegen_intcast`
+  follows the same `equal -> extend -> reduce` pattern as upstream's
+  `clif_intcast` in `cg_clif/src/cast.rs`.
+- **Float `Rem` lowering matches upstream for `f32`/`f64`** — both use
+  libcalls (`fmodf`/`fmod`) from Cranelift codegen.
+- **Pointer `Offset` scaling now matches upstream** — we now multiply the
+  offset by `pointee_size` before adding to the base pointer.
+
+Still diverges from upstream:
+- **Pointer coercion casts are incomplete** — upstream handles
+  `PointerCoercion::{ReifyFnPointer, UnsafeFnPointer, ClosureFnPointer, Unsize}`
+  explicitly (plus borrowck-only `MutToConstPointer`/`ArrayToPointer` cases).
+  Our current code treats `CastKind::PointerCoercion(_)` as a scalar cast,
+  which is not sufficient for full parity.
+- **Wide-pointer cast behavior is missing** — upstream has dedicated
+  scalar-pair handling (wide<->wide and wide->thin paths). Our scalar-only
+  path does not yet implement this.
+- **Cast edge semantics are still simplified** — upstream handles i128
+  conversion libcalls and float->int nuances (NaN behavior / saturating cast
+  details) that we have not fully ported.
+
 Known bugs (divergence from upstream cg_clif):
-- **Pointer `Offset` missing size scaling** — our `BinOp::Offset` does
-  `iadd(ptr, offset)` but upstream does `iadd(ptr, imul_imm(offset, pointee_size))`.
-  `ptr.offset(2)` should advance by `2 * sizeof(T)` bytes, not 2 bytes.
 - **Constants only handle small scalars** — `const_to_i64` extracts raw bytes
   into i64. Missing: pointer constants (references to allocations/statics),
   slice constants (fat pointers), i128 (upstream uses `iconcat(lsb, msb)`),
@@ -41,18 +65,19 @@ What's missing:
 - `CValue`/`CPlace` abstractions (currently using raw Cranelift `Value`)
 - Overflow binops: `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow`
   (return tuple, need CValue pairs)
-- Float `Rem` (needs libcall to fmod/fmodf)
 - Indirect calls (fn pointers, closures)
 - Struct/enum constructor calls (`CallableDefId::StructId`/`EnumVariantId`)
 - Aggregates: non-scalar locals (need stack slots), projections
-- Casts, discriminants, intrinsics, drop glue, etc.
+- Remaining casts (`DynStar`, pointer-coercion cases that require non-scalar
+  representations and wide-pointer behavior), discriminants, intrinsics,
+  drop glue, etc.
 
 Next steps (easiest to port):
-1. Fix pointer `Offset` — one-line fix, multiply offset by pointee size
-2. `CValue`/`CPlace` — value-with-layout abstraction (enables aggregates,
+1. `CValue`/`CPlace` — value-with-layout abstraction (enables aggregates,
    overflow ops, projections)
-3. Casts (`Rvalue::Cast`)
-4. Aggregate support (struct/enum locals, field projections)
+2. Aggregate support (struct/enum locals, field projections)
+3. Overflow binops (`AddWithOverflow` etc.) on top of `CValue::ByValPair`
+4. Remaining cast/discriminant/intrinsic/drop-glue coverage
 
 ## Original cg_clif architecture
 

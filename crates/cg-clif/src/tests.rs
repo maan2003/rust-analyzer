@@ -21,6 +21,11 @@ use hir_ty::{
     next_solver::{DbInterner, GenericArgs},
 };
 
+unsafe extern "C" {
+    fn fmodf(x: f32, y: f32) -> f32;
+    fn fmod(x: f64, y: f64) -> f64;
+}
+
 // ---------------------------------------------------------------------------
 // TestDB (same pattern as hir-ty's test_db)
 // ---------------------------------------------------------------------------
@@ -282,8 +287,10 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         let file_id = *file_ids.last().unwrap();
         let isa = crate::build_host_isa(false);
 
-        let jit_builder =
+        let mut jit_builder =
             cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        jit_builder.symbol("fmodf", fmodf as *const u8);
+        jit_builder.symbol("fmod", fmod as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         for &name in fn_names {
@@ -679,6 +686,52 @@ fn foo() -> f64 {
         "foo",
     );
     assert_eq!(result, 4.0);
+}
+
+#[test]
+fn jit_float_rem() {
+    let result = jit_run::<f64>(
+        r#"
+fn foo() -> f64 {
+    7.25 % 2.0
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 1.25);
+}
+
+#[test]
+fn jit_casts_int_float() {
+    let result = jit_run::<i32>(
+        r#"
+fn foo() -> i32 {
+    let a = 250u8 as i32;
+    let b = 3.75f32 as i32;
+    let c = 2i16 as f32;
+    a + b + c as i32
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 255);
+}
+
+#[test]
+fn jit_pointer_int_cast_roundtrip() {
+    let result = jit_run::<usize>(
+        r#"
+fn foo() -> usize {
+    let p = 0x1000usize as *const i32;
+    p as usize
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 0x1000);
 }
 
 #[test]

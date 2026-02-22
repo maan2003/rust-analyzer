@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, Signature, Type, Value, types};
+use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, MemFlags, Signature, Type, Value, types};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
@@ -16,7 +16,8 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::CallableDefId;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
-    BasicBlockId, BinOp, LocalId, MirBody, Operand, OperandKind, Place, Rvalue, StatementKind,
+    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, Rvalue,
+    StatementKind,
     TerminatorKind, UnOp,
 };
 use hir_ty::next_solver::{Const, ConstKind, GenericArgs, IntoKind, StoredTy, TyKind};
@@ -168,6 +169,122 @@ fn bin_op_to_floatcc(op: &BinOp) -> FloatCC {
     }
 }
 
+fn ty_is_signed_int(ty: StoredTy) -> bool {
+    matches!(ty.as_ref().kind(), TyKind::Int(_))
+}
+
+fn codegen_intcast(fx: &mut FunctionCx<'_, impl Module>, val: Value, to_ty: Type, signed: bool) -> Value {
+    let from_ty = fx.bcx.func.dfg.value_type(val);
+    match (from_ty, to_ty) {
+        (_, _) if from_ty == to_ty => val,
+        (_, _) if to_ty.wider_or_equal(from_ty) => {
+            if signed {
+                fx.bcx.ins().sextend(to_ty, val)
+            } else {
+                fx.bcx.ins().uextend(to_ty, val)
+            }
+        }
+        (_, _) => fx.bcx.ins().ireduce(to_ty, val),
+    }
+}
+
+fn codegen_libcall1(
+    fx: &mut FunctionCx<'_, impl Module>,
+    name: &str,
+    params: &[Type],
+    ret: Type,
+    args: &[Value],
+) -> Value {
+    let mut sig = Signature::new(fx.isa.default_call_conv());
+    sig.params.extend(params.iter().copied().map(AbiParam::new));
+    sig.returns.push(AbiParam::new(ret));
+
+    let func_id = fx
+        .module
+        .declare_function(name, Linkage::Import, &sig)
+        .expect("declare libcall");
+    let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
+    let call = fx.bcx.ins().call(func_ref, args);
+    fx.bcx.inst_results(call)[0]
+}
+
+fn codegen_cast(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    kind: &CastKind,
+    operand: &Operand,
+    target_ty: &StoredTy,
+) -> Value {
+    let from_ty = operand_ty(body, &operand.kind);
+    let from_val = codegen_operand(fx, body, &operand.kind);
+    let from_clif_ty = fx.bcx.func.dfg.value_type(from_val);
+
+    let target_layout = fx
+        .db
+        .layout_of_ty(target_ty.clone(), fx.env.clone())
+        .expect("layout error for cast target");
+    let BackendRepr::Scalar(target_scalar) = target_layout.backend_repr else {
+        todo!("cast target must be scalar")
+    };
+    let target_clif_ty = scalar_to_clif_type(fx.dl, &target_scalar);
+
+    match kind {
+        CastKind::IntToInt => {
+            let from_signed = ty_is_signed_int(from_ty);
+            codegen_intcast(fx, from_val, target_clif_ty, from_signed)
+        }
+        CastKind::FloatToInt => {
+            if ty_is_signed_int(target_ty.clone()) {
+                fx.bcx.ins().fcvt_to_sint_sat(target_clif_ty, from_val)
+            } else {
+                fx.bcx.ins().fcvt_to_uint_sat(target_clif_ty, from_val)
+            }
+        }
+        CastKind::IntToFloat => {
+            let from_signed = ty_is_signed_int(from_ty);
+            if from_signed {
+                fx.bcx.ins().fcvt_from_sint(target_clif_ty, from_val)
+            } else {
+                fx.bcx.ins().fcvt_from_uint(target_clif_ty, from_val)
+            }
+        }
+        CastKind::FloatToFloat => match (from_clif_ty, target_clif_ty) {
+            (from, to) if from == to => from_val,
+            (from, to) if to.wider_or_equal(from) => fx.bcx.ins().fpromote(to, from_val),
+            (to, from) if to.wider_or_equal(from) => fx.bcx.ins().fdemote(from, from_val),
+            _ => unreachable!("invalid float cast from {from_clif_ty:?} to {target_clif_ty:?}"),
+        },
+        CastKind::PtrToPtr
+        | CastKind::FnPtrToPtr
+        | CastKind::PointerExposeProvenance
+        | CastKind::PointerWithExposedProvenance
+        | CastKind::PointerCoercion(_) => {
+            let from_signed = ty_is_signed_int(from_ty);
+            codegen_intcast(fx, from_val, target_clif_ty, from_signed)
+        }
+        CastKind::Transmute => {
+            let from_layout = fx
+                .db
+                .layout_of_ty(from_ty.clone(), fx.env.clone())
+                .expect("layout error for transmute source");
+            assert_eq!(
+                from_layout.size, target_layout.size,
+                "transmute between differently-sized types"
+            );
+            if from_clif_ty == target_clif_ty {
+                from_val
+            } else if from_clif_ty.bits() == target_clif_ty.bits() {
+                fx.bcx.ins().bitcast(target_clif_ty, MemFlags::new(), from_val)
+            } else {
+                unreachable!(
+                    "transmute between mismatched clif types: {from_clif_ty:?} -> {target_clif_ty:?}"
+                );
+            }
+        }
+        CastKind::DynStar => todo!("dyn* cast"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
@@ -207,6 +324,7 @@ fn codegen_rvalue(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, rvalue: 
         Rvalue::Use(operand) => codegen_operand(fx, body, &operand.kind),
         Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, body, op, lhs, rhs),
         Rvalue::UnaryOp(op, operand) => codegen_unop(fx, body, op, operand),
+        Rvalue::Cast(kind, operand, target_ty) => codegen_cast(fx, body, kind, operand, target_ty),
         _ => todo!("rvalue: {:?}", rvalue),
     }
 }
@@ -226,7 +344,19 @@ fn codegen_binop(
         Primitive::Int(_, signed) => codegen_int_binop(fx, op, lhs_val, rhs_val, signed),
         Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
         Primitive::Pointer(_) => match op {
-            BinOp::Offset => fx.bcx.ins().iadd(lhs_val, rhs_val),
+            BinOp::Offset => {
+                let lhs_ty = operand_ty(body, &lhs.kind);
+                let pointee_ty = lhs_ty
+                    .as_ref()
+                    .builtin_deref(true)
+                    .expect("Offset lhs must be a pointer/reference");
+                let pointee_layout = fx
+                    .db
+                    .layout_of_ty(pointee_ty.store(), fx.env.clone())
+                    .expect("layout error for pointee type");
+                let byte_offset = fx.bcx.ins().imul_imm(rhs_val, pointee_layout.size.bytes() as i64);
+                fx.bcx.ins().iadd(lhs_val, byte_offset)
+            }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
                 let cc = bin_op_to_intcc(op, false);
                 fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
@@ -307,7 +437,15 @@ fn codegen_float_binop(
         BinOp::Sub | BinOp::SubUnchecked => b.ins().fsub(lhs, rhs),
         BinOp::Mul | BinOp::MulUnchecked => b.ins().fmul(lhs, rhs),
         BinOp::Div => b.ins().fdiv(lhs, rhs),
-        BinOp::Rem => todo!("float rem (needs libcall)"),
+        BinOp::Rem => {
+            let ty = b.func.dfg.value_type(lhs);
+            let name = match ty {
+                types::F32 => "fmodf",
+                types::F64 => "fmod",
+                _ => todo!("float rem for {ty:?}"),
+            };
+            codegen_libcall1(fx, name, &[ty, ty], ty, &[lhs, rhs])
+        }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
             let cc = bin_op_to_floatcc(op);
             b.ins().fcmp(cc, lhs, rhs)

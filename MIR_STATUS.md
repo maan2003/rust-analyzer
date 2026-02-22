@@ -137,9 +137,11 @@ All `Infallible` stubs have been removed from MIR types.
 - **Arithmetic**: Lowering emits wrapping `BinOp::Add/Sub/Mul` for `+`/`-`/`*`. This matches rustc — overflow checks are inserted by a later MIR pass (`Assert` terminators using `AddWithOverflow`), not during initial lowering. The `WithOverflow`/`Unchecked` variants are defined for use by MIR passes and intrinsic lowering.
 - **Intrinsics as calls**: Most intrinsics (`unchecked_add`, `saturating_add`, `copy_nonoverlapping`, `offset`, etc.) are lowered as regular `Call` terminators and handled by the eval shim. Only `transmute`/`transmute_unchecked` are specially lowered to `Cast(Transmute)`. Codegen will need to recognize these intrinsic calls.
 - **Cast lowering**: `cast_kind()` in `lower.rs` covers Ptr↔Int, Int↔Int, Float↔Int, Float↔Float, Ptr↔Ptr, FnPtr→Ptr. Returns `not_supported!` for unknown combinations (conservative).
+- **Cast classification is approximate without THIR**: `Expr::Cast` currently special-cases `source_ty.as_reference()` to `PointerCoercion(ArrayToPointer)` before `cast_kind()`. This is intentionally conservative but can differ from rustc's finer-grained cast classification.
 - **Downcast**: Correctly emitted before field access on enum variants in pattern matching.
 - **AddressOf**: Correctly emitted for `&raw const/mut` and `addr_of!` coercions.
 - **LogicOp**: `&&`/`||` lowered as `BitAnd`/`BitOr` (not short-circuit). Has a FIXME.
+- **Source-level raw-pointer `offset` in fixtures**: In the lightweight `TestDB` fixture used by `crates/cg-clif` tests, calling `p.offset(n)` currently fails MIR lowering with `UnresolvedMethod("offset")`. The intrinsic path remains lowerable, but this blocks a direct source-level regression for `BinOp::Offset`.
 
 ## Expressions not lowered (`not_supported!`)
 
@@ -158,3 +160,4 @@ These are intentional gaps — uncommon or unstable features.
 2. `Intrinsic` statement -- `assume`, `copy_nonoverlapping`.
 3. `UnwindAction` enum -- rustc uses this instead of `Option<BasicBlockId>` for unwind. Only matters for panic=unwind.
 4. Lower more intrinsics to MIR constructs (e.g. `offset` → `BinOp::Offset`) as needed by codegen.
+5. Fix raw-pointer inherent method resolution for `offset` in the test/fixture path so source-level `p.offset(n)` can exercise `BinOp::Offset` end-to-end.
