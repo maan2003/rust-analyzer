@@ -153,17 +153,15 @@ rustc roundtrip.
 - Overflow/unchecked `BinOp` variants (`AddWithOverflow`, `SubWithOverflow`,
   `MulWithOverflow`, `AddUnchecked`, `SubUnchecked`, `MulUnchecked`,
   `ShlUnchecked`, `ShrUnchecked`, `Cmp`)
+- `DropAndReplace` removed (rustc removed it, r-a never emitted it)
+- `ThreadLocalRef(StaticId)` — real variant (no more `Infallible` stub).
+  Not emitted by lowering yet (r-a doesn't track `#[thread_local]`).
+- Zero `Infallible` stubs remain in MIR types
 
 ### Remaining (by priority for codegen)
 
-- `ThreadLocalRef(StaticId)` — still Infallible stub, low priority (only
-  thread-local statics)
 - `OperandKind::Static` — non-standard, rustc uses `Constant` for statics.
   Works for codegen but diverges from cg_clif's expectations.
-- `ShallowInitBoxWithAlloc` — non-standard r-a invention. cg_clif won't
-  recognize it; needs lowering to alloc call + `ShallowInitBox`.
-- `DropAndReplace` — rustc removed this terminator, replaced with
-  `Drop` + assignment. r-a still emits it.
 - `Intrinsic` statement (`NonDivergingIntrinsic`: `assume`,
   `copy_nonoverlapping`) — needed when lowering uses these intrinsics
 - Coroutine support (`AggregateKind::Coroutine`, `Yield`/`CoroutineDrop`

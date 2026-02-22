@@ -1713,7 +1713,7 @@ impl<'db> Evaluator<'db> {
                 }
                 CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
             },
-            Rvalue::ThreadLocalRef(n) => match *n {},
+            Rvalue::ThreadLocalRef(_) => not_supported!("thread local ref"),
         })
     }
 

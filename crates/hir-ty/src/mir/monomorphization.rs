@@ -181,7 +181,7 @@ impl<'db> Filler<'db> {
                         | Rvalue::UnaryOp(_, _)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
-                        Rvalue::ThreadLocalRef(n) => match *n {},
+                        Rvalue::ThreadLocalRef(_) => (),
                     },
                     StatementKind::Deinit(_)
                     | StatementKind::SetDiscriminant { .. }
@@ -208,7 +208,6 @@ impl<'db> Filler<'db> {
                     | TerminatorKind::Return
                     | TerminatorKind::Unreachable
                     | TerminatorKind::Drop { .. }
-                    | TerminatorKind::DropAndReplace { .. }
                     | TerminatorKind::Assert { .. }
                     | TerminatorKind::Yield { .. }
                     | TerminatorKind::CoroutineDrop

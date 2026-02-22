@@ -487,7 +487,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 w!(self, "&raw {m} ");
                 self.place(p);
             }
-            Rvalue::ThreadLocalRef(n) => match *n {},
+            Rvalue::ThreadLocalRef(s) => w!(self, "ThreadLocalRef({:?})", s),
         }
     }
 

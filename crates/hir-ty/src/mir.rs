@@ -509,43 +509,6 @@ pub enum TerminatorKind {
     /// > consider indirect assignments.
     Drop { place: Place, target: BasicBlockId, unwind: Option<BasicBlockId> },
 
-    /// Drops the place and assigns a new value to it.
-    ///
-    /// This first performs the exact same operation as the pre drop-elaboration `Drop` terminator;
-    /// it then additionally assigns the `value` to the `place` as if by an assignment statement.
-    /// This assignment occurs both in the unwind and the regular code paths. The semantics are best
-    /// explained by the elaboration:
-    ///
-    /// ```ignore (MIR)
-    /// BB0 {
-    ///   DropAndReplace(P <- V, goto BB1, unwind BB2)
-    /// }
-    /// ```
-    ///
-    /// becomes
-    ///
-    /// ```ignore (MIR)
-    /// BB0 {
-    ///   Drop(P, goto BB1, unwind BB2)
-    /// }
-    /// BB1 {
-    ///   // P is now uninitialized
-    ///   P <- V
-    /// }
-    /// BB2 {
-    ///   // P is now uninitialized -- its dtor panicked
-    ///   P <- V
-    /// }
-    /// ```
-    ///
-    /// Disallowed after drop elaboration.
-    DropAndReplace {
-        place: Place,
-        value: Operand,
-        target: BasicBlockId,
-        unwind: Option<BasicBlockId>,
-    },
-
     /// Roughly speaking, evaluates the `func` operand and the arguments, and starts execution of
     /// the referred to function. The operand types must match the argument types of the function.
     /// The return place type must match the return type. The type of the `func` operand must be
@@ -950,8 +913,7 @@ pub enum Rvalue {
     ///
     /// **Needs clarification**: Are there weird additional semantics here related to the runtime
     /// nature of this operation?
-    // ThreadLocalRef(DefId),
-    ThreadLocalRef(std::convert::Infallible),
+    ThreadLocalRef(StaticId),
 
     /// Creates a pointer with the indicated mutability to the place.
     ///
@@ -1145,7 +1107,7 @@ impl MirBody {
                                 }
                             }
                             Rvalue::AddressOf(_, p) => f(p, &mut self.projection_store),
-                            Rvalue::ThreadLocalRef(n) => match *n {},
+                            Rvalue::ThreadLocalRef(_) => (),
                         }
                     }
                     StatementKind::FakeRead(p)
@@ -1173,10 +1135,6 @@ impl MirBody {
                     | TerminatorKind::Unreachable => (),
                     TerminatorKind::Drop { place, .. } => {
                         f(place, &mut self.projection_store);
-                    }
-                    TerminatorKind::DropAndReplace { place, value, .. } => {
-                        f(place, &mut self.projection_store);
-                        for_operand(value, &mut f, &mut self.projection_store);
                     }
                     TerminatorKind::Call { func, args, destination, .. } => {
                         for_operand(func, &mut f, &mut self.projection_store);
