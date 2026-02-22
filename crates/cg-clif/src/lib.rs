@@ -11,25 +11,34 @@ use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, MemFlags, Signature, T
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{CallableDefId, ItemContainerId};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
-    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, Rvalue,
-    StatementKind,
-    TerminatorKind, UnOp,
+    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place,
+    ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
+use either::Either;
 use hir_ty::next_solver::{Const, ConstKind, GenericArgs, IntoKind, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
+use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
+use triomphe::Arc as TArc;
 
 pub mod link;
 mod pointer;
 pub mod symbol_mangling;
+mod value_and_place;
+
+use hir_ty::layout::Layout;
+use value_and_place::{CPlace, CValue};
+
+/// Layout Arc type alias (triomphe::Arc from hir-ty's layout_of_ty).
+type LayoutArc = TArc<Layout>;
 
 // ---------------------------------------------------------------------------
 // Type mapping: r-a Ty → Cranelift Type
@@ -80,15 +89,8 @@ struct FunctionCx<'a, M: Module> {
 
     /// MIR basic block → Cranelift block
     block_map: ArenaMap<BasicBlockId, Block>,
-    /// MIR local → Cranelift variable (for scalar locals) or ZST
-    local_map: ArenaMap<LocalId, LocalStorage>,
-}
-
-#[derive(Clone)]
-enum LocalStorage {
-    Var(Variable, Type),
-    Zst,
-    // Stack(StackSlot),
+    /// MIR local → CPlace (SSA variable, variable pair, or stack slot)
+    local_map: ArenaMap<LocalId, CPlace>,
 }
 
 impl<M: Module> FunctionCx<'_, M> {
@@ -96,7 +98,7 @@ impl<M: Module> FunctionCx<'_, M> {
         self.block_map[bb]
     }
 
-    fn local_storage(&self, local: LocalId) -> &LocalStorage {
+    fn local_place(&self, local: LocalId) -> &CPlace {
         &self.local_map[local]
     }
 }
@@ -124,25 +126,31 @@ fn const_to_i64(konst: Const<'_>, size: Size) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Extract the stored type from an operand.
-fn operand_ty(body: &MirBody, kind: &OperandKind) -> StoredTy {
+fn operand_ty(db: &dyn HirDatabase, body: &MirBody, kind: &OperandKind) -> StoredTy {
     match kind {
         OperandKind::Constant { ty, .. } => ty.clone(),
         OperandKind::Copy(place) | OperandKind::Move(place) => {
-            assert!(place.projection.is_empty(), "projections not yet supported");
-            body.locals[place.local].ty.clone()
+            place_ty(db, body, place)
         }
         OperandKind::Static(_) => todo!("static operand type"),
     }
 }
 
-/// Get the scalar representation of an operand's type.
-fn operand_scalar(fx: &FunctionCx<'_, impl Module>, body: &MirBody, kind: &OperandKind) -> Scalar {
-    let ty = operand_ty(body, kind);
-    let layout = fx.db.layout_of_ty(ty, fx.env.clone()).expect("layout error");
-    match layout.backend_repr {
-        BackendRepr::Scalar(scalar) => scalar,
-        _ => panic!("expected scalar type for operand"),
+fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
+    let mut ty = body.locals[place.local].ty.clone();
+    let projections = place.projection.lookup(&body.projection_store);
+    for proj in projections {
+        ty = match proj {
+            ProjectionElem::Field(field) => field_type(db, &ty, field),
+            ProjectionElem::Deref => {
+                ty.as_ref().builtin_deref(true).expect("deref on non-pointer").store()
+            }
+            ProjectionElem::Downcast(_) => ty, // Downcast doesn't change the Rust type
+            ProjectionElem::ClosureField(idx) => closure_field_type(db, &ty, *idx),
+            _ => todo!("place_ty for {:?}", proj),
+        };
     }
+    ty
 }
 
 fn bin_op_to_intcc(op: &BinOp, signed: bool) -> IntCC {
@@ -218,21 +226,19 @@ fn codegen_cast(
     kind: &CastKind,
     operand: &Operand,
     target_ty: &StoredTy,
-) -> Value {
-    let from_ty = operand_ty(body, &operand.kind);
-    let from_val = codegen_operand(fx, body, &operand.kind);
+    result_layout: &LayoutArc,
+) -> CValue {
+    let from_ty = operand_ty(fx.db, body, &operand.kind);
+    let from_cval = codegen_operand(fx, body, &operand.kind);
+    let from_val = from_cval.load_scalar(fx);
     let from_clif_ty = fx.bcx.func.dfg.value_type(from_val);
 
-    let target_layout = fx
-        .db
-        .layout_of_ty(target_ty.clone(), fx.env.clone())
-        .expect("layout error for cast target");
-    let BackendRepr::Scalar(target_scalar) = target_layout.backend_repr else {
+    let BackendRepr::Scalar(target_scalar) = result_layout.backend_repr else {
         todo!("cast target must be scalar")
     };
     let target_clif_ty = scalar_to_clif_type(fx.dl, &target_scalar);
 
-    match kind {
+    let val = match kind {
         CastKind::IntToInt => {
             let from_signed = ty_is_signed_int(from_ty);
             codegen_intcast(fx, from_val, target_clif_ty, from_signed)
@@ -267,12 +273,8 @@ fn codegen_cast(
             codegen_intcast(fx, from_val, target_clif_ty, from_signed)
         }
         CastKind::Transmute => {
-            let from_layout = fx
-                .db
-                .layout_of_ty(from_ty.clone(), fx.env.clone())
-                .expect("layout error for transmute source");
             assert_eq!(
-                from_layout.size, target_layout.size,
+                from_cval.layout.size, result_layout.size,
                 "transmute between differently-sized types"
             );
             if from_clif_ty == target_clif_ty {
@@ -286,6 +288,139 @@ fn codegen_cast(
             }
         }
         CastKind::DynStar => todo!("dyn* cast"),
+    };
+    CValue::by_val(val, result_layout.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Place codegen
+// ---------------------------------------------------------------------------
+
+fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &Place) -> CPlace {
+    let projections = place.projection.lookup(&body.projection_store);
+    if projections.is_empty() {
+        return fx.local_place(place.local).clone();
+    }
+
+    let mut cplace = fx.local_place(place.local).clone();
+    let mut cur_ty = body.locals[place.local].ty.clone();
+
+    for proj in projections {
+        match proj {
+            ProjectionElem::Field(field) => {
+                let field_idx = match field {
+                    Either::Left(field_id) => {
+                        field_id.local_id.into_raw().into_u32() as usize
+                    }
+                    Either::Right(tuple_field_id) => tuple_field_id.index as usize,
+                };
+
+                // Determine the field type from the current type
+                let field_ty = field_type(fx.db, &cur_ty, field);
+                let field_layout = fx
+                    .db
+                    .layout_of_ty(field_ty.clone(), fx.env.clone())
+                    .expect("field layout error");
+
+                cplace = cplace.place_field(fx, field_idx, field_layout);
+                cur_ty = field_ty;
+            }
+            ProjectionElem::Deref => {
+                let inner_ty = cur_ty
+                    .as_ref()
+                    .builtin_deref(true)
+                    .expect("deref on non-pointer type");
+                let inner_layout = fx
+                    .db
+                    .layout_of_ty(inner_ty.store(), fx.env.clone())
+                    .expect("deref layout error");
+
+                // Load the pointer value from the current place
+                let ptr_val = cplace.to_cvalue(fx).load_scalar(fx);
+                cplace = CPlace::for_ptr(pointer::Pointer::new(ptr_val), inner_layout);
+                cur_ty = inner_ty.store();
+            }
+            ProjectionElem::Downcast(variant_idx) => {
+                let variant_layout = variant_layout(
+                    fx.db,
+                    &cur_ty,
+                    &cplace.layout,
+                    *variant_idx,
+                    &fx.env,
+                );
+                cplace = cplace.downcast_variant(variant_layout);
+                // cur_ty stays the same (Downcast is just a type assertion)
+            }
+            ProjectionElem::ClosureField(idx) => {
+                // Closure captures are stored as fields of the closure struct
+                let field_ty = closure_field_type(fx.db, &cur_ty, *idx);
+                let field_layout = fx
+                    .db
+                    .layout_of_ty(field_ty.clone(), fx.env.clone())
+                    .expect("closure field layout error");
+                cplace = cplace.place_field(fx, *idx, field_layout);
+                cur_ty = field_ty;
+            }
+            ProjectionElem::Index(_) => todo!("Index projection"),
+            ProjectionElem::ConstantIndex { .. } => todo!("ConstantIndex projection"),
+            ProjectionElem::Subslice { .. } => todo!("Subslice projection"),
+            ProjectionElem::OpaqueCast(_) => todo!("OpaqueCast projection"),
+        }
+    }
+    cplace
+}
+
+/// Get the type of a field from a parent type.
+fn field_type(
+    _db: &dyn HirDatabase,
+    parent_ty: &StoredTy,
+    field: &Either<hir_def::FieldId, hir_def::TupleFieldId>,
+) -> StoredTy {
+    match parent_ty.as_ref().kind() {
+        TyKind::Tuple(tys) => {
+            let idx = match field {
+                Either::Right(tuple_field) => tuple_field.index as usize,
+                Either::Left(field_id) => {
+                    field_id.local_id.into_raw().into_u32() as usize
+                }
+            };
+            tys.as_slice()[idx].store()
+        }
+        TyKind::Adt(_adt_id, _args) => {
+            todo!("field_type for ADT types (coming in M3.3)")
+        }
+        _ => todo!("field_type for {:?}", parent_ty.as_ref().kind()),
+    }
+}
+
+/// Get the type of a closure field (captured variable).
+fn closure_field_type(
+    _db: &dyn HirDatabase,
+    _closure_ty: &StoredTy,
+    _idx: usize,
+) -> StoredTy {
+    todo!("closure_field_type (coming in M3.3)")
+}
+
+/// Compute a variant layout for Downcast projection.
+fn variant_layout(
+    _db: &dyn HirDatabase,
+    _ty: &StoredTy,
+    parent_layout: &TArc<Layout>,
+    variant_idx: VariantIdx,
+    _env: &StoredParamEnvAndCrate,
+) -> TArc<Layout> {
+    use rustc_abi::Variants;
+    match &parent_layout.variants {
+        Variants::Single { .. } => {
+            // Single variant — layout stays the same, just bump refcount
+            parent_layout.clone()
+        }
+        Variants::Multiple { variants, .. } => {
+            let variant = &variants[variant_idx];
+            TArc::new(variant.clone())
+        }
+        Variants::Empty => panic!("downcast on empty variants"),
     }
 }
 
@@ -306,30 +441,185 @@ fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, stmt:
 }
 
 fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &Place, rvalue: &Rvalue) {
-    assert!(place.projection.is_empty(), "projections not yet supported");
-
-    match fx.local_storage(place.local) {
-        LocalStorage::Zst => return,
-        LocalStorage::Var(_, _) => {}
+    let dest = codegen_place(fx, body, place);
+    if dest.layout.is_zst() {
+        return;
     }
 
-    let val = codegen_rvalue(fx, body, rvalue);
-
-    match fx.local_storage(place.local) {
-        LocalStorage::Var(var, _) => {
-            fx.bcx.def_var(*var, val);
+    // Some rvalues need to write directly to the destination place
+    match rvalue {
+        Rvalue::Aggregate(kind, operands) => {
+            codegen_aggregate(fx, body, kind, operands, dest);
+            return;
         }
-        LocalStorage::Zst => unreachable!(),
+        Rvalue::Ref(_, ref_place) | Rvalue::AddressOf(_, ref_place) => {
+            let place = codegen_place(fx, body, ref_place);
+            let ptr = place.to_ptr();
+            let val = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+            dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+            return;
+        }
+        Rvalue::Discriminant(disc_place) => {
+            let disc_cplace = codegen_place(fx, body, disc_place);
+            let disc_val = codegen_get_discriminant(fx, &disc_cplace, &dest.layout);
+            dest.write_cvalue(fx, CValue::by_val(disc_val, dest.layout.clone()));
+            return;
+        }
+        _ => {}
+    }
+
+    let val = codegen_rvalue(fx, body, rvalue, &dest.layout);
+    dest.write_cvalue(fx, val);
+}
+
+fn codegen_rvalue(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    rvalue: &Rvalue,
+    result_layout: &LayoutArc,
+) -> CValue {
+    match rvalue {
+        Rvalue::Use(operand) => codegen_operand(fx, body, &operand.kind),
+        Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, body, op, lhs, rhs, result_layout),
+        Rvalue::UnaryOp(op, operand) => codegen_unop(fx, body, op, operand, result_layout),
+        Rvalue::Cast(kind, operand, target_ty) => {
+            codegen_cast(fx, body, kind, operand, target_ty, result_layout)
+        }
+        Rvalue::Len(place) => {
+            // For fixed-size arrays, length is a constant
+            let place_ty = place_ty(fx.db, body, place);
+            match place_ty.as_ref().kind() {
+                TyKind::Array(_, len) => {
+                    let len_val = match len.kind() {
+                        ConstKind::Value(val) => {
+                            let bytes = &val.value.inner().memory;
+                            let mut buf = [0u8; 8];
+                            let n = bytes.len().min(8);
+                            buf[..n].copy_from_slice(&bytes[..n]);
+                            u64::from_le_bytes(buf) as i64
+                        }
+                        _ => todo!("non-value const in array length"),
+                    };
+                    CValue::by_val(
+                        fx.bcx.ins().iconst(fx.pointer_type, len_val),
+                        result_layout.clone(),
+                    )
+                }
+                _ => todo!("Len on non-array type"),
+            }
+        }
+        Rvalue::Aggregate(_, _)
+        | Rvalue::Ref(_, _)
+        | Rvalue::AddressOf(_, _)
+        | Rvalue::Discriminant(_) => {
+            unreachable!("handled in codegen_assign")
+        }
+        _ => todo!("rvalue: {:?}", rvalue),
     }
 }
 
-fn codegen_rvalue(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, rvalue: &Rvalue) -> Value {
-    match rvalue {
-        Rvalue::Use(operand) => codegen_operand(fx, body, &operand.kind),
-        Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, body, op, lhs, rhs),
-        Rvalue::UnaryOp(op, operand) => codegen_unop(fx, body, op, operand),
-        Rvalue::Cast(kind, operand, target_ty) => codegen_cast(fx, body, kind, operand, target_ty),
-        _ => todo!("rvalue: {:?}", rvalue),
+fn codegen_aggregate(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    kind: &hir_ty::mir::AggregateKind,
+    operands: &[Operand],
+    dest: CPlace,
+) {
+    use hir_ty::mir::AggregateKind;
+    match kind {
+        AggregateKind::Tuple(_) | AggregateKind::Array(_) | AggregateKind::Closure(_) => {
+            // For ScalarPair tuples, construct directly as a pair
+            if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
+                assert_eq!(operands.len(), 2, "ScalarPair aggregate expects 2 operands");
+                let val0 = codegen_operand(fx, body, &operands[0].kind).load_scalar(fx);
+                let val1 = codegen_operand(fx, body, &operands[1].kind).load_scalar(fx);
+                dest.write_cvalue(
+                    fx,
+                    CValue::by_val_pair(val0, val1, dest.layout.clone()),
+                );
+                return;
+            }
+
+            // For single scalar, construct directly
+            if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
+                assert_eq!(operands.len(), 1, "Scalar aggregate expects 1 operand");
+                let val = codegen_operand(fx, body, &operands[0].kind);
+                dest.write_cvalue(fx, val);
+                return;
+            }
+
+            // General case: write each field to the destination place
+            for (i, operand) in operands.iter().enumerate() {
+                let field_cval = codegen_operand(fx, body, &operand.kind);
+                let field_layout = field_cval.layout.clone();
+                let field_place = dest.place_field(fx, i, field_layout);
+                field_place.write_cvalue(fx, field_cval);
+            }
+        }
+        AggregateKind::Adt(_, _) => {
+            todo!("ADT aggregate (coming in M3.3)")
+        }
+        AggregateKind::Union(_, _) => {
+            todo!("Union aggregate")
+        }
+        AggregateKind::RawPtr(_, _) => {
+            todo!("RawPtr aggregate")
+        }
+    }
+}
+
+fn codegen_get_discriminant(
+    fx: &mut FunctionCx<'_, impl Module>,
+    place: &CPlace,
+    dest_layout: &LayoutArc,
+) -> Value {
+    use rustc_abi::Variants;
+    let BackendRepr::Scalar(dest_scalar) = dest_layout.backend_repr else {
+        panic!("discriminant destination must be scalar");
+    };
+    let dest_clif_ty = scalar_to_clif_type(fx.dl, &dest_scalar);
+
+    match &place.layout.variants {
+        Variants::Single { index } => {
+            // Single-variant enum or struct: for types with no explicit
+            // discriminant values the variant index IS the discriminant.
+            // TODO: enums with explicit discriminant values (e.g. `A = 100`)
+            // need db.const_eval_discriminant() lookup here.
+            let discr_val = index.as_u32();
+            fx.bcx.ins().iconst(dest_clif_ty, i64::from(discr_val))
+        }
+        Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
+            use rustc_abi::TagEncoding;
+            // Read the tag field
+            let tag_offset = place.layout.fields.offset(tag_field.as_usize());
+            let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
+            let tag_ptr = place.to_ptr().offset_i64(
+                &mut fx.bcx,
+                fx.pointer_type,
+                i64::try_from(tag_offset.bytes()).unwrap(),
+            );
+            let mut flags = MemFlags::new();
+            flags.set_notrap();
+            let tag_val = tag_ptr.load(&mut fx.bcx, tag_clif_ty, flags);
+
+            match tag_encoding {
+                TagEncoding::Direct => {
+                    let signed = match tag.primitive() {
+                        Primitive::Int(_, signed) => signed,
+                        _ => false,
+                    };
+                    codegen_intcast(fx, tag_val, dest_clif_ty, signed)
+                }
+                TagEncoding::Niche { .. } => {
+                    todo!("niche-encoded discriminant")
+                }
+            }
+        }
+        Variants::Empty => {
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+            // Unreachable, but need a value for cranelift
+            fx.bcx.ins().iconst(dest_clif_ty, 0)
+        }
     }
 }
 
@@ -339,17 +629,32 @@ fn codegen_binop(
     op: &BinOp,
     lhs: &Operand,
     rhs: &Operand,
-) -> Value {
-    let lhs_val = codegen_operand(fx, body, &lhs.kind);
-    let rhs_val = codegen_operand(fx, body, &rhs.kind);
-    let scalar = operand_scalar(fx, body, &lhs.kind);
+    result_layout: &LayoutArc,
+) -> CValue {
+    let lhs_cval = codegen_operand(fx, body, &lhs.kind);
+    let rhs_cval = codegen_operand(fx, body, &rhs.kind);
+    let lhs_val = lhs_cval.load_scalar(fx);
+    let rhs_val = rhs_cval.load_scalar(fx);
 
-    match scalar.primitive() {
+    let BackendRepr::Scalar(scalar) = lhs_cval.layout.backend_repr else {
+        panic!("expected scalar type for binop lhs");
+    };
+
+    // Overflow binops return (T, bool) as a ScalarPair
+    if matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow) {
+        let Primitive::Int(_, signed) = scalar.primitive() else {
+            panic!("overflow binop on non-integer type");
+        };
+        let (res, has_overflow) = codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
+        return CValue::by_val_pair(res, has_overflow, result_layout.clone());
+    }
+
+    let val = match scalar.primitive() {
         Primitive::Int(_, signed) => codegen_int_binop(fx, op, lhs_val, rhs_val, signed),
         Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
         Primitive::Pointer(_) => match op {
             BinOp::Offset => {
-                let lhs_ty = operand_ty(body, &lhs.kind);
+                let lhs_ty = operand_ty(fx.db, body, &lhs.kind);
                 let pointee_ty = lhs_ty
                     .as_ref()
                     .builtin_deref(true)
@@ -360,7 +665,7 @@ fn codegen_binop(
                     .expect("layout error for pointee type");
                 let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
                 let rhs_ty = fx.bcx.func.dfg.value_type(rhs_val);
-                let rhs_signed = ty_is_signed_int(operand_ty(body, &rhs.kind));
+                let rhs_signed = ty_is_signed_int(operand_ty(fx.db, body, &rhs.kind));
                 let rhs = if rhs_ty == ptr_ty {
                     rhs_val
                 } else if ptr_ty.wider_or_equal(rhs_ty) {
@@ -381,7 +686,8 @@ fn codegen_binop(
             }
             _ => todo!("pointer binop: {:?}", op),
         },
-    }
+    };
+    CValue::by_val(val, result_layout.clone())
 }
 
 fn codegen_int_binop(
@@ -437,9 +743,94 @@ fn codegen_int_binop(
             b.ins().isub(gt, lt)
         }
         BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
-            todo!("overflow binops (need CValue pairs)")
+            unreachable!("overflow binops handled by codegen_checked_int_binop")
         }
         BinOp::Offset => unreachable!("Offset on integer type"),
+    }
+}
+
+fn codegen_checked_int_binop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    op: &BinOp,
+    lhs: Value,
+    rhs: Value,
+    signed: bool,
+) -> (Value, Value) {
+    let b = &mut fx.bcx;
+    match op {
+        BinOp::AddWithOverflow => {
+            let val = b.ins().iadd(lhs, rhs);
+            let has_overflow = if !signed {
+                b.ins().icmp(IntCC::UnsignedLessThan, val, lhs)
+            } else {
+                let rhs_is_negative = b.ins().icmp_imm(IntCC::SignedLessThan, rhs, 0);
+                let slt = b.ins().icmp(IntCC::SignedLessThan, val, lhs);
+                b.ins().bxor(rhs_is_negative, slt)
+            };
+            (val, has_overflow)
+        }
+        BinOp::SubWithOverflow => {
+            let val = b.ins().isub(lhs, rhs);
+            let has_overflow = if !signed {
+                b.ins().icmp(IntCC::UnsignedGreaterThan, val, lhs)
+            } else {
+                let rhs_is_negative = b.ins().icmp_imm(IntCC::SignedLessThan, rhs, 0);
+                let sgt = b.ins().icmp(IntCC::SignedGreaterThan, val, lhs);
+                b.ins().bxor(rhs_is_negative, sgt)
+            };
+            (val, has_overflow)
+        }
+        BinOp::MulWithOverflow => {
+            let ty = b.func.dfg.value_type(lhs);
+            match ty {
+                types::I8 | types::I16 | types::I32 if !signed => {
+                    let wide = ty.double_width().unwrap();
+                    let lhs_w = b.ins().uextend(wide, lhs);
+                    let rhs_w = b.ins().uextend(wide, rhs);
+                    let val_w = b.ins().imul(lhs_w, rhs_w);
+                    let has_overflow = b.ins().icmp_imm(
+                        IntCC::UnsignedGreaterThan,
+                        val_w,
+                        (1i64 << ty.bits()) - 1,
+                    );
+                    let val = b.ins().ireduce(ty, val_w);
+                    (val, has_overflow)
+                }
+                types::I8 | types::I16 | types::I32 if signed => {
+                    let wide = ty.double_width().unwrap();
+                    let lhs_w = b.ins().sextend(wide, lhs);
+                    let rhs_w = b.ins().sextend(wide, rhs);
+                    let val_w = b.ins().imul(lhs_w, rhs_w);
+                    let has_underflow = b.ins().icmp_imm(
+                        IntCC::SignedLessThan,
+                        val_w,
+                        -(1i64 << (ty.bits() - 1)),
+                    );
+                    let has_overflow = b.ins().icmp_imm(
+                        IntCC::SignedGreaterThan,
+                        val_w,
+                        (1i64 << (ty.bits() - 1)) - 1,
+                    );
+                    let val = b.ins().ireduce(ty, val_w);
+                    (val, b.ins().bor(has_underflow, has_overflow))
+                }
+                types::I64 => {
+                    let val = b.ins().imul(lhs, rhs);
+                    let has_overflow = if !signed {
+                        let val_hi = b.ins().umulhi(lhs, rhs);
+                        b.ins().icmp_imm(IntCC::NotEqual, val_hi, 0)
+                    } else {
+                        let val_hi = b.ins().smulhi(lhs, rhs);
+                        let val_sign = b.ins().sshr_imm(val, i64::from(ty.bits() - 1));
+                        let xor = b.ins().bxor(val_hi, val_sign);
+                        b.ins().icmp_imm(IntCC::NotEqual, xor, 0)
+                    };
+                    (val, has_overflow)
+                }
+                _ => todo!("checked mul for {ty:?}"),
+            }
+        }
+        _ => unreachable!("not a checked binop: {:?}", op),
     }
 }
 
@@ -477,11 +868,13 @@ fn codegen_unop(
     body: &MirBody,
     op: &UnOp,
     operand: &Operand,
-) -> Value {
-    let val = codegen_operand(fx, body, &operand.kind);
-    match op {
+    result_layout: &LayoutArc,
+) -> CValue {
+    let cval = codegen_operand(fx, body, &operand.kind);
+    let val = cval.load_scalar(fx);
+    let result = match op {
         UnOp::Not => {
-            let ty = operand_ty(body, &operand.kind);
+            let ty = operand_ty(fx.db, body, &operand.kind);
             if ty.as_ref().kind() == TyKind::Bool {
                 fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0)
             } else {
@@ -489,26 +882,36 @@ fn codegen_unop(
             }
         }
         UnOp::Neg => {
-            let scalar = operand_scalar(fx, body, &operand.kind);
+            let BackendRepr::Scalar(scalar) = cval.layout.backend_repr else {
+                panic!("neg on non-scalar");
+            };
             match scalar.primitive() {
                 Primitive::Int(_, _) => fx.bcx.ins().ineg(val),
                 Primitive::Float(_) => fx.bcx.ins().fneg(val),
                 Primitive::Pointer(_) => unreachable!("neg on pointer"),
             }
         }
-    }
+    };
+    CValue::by_val(result, result_layout.clone())
 }
 
-fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, _body: &MirBody, kind: &OperandKind) -> Value {
+fn codegen_operand(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    kind: &OperandKind,
+) -> CValue {
     match kind {
         OperandKind::Constant { konst, ty } => {
             let layout = fx
                 .db
                 .layout_of_ty(ty.clone(), fx.env.clone())
                 .expect("layout error for constant type");
+            if layout.is_zst() {
+                return CValue::zst(layout);
+            }
             if let BackendRepr::Scalar(scalar) = layout.backend_repr {
                 let raw = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
-                match scalar.primitive() {
+                let val = match scalar.primitive() {
                     Primitive::Float(rustc_abi::Float::F32) => {
                         fx.bcx.ins().f32const(f32::from_bits(raw as u32))
                     }
@@ -520,17 +923,14 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, _body: &MirBody, kind: 
                         let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
                         fx.bcx.ins().iconst(clif_ty, raw)
                     }
-                }
+                };
+                CValue::by_val(val, layout)
             } else {
                 todo!("non-scalar constant")
             }
         }
         OperandKind::Copy(place) | OperandKind::Move(place) => {
-            assert!(place.projection.is_empty(), "projections not yet supported");
-            match fx.local_storage(place.local) {
-                LocalStorage::Var(var, _) => fx.bcx.use_var(*var),
-                LocalStorage::Zst => unreachable!("cannot produce a Value from ZST local"),
-            }
+            codegen_place(fx, body, place).to_cvalue(fx)
         }
         OperandKind::Static(_) => todo!("static operand"),
     }
@@ -543,14 +943,21 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, _body: &MirBody, kind: 
 fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term: &TerminatorKind) {
     match term {
         TerminatorKind::Return => {
-            let ret_local = hir_ty::mir::return_slot();
-            match fx.local_storage(ret_local) {
-                LocalStorage::Zst => {
-                    fx.bcx.ins().return_(&[]);
-                }
-                LocalStorage::Var(var, _) => {
-                    let val = fx.bcx.use_var(*var);
-                    fx.bcx.ins().return_(&[val]);
+            let ret_place = fx.local_place(hir_ty::mir::return_slot()).clone();
+            if ret_place.layout.is_zst() {
+                fx.bcx.ins().return_(&[]);
+            } else {
+                let cval = ret_place.to_cvalue(fx);
+                match ret_place.layout.backend_repr {
+                    BackendRepr::Scalar(_) => {
+                        let val = cval.load_scalar(fx);
+                        fx.bcx.ins().return_(&[val]);
+                    }
+                    BackendRepr::ScalarPair(_, _) => {
+                        let (a, b) = cval.load_scalar_pair(fx);
+                        fx.bcx.ins().return_(&[a, b]);
+                    }
+                    _ => todo!("return non-scalar/pair type"),
                 }
             }
         }
@@ -562,7 +969,8 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
         }
         TerminatorKind::SwitchInt { discr, targets } => {
-            let discr_val = codegen_operand(fx, body, &discr.kind);
+            let discr_cval = codegen_operand(fx, body, &discr.kind);
+            let discr_val = discr_cval.load_scalar(fx);
             let otherwise = fx.clif_block(targets.otherwise());
 
             let mut switch = Switch::new();
@@ -668,28 +1076,52 @@ fn codegen_direct_call(
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
     // Build argument values (skip ZST args that have no Cranelift representation)
-    let call_args: Vec<Value> = args
-        .iter()
-        .filter_map(|arg| {
-            let ty = operand_ty(body, &arg.kind);
-            let layout = fx
-                .db
-                .layout_of_ty(ty, fx.env.clone())
-                .expect("arg layout");
-            if layout.is_zst() {
-                None
-            } else {
-                Some(codegen_operand(fx, body, &arg.kind))
+    let mut call_args: Vec<Value> = Vec::new();
+    for arg in args {
+        let cval = codegen_operand(fx, body, &arg.kind);
+        if cval.layout.is_zst() {
+            continue;
+        }
+        match cval.layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = cval.load_scalar_pair(fx);
+                call_args.push(a);
+                call_args.push(b);
             }
-        })
-        .collect();
+            _ => {
+                call_args.push(cval.load_scalar(fx));
+            }
+        }
+    }
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
 
-    // Store return value
+    // Store return value into destination place
+    let dest = codegen_place(fx, body, destination);
     let results = fx.bcx.inst_results(call);
-    write_call_destination(fx, destination, results.get(0).copied());
+    if !dest.layout.is_zst() {
+        match dest.layout.backend_repr {
+            BackendRepr::Scalar(_) => {
+                let val = results.first().copied()
+                    .expect("call returns no values but destination expects Scalar");
+                dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+            }
+            BackendRepr::ScalarPair(_, _) => {
+                assert!(results.len() >= 2, "call returns fewer than 2 values but destination expects ScalarPair");
+                dest.write_cvalue(
+                    fx,
+                    CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                );
+            }
+            _ => {
+                // Memory return types: not yet handled
+                if !results.is_empty() {
+                    todo!("memory return types");
+                }
+            }
+        }
+    }
 
     // Jump to continuation block (or trap for diverging calls)
     if let Some(target) = target {
@@ -699,25 +1131,6 @@ fn codegen_direct_call(
         // Diverging call (returns `!`) — the callee never returns,
         // but Cranelift requires the block to be terminated.
         fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-    }
-}
-
-fn write_call_destination(
-    fx: &mut FunctionCx<'_, impl Module>,
-    destination: &Place,
-    result: Option<Value>,
-) {
-    assert!(
-        destination.projection.is_empty(),
-        "call destination projections not yet supported"
-    );
-    match fx.local_storage(destination.local) {
-        LocalStorage::Zst => {}
-        LocalStorage::Var(var, _) => {
-            if let Some(val) = result {
-                fx.bcx.def_var(*var, val);
-            }
-        }
     }
 }
 
@@ -739,10 +1152,12 @@ fn codegen_intrinsic_call(
         "offset" | "arith_offset" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
 
-            let ptr = codegen_operand(fx, body, &args[0].kind);
-            let offset = codegen_operand(fx, body, &args[1].kind);
+            let ptr_cval = codegen_operand(fx, body, &args[0].kind);
+            let offset_cval = codegen_operand(fx, body, &args[1].kind);
+            let ptr = ptr_cval.load_scalar(fx);
+            let offset = offset_cval.load_scalar(fx);
 
-            let ptr_ty = operand_ty(body, &args[0].kind);
+            let ptr_ty = operand_ty(fx.db, body, &args[0].kind);
             let pointee_ty = ptr_ty
                 .as_ref()
                 .builtin_deref(true)
@@ -754,7 +1169,7 @@ fn codegen_intrinsic_call(
 
             let ptr_clif_ty = fx.bcx.func.dfg.value_type(ptr);
             let offset_clif_ty = fx.bcx.func.dfg.value_type(offset);
-            let offset_signed = ty_is_signed_int(operand_ty(body, &args[1].kind));
+            let offset_signed = ty_is_signed_int(operand_ty(fx.db, body, &args[1].kind));
             let offset = if offset_clif_ty == ptr_clif_ty {
                 offset
             } else if ptr_clif_ty.wider_or_equal(offset_clif_ty) {
@@ -773,10 +1188,12 @@ fn codegen_intrinsic_call(
         "ptr_offset_from" | "ptr_offset_from_unsigned" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
 
-            let ptr = codegen_operand(fx, body, &args[0].kind);
-            let base = codegen_operand(fx, body, &args[1].kind);
+            let ptr_cval = codegen_operand(fx, body, &args[0].kind);
+            let base_cval = codegen_operand(fx, body, &args[1].kind);
+            let ptr = ptr_cval.load_scalar(fx);
+            let base = base_cval.load_scalar(fx);
 
-            let ptr_ty = operand_ty(body, &args[0].kind);
+            let ptr_ty = operand_ty(fx.db, body, &args[0].kind);
             let pointee_ty = ptr_ty
                 .as_ref()
                 .builtin_deref(true)
@@ -798,7 +1215,14 @@ fn codegen_intrinsic_call(
         _ => return false,
     };
 
-    write_call_destination(fx, destination, result);
+    // Write result to destination
+    let dest = codegen_place(fx, body, destination);
+    if let Some(val) = result {
+        if !dest.layout.is_zst() {
+            dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+        }
+    }
+
     if let Some(target) = target {
         let block = fx.clif_block(*target);
         fx.bcx.ins().jump(block, &[]);
@@ -836,8 +1260,17 @@ fn build_fn_sig(
     let ret_layout = db
         .layout_of_ty(ret_local.ty.clone(), env.clone())
         .map_err(|e| format!("return type layout error: {:?}", e))?;
-    if let BackendRepr::Scalar(scalar) = ret_layout.backend_repr {
-        sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+    match ret_layout.backend_repr {
+        BackendRepr::Scalar(scalar) => {
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+        }
+        BackendRepr::ScalarPair(a, b) => {
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
+        }
+        _ => {
+            // ZST or Memory — no return params
+        }
     }
 
     // Parameter types
@@ -846,12 +1279,18 @@ fn build_fn_sig(
         let param_layout = db
             .layout_of_ty(param.ty.clone(), env.clone())
             .map_err(|e| format!("param layout error: {:?}", e))?;
-        if let BackendRepr::Scalar(scalar) = param_layout.backend_repr {
-            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-        } else if param_layout.is_zst() {
-            // ZST params ignored
-        } else {
-            return Err("unsupported param type: non-scalar, non-ZST".into());
+        match param_layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
+                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
+            }
+            _ if param_layout.is_zst() => {}
+            _ => {
+                return Err("unsupported param type: non-scalar, non-ZST, non-pair".into());
+            }
         }
     }
 
@@ -943,36 +1382,79 @@ pub fn compile_fn(
         bcx.switch_to_block(entry_block);
         bcx.append_block_params_for_function_params(entry_block);
 
-        // Set up locals as Cranelift variables
+        // Build a temporary FunctionCx for local setup (needed by CPlace constructors)
         let mut local_map = ArenaMap::new();
 
+        // First pass: create CPlace for each local using direct bcx access
+        // (We can't use FunctionCx yet because we're still building it)
         for (local_id, local) in body.locals.iter() {
             let local_layout = db
                 .layout_of_ty(local.ty.clone(), env.clone())
                 .map_err(|e| format!("local layout error: {:?}", e))?;
 
-            if let BackendRepr::Scalar(scalar) = local_layout.backend_repr {
-                let clif_ty = scalar_to_clif_type(dl, &scalar);
-                let var = bcx.declare_var(clif_ty);
-                local_map.insert(local_id, LocalStorage::Var(var, clif_ty));
-            } else if local_layout.is_zst() {
-                local_map.insert(local_id, LocalStorage::Zst);
-            } else {
-                // TODO: stack slot for non-scalar types
-                return Err(format!("unsupported local type: non-scalar, non-ZST"));
-            }
+            let place = match local_layout.backend_repr {
+                BackendRepr::Scalar(scalar) => {
+                    let clif_ty = scalar_to_clif_type(dl, &scalar);
+                    let var = bcx.declare_var(clif_ty);
+                    CPlace::new_var_raw(var, local_layout)
+                }
+                BackendRepr::ScalarPair(a, b) => {
+                    let a_clif = scalar_to_clif_type(dl, &a);
+                    let b_clif = scalar_to_clif_type(dl, &b);
+                    let var1 = bcx.declare_var(a_clif);
+                    let var2 = bcx.declare_var(b_clif);
+                    CPlace::new_var_pair_raw(var1, var2, local_layout)
+                }
+                _ if local_layout.is_zst() => {
+                    CPlace::for_ptr(
+                        pointer::Pointer::dangling(local_layout.align.abi),
+                        local_layout,
+                    )
+                }
+                _ => {
+                    // Non-scalar, non-ZST: allocate stack slot
+                    let size = u32::try_from(local_layout.size.bytes())
+                        .expect("stack slot too large");
+                    let align_shift = {
+                        let a = local_layout.align.abi.bytes();
+                        assert!(a.is_power_of_two());
+                        a.trailing_zeros() as u8
+                    };
+                    let slot = bcx.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            size,
+                            align_shift,
+                        ),
+                    );
+                    CPlace::for_ptr(pointer::Pointer::stack_slot(slot), local_layout)
+                }
+            };
+            local_map.insert(local_id, place);
         }
 
         // Wire function parameters to their locals
         let block_params: Vec<Value> = bcx.block_params(entry_block).to_vec();
         let mut param_idx = 0;
         for &param_local in &body.param_locals {
-            match &local_map[param_local] {
-                LocalStorage::Var(var, _) => {
-                    bcx.def_var(*var, block_params[param_idx]);
+            let place = &local_map[param_local];
+            if place.layout.is_zst() {
+                continue;
+            }
+            match place.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    place.def_var(0, block_params[param_idx], &mut bcx);
                     param_idx += 1;
                 }
-                LocalStorage::Zst => {}
+                BackendRepr::ScalarPair(_, _) => {
+                    place.def_var(0, block_params[param_idx], &mut bcx);
+                    place.def_var(1, block_params[param_idx + 1], &mut bcx);
+                    param_idx += 2;
+                }
+                _ => {
+                    // Stack slot params: not yet handled via ABI
+                    // For now, skip non-scalar/pair params
+                }
             }
         }
 

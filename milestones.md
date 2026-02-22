@@ -52,8 +52,7 @@ Full scalar codegen working:
 - `SwitchInt` multi-way branching, direct function calls (call chains,
   calls combined with branches), `Drop` as no-op jump.
 
-Known bugs: pointer `Offset` missing size scaling, constants limited to
-small scalars, no `PassMode`/ABI handling. See `crates/cg-clif/NOTES.md`.
+See `crates/cg-clif/NOTES.md` for known bugs and upstream divergences.
 
 ---
 
@@ -62,28 +61,37 @@ small scalars, no `PassMode`/ABI handling. See `crates/cg-clif/NOTES.md`.
 Before linking against std, fill out codegen for the MIR constructs we'll
 encounter. These can all be tested via JIT without a linker.
 
-### M3.1: CValue/CPlace abstraction
+### M3.1: CValue/CPlace abstraction ✅
 
-Port `value_and_place.rs` pattern: CValue (ByRef | ByVal | ByValPair),
-CPlace (Var | VarPair | Addr). Enables non-scalar locals (stack slots),
-overflow binops (return tuples), and field projections.
+Ported `value_and_place.rs`: CValue (ByRef | ByVal | ByValPair),
+CPlace (Var | VarPair | Addr). Non-scalar locals use stack slots.
+ScalarPair locals (tuples like `(i32, i32)`) stored as VarPair,
+wired for params and returns. Memory-to-memory copy via
+`emit_small_memory_copy`.
 
-### M3.2: Casts (`Rvalue::Cast`)
+### M3.2: Casts (`Rvalue::Cast`) ✅
 
 IntToInt, FloatToInt, IntToFloat, FloatToFloat, PtrToPtr,
-PointerExposeProvenance, PointerWithExposedProvenance, Transmute.
+PointerExposeProvenance, PointerWithExposedProvenance, Transmute
+all working for scalar types.
 
-### M3.3: Aggregates
+### M3.3: Aggregates (partial — tuples only)
 
-Struct/enum/tuple locals on stack slots, `Aggregate` rvalue construction,
-`Field`/`TupleOrClosureField` projections, `Downcast` for enum variants,
-`Discriminant` rvalue, `SetDiscriminant` statement.
+Tuple aggregates working (Scalar, ScalarPair, and memory-repr fast
+paths). Tuple field projections via `CPlace::place_field`. Deref
+projection, Downcast projection (Direct tag encoding), Discriminant
+rvalue (Direct tag), Ref/AddressOf, Len for fixed-size arrays.
 
-### M3.4: Remaining scalar ops
+Still missing: ADT aggregate construction (struct/enum), ADT field
+type resolution (needs generic substitution), closure field types,
+niche-encoded discriminants, `SetDiscriminant` statement.
 
-- Overflow binops (`AddWithOverflow` etc.) — need CValue pairs
-- Float `Rem` (libcall to fmod/fmodf)
-- Fix pointer `Offset` size scaling
+### M3.4: Remaining scalar ops ✅
+
+- Overflow binops (`AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow`)
+  implemented via `codegen_checked_int_binop` returning ScalarPair.
+- Float `Rem` via fmod/fmodf libcalls.
+- Pointer `Offset` size scaling fixed.
 
 ---
 

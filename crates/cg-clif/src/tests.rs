@@ -902,6 +902,47 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Tuple / aggregate / field projection tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_tuple_field_access() {
+    let result = jit_run::<i32>(
+        r#"
+fn make_pair(a: i32, b: i32) -> (i32, i32) {
+    (a, b)
+}
+fn foo() -> i32 {
+    let pair = make_pair(10, 20);
+    pair.0 + pair.1
+}
+"#,
+        &["make_pair", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 30);
+}
+
+#[test]
+fn jit_tuple_swap() {
+    let result = jit_run::<i32>(
+        r#"
+fn swap(pair: (i32, i32)) -> (i32, i32) {
+    (pair.1, pair.0)
+}
+fn foo() -> i32 {
+    let a = (3, 7);
+    let b = swap(a);
+    b.0 * 10 + b.1
+}
+"#,
+        &["swap", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 73);
+}
+
+// ---------------------------------------------------------------------------
 // Symbol mangling tests
 // ---------------------------------------------------------------------------
 

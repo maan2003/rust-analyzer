@@ -267,6 +267,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "either",
  "hir-def",
  "hir-expand",
  "hir-ty",

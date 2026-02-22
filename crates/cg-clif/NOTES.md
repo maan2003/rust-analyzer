@@ -15,15 +15,16 @@ What works:
   (add/sub/mul/div/rem via `fmod`/`fmodf` libcalls) and comparisons.
   Pointer offset and comparisons (offset now scales by pointee size).
   Unchecked variants handled. Overflow variants (`AddWithOverflow` etc.)
-  still stubbed — need CValue pairs.
+  implemented via `codegen_checked_int_binop` returning ScalarPair.
 - `Rvalue::UnaryOp` — `Neg` (ineg/fneg), `Not` (bnot for ints, icmp_imm for bool)
 - `Rvalue::Cast` for scalar casts: int<->int, int<->float, float<->float,
   ptr<->ptr/int (`PtrToPtr`, provenance casts, `FnPtrToPtr`), scalar transmute
 - `TerminatorKind::SwitchInt` — multi-way branching via `cranelift_frontend::Switch`
-- `TerminatorKind::Call` — direct function calls (FnDef with scalar
-  args/returns). Resolves callee via TyKind::FnDef → CallableDefId,
+- `TerminatorKind::Call` — direct function calls (FnDef with scalar and
+  ScalarPair args/returns). Resolves callee via TyKind::FnDef → CallableDefId,
   gets callee MIR, builds Cranelift sig, declares in module, emits call.
-  ZST args filtered. Tested with call chains and calls combined with branches.
+  ZST args filtered. ScalarPair args passed as two values.
+  Tested with call chains and calls combined with branches.
   Includes direct lowering of pointer intrinsics used by raw-pointer methods:
   `offset`, `arith_offset`, `ptr_offset_from`, `ptr_offset_from_unsigned`.
   Extern `"C"` function calls supported: detects `ExternBlockId` container,
@@ -31,6 +32,20 @@ What works:
   uses raw (unmangled) symbol name. Diverging calls (`-> !`) terminate the
   block with a trap instruction.
 - `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
+- **CValue/CPlace abstractions** — `value_and_place.rs` ported with
+  CValue (ByRef | ByVal | ByValPair) and CPlace (Var | VarPair | Addr).
+  All locals use CPlace, operands flow through CValue.
+- **ScalarPair locals** — tuples like `(i32, i32)` stored as VarPair,
+  properly wired for function params and returns.
+- **Non-scalar locals** — Memory-repr types allocated as stack slots.
+- **Tuple aggregates** — `Rvalue::Aggregate(Tuple)` constructs tuples,
+  with fast paths for Scalar and ScalarPair representations.
+- **Field projections** — `ProjectionElem::Field` on tuples via
+  `CPlace::place_field`. VarPair splits into individual Vars for
+  ScalarPair fields; Addr offsets by field layout offset.
+- **Rvalue::Ref/AddressOf** — takes address of a place.
+- **Rvalue::Discriminant** — reads enum discriminant (Direct tag encoding).
+- **Rvalue::Len** — returns fixed-size array length as a constant.
 
 ## Upstream comparison (`./cg_clif`)
 
@@ -65,10 +80,16 @@ Known bugs (divergence from upstream cg_clif):
   slice constants (fat pointers), i128 (upstream uses `iconcat(lsb, msb)`),
   indirect constants (stored in allocations). String literals, `const &[T]`,
   etc. won't work.
-- **No `PassMode` / ABI handling in calls** — we assume all args are by-val
-  scalars or ZST. Upstream has `PassMode::Indirect` (pass-by-pointer for
-  large structs), `PassMode::Pair` (scalar pairs like slices),
-  `PassMode::Uniform`. Struct args/returns will produce wrong ABI.
+- **No `PassMode` / ABI handling in calls** — we pass Scalar and ScalarPair
+  args/returns directly and skip ZSTs, but have no `PassMode::Indirect`
+  (pass-by-pointer for large structs) or `PassMode::Uniform`. Struct
+  args/returns that aren't Scalar/ScalarPair will produce wrong ABI.
+- **`Variants::Single` discriminant uses variant index** — for enums with
+  explicit discriminant values (e.g. `A = 100`) the codegen returns the
+  variant index (0) instead of the discriminant value (100). Needs
+  `db.const_eval_discriminant()` lookup.
+- **Niche-encoded discriminant not implemented** — `TagEncoding::Niche`
+  hits `todo!()` at runtime.
 - **JIT helper compiles only explicitly listed roots** — calls from a tested
   function into other local functions not listed in `jit_run(..., fn_names, ...)`
   remain unresolved at runtime (`can't resolve symbol ...`). This especially
@@ -76,22 +97,22 @@ Known bugs (divergence from upstream cg_clif):
   unless tests use direct intrinsic calls or object-only compile checks.
 
 What's missing:
-- `CValue`/`CPlace` abstractions (currently using raw Cranelift `Value`)
-- Overflow binops: `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow`
-  (return tuple, need CValue pairs)
+- ADT aggregate construction (struct/enum `Rvalue::Aggregate`)
+- ADT field type resolution (needs generic substitution via `StoredEarlyBinder`)
+- Closure field type resolution
+- Niche-encoded discriminant reading
+- `SetDiscriminant` statement
+- Union and RawPtr aggregates
 - Indirect calls (fn pointers, closures)
 - Struct/enum constructor calls (`CallableDefId::StructId`/`EnumVariantId`)
-- Aggregates: non-scalar locals (need stack slots), projections
-- Remaining casts (`DynStar`, pointer-coercion cases that require non-scalar
-  representations and wide-pointer behavior), discriminants, intrinsics,
-  drop glue, etc.
+- Remaining casts (`DynStar`, wide-pointer coercions)
+- Intrinsics beyond pointer offset/distance
+- Drop glue
 
 Next steps (easiest to port):
-1. `CValue`/`CPlace` — value-with-layout abstraction (enables aggregates,
-   overflow ops, projections)
-2. Aggregate support (struct/enum locals, field projections)
-3. Overflow binops (`AddWithOverflow` etc.) on top of `CValue::ByValPair`
-4. Remaining cast/discriminant/intrinsic/drop-glue coverage
+1. ADT aggregate support (struct/enum locals, field projections with substitution)
+2. `SetDiscriminant` and niche-encoded discriminants
+3. Remaining cast/intrinsic/drop-glue coverage
 
 ## Original cg_clif architecture
 
