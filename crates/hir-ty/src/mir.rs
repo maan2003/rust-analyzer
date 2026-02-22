@@ -10,6 +10,7 @@ use hir_def::{
     hir::{BindingAnnotation, BindingId, Expr, ExprId, Ordering, PatId},
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
+use rac_abi::VariantIdx;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
@@ -150,7 +151,7 @@ pub enum ProjectionElem<V: PartialEq> {
     Index(V),
     ConstantIndex { offset: u64, from_end: bool },
     Subslice { from: u64, to: u64 },
-    //Downcast(Option<Symbol>, VariantIdx),
+    Downcast(VariantIdx),
     OpaqueCast(StoredTy),
 }
 
@@ -246,6 +247,7 @@ impl<V: PartialEq> ProjectionElem<V> {
                     Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
+            ProjectionElem::Downcast(_) => base,
             ProjectionElem::OpaqueCast(_) => {
                 never!("We don't emit these yet");
                 Ty::new_error(interner, ErrorGuaranteed)
@@ -772,6 +774,24 @@ pub enum BinOp {
     Gt,
     /// The `ptr.offset` operator
     Offset,
+    /// Like `Add`, but with overflow checking yielding `(T, bool)`.
+    AddWithOverflow,
+    /// Like `Sub`, but with overflow checking yielding `(T, bool)`.
+    SubWithOverflow,
+    /// Like `Mul`, but with overflow checking yielding `(T, bool)`.
+    MulWithOverflow,
+    /// Unchecked add — UB on overflow.
+    AddUnchecked,
+    /// Unchecked sub — UB on overflow.
+    SubUnchecked,
+    /// Unchecked mul — UB on overflow.
+    MulUnchecked,
+    /// Unchecked shift left — UB if rhs >= bit width.
+    ShlUnchecked,
+    /// Unchecked shift right — UB if rhs >= bit width.
+    ShrUnchecked,
+    /// Three-way comparison (returns `Ordering`).
+    Cmp,
 }
 
 impl BinOp {
@@ -785,6 +805,26 @@ impl BinOp {
             BinOp::Ne => l != r,
             x => panic!("`run_compare` called on operator {x:?}"),
         }
+    }
+
+    /// Convert an overflowing variant to its wrapping equivalent.
+    pub fn overflowing_to_wrapping(self) -> Option<Self> {
+        Some(match self {
+            BinOp::AddWithOverflow => BinOp::Add,
+            BinOp::SubWithOverflow => BinOp::Sub,
+            BinOp::MulWithOverflow => BinOp::Mul,
+            _ => return None,
+        })
+    }
+
+    /// Convert a wrapping variant to its overflowing equivalent.
+    pub fn wrapping_to_overflowing(self) -> Option<Self> {
+        Some(match self {
+            BinOp::Add => BinOp::AddWithOverflow,
+            BinOp::Sub => BinOp::SubWithOverflow,
+            BinOp::Mul => BinOp::MulWithOverflow,
+            _ => return None,
+        })
     }
 }
 
@@ -808,6 +848,15 @@ impl Display for BinOp {
             BinOp::Ge => ">=",
             BinOp::Gt => ">",
             BinOp::Offset => "`offset`",
+            BinOp::AddWithOverflow => "`add_with_overflow`",
+            BinOp::SubWithOverflow => "`sub_with_overflow`",
+            BinOp::MulWithOverflow => "`mul_with_overflow`",
+            BinOp::AddUnchecked => "`add_unchecked`",
+            BinOp::SubUnchecked => "`sub_unchecked`",
+            BinOp::MulUnchecked => "`mul_unchecked`",
+            BinOp::ShlUnchecked => "`shl_unchecked`",
+            BinOp::ShrUnchecked => "`shr_unchecked`",
+            BinOp::Cmp => "`cmp`",
         })
     }
 }
@@ -911,8 +960,7 @@ pub enum Rvalue {
     ///
     /// Like with references, the semantics of this operation are heavily dependent on the aliasing
     /// model.
-    // AddressOf(Mutability, Place),
-    AddressOf(std::convert::Infallible),
+    AddressOf(Mutability, Place),
 
     /// Yields the length of the place, as a `usize`.
     ///
@@ -942,28 +990,7 @@ pub enum Rvalue {
     ///   types and return a value of that type.
     /// * The remaining operations accept signed integers, unsigned integers, or floats with
     ///   matching types and return a value of that type.
-    //BinaryOp(BinOp, Box<(Operand, Operand)>),
-    BinaryOp(std::convert::Infallible),
-
-    /// Same as `BinaryOp`, but yields `(T, bool)` with a `bool` indicating an error condition.
-    ///
-    /// When overflow checking is disabled and we are generating run-time code, the error condition
-    /// is false. Otherwise, and always during CTFE, the error condition is determined as described
-    /// below.
-    ///
-    /// For addition, subtraction, and multiplication on integers the error condition is set when
-    /// the infinite precision result would be unequal to the actual result.
-    ///
-    /// For shift operations on integers the error condition is set when the value of right-hand
-    /// side is greater than or equal to the number of bits in the type of the left-hand side, or
-    /// when the value of right-hand side is negative.
-    ///
-    /// Other combinations of types and operators are unsupported.
-    CheckedBinaryOp(BinOp, Operand, Operand),
-
-    /// Computes a value as described by the operation.
-    //NullaryOp(NullOp, Ty),
-    NullaryOp(std::convert::Infallible),
+    BinaryOp(BinOp, Operand, Operand),
 
     /// Exactly like `BinaryOp`, but less operands.
     ///
@@ -1017,10 +1044,7 @@ pub enum Rvalue {
 pub enum StatementKind {
     Assign(Place, Rvalue),
     FakeRead(Place),
-    //SetDiscriminant {
-    //    place: Box<Place>,
-    //    variant_index: VariantIdx,
-    //},
+    SetDiscriminant { place: Place, variant_index: VariantIdx },
     Deinit(Place),
     StorageLive(LocalId),
     StorageDead(LocalId),
@@ -1111,7 +1135,7 @@ impl MirBody {
                             | Rvalue::Discriminant(p)
                             | Rvalue::Len(p)
                             | Rvalue::Ref(_, p) => f(p, &mut self.projection_store),
-                            Rvalue::CheckedBinaryOp(_, o1, o2) => {
+                            Rvalue::BinaryOp(_, o1, o2) => {
                                 for_operand(o1, &mut f, &mut self.projection_store);
                                 for_operand(o2, &mut f, &mut self.projection_store);
                             }
@@ -1120,13 +1144,13 @@ impl MirBody {
                                     for_operand(op, &mut f, &mut self.projection_store);
                                 }
                             }
-                            Rvalue::ThreadLocalRef(n)
-                            | Rvalue::AddressOf(n)
-                            | Rvalue::BinaryOp(n)
-                            | Rvalue::NullaryOp(n) => match *n {},
+                            Rvalue::AddressOf(_, p) => f(p, &mut self.projection_store),
+                            Rvalue::ThreadLocalRef(n) => match *n {},
                         }
                     }
-                    StatementKind::FakeRead(p) | StatementKind::Deinit(p) => {
+                    StatementKind::FakeRead(p)
+                    | StatementKind::Deinit(p)
+                    | StatementKind::SetDiscriminant { place: p, .. } => {
                         f(p, &mut self.projection_store)
                     }
                     StatementKind::StorageLive(_)

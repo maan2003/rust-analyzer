@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    AggregateKind, BasicBlockId, BorrowKind, LocalId, MirBody, MutBorrowKind, Operand, OperandKind,
-    Place, Rvalue, UnOp,
+    AggregateKind, BasicBlockId, BorrowKind, LocalId, MirBody, MutBorrowKind, Mutability, Operand,
+    OperandKind, Place, Rvalue, UnOp,
 };
 
 macro_rules! w {
@@ -259,6 +259,11 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                             this.place(p);
                             wln!(this, ");");
                         }
+                        StatementKind::SetDiscriminant { place, variant_index } => {
+                            w!(this, "SetDiscriminant(");
+                            this.place(place);
+                            wln!(this, ", {});", variant_index.as_u32());
+                        }
                         StatementKind::FakeRead(p) => {
                             w!(this, "FakeRead(");
                             this.place(p);
@@ -363,6 +368,11 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                         this.local_name(*l).display_test(this.db, this.display_target)
                     );
                 }
+                ProjectionElem::Downcast(idx) => {
+                    w!(this, "(");
+                    f(this, local, head);
+                    w!(this, " as variant#{})", idx.as_u32());
+                }
                 it => {
                     f(this, local, head);
                     w!(this, ".{:?}", it);
@@ -440,7 +450,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.operand(op);
                 w!(self, ", {})", self.hir_display(&ty.as_ref()));
             }
-            Rvalue::CheckedBinaryOp(b, o1, o2) => {
+            Rvalue::BinaryOp(b, o1, o2) => {
                 self.operand(o1);
                 w!(self, " {b} ");
                 self.operand(o2);
@@ -469,10 +479,15 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.place(p);
                 w!(self, ")");
             }
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::AddressOf(m, p) => {
+                let m = match m {
+                    Mutability::Mut => "mut",
+                    Mutability::Not => "const",
+                };
+                w!(self, "&raw {m} ");
+                self.place(p);
+            }
+            Rvalue::ThreadLocalRef(n) => match *n {},
         }
     }
 

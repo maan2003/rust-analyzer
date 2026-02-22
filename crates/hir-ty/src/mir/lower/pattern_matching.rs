@@ -1,6 +1,6 @@
 //! MIR lowering for patterns
 
-use hir_def::{hir::ExprId, signatures::VariantFields};
+use hir_def::{Lookup, hir::ExprId, signatures::VariantFields};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
@@ -218,7 +218,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     self.push_assignment(
                         current,
                         discr,
-                        Rvalue::CheckedBinaryOp(
+                        Rvalue::BinaryOp(
                             binop,
                             lv,
                             Operand { kind: OperandKind::Copy(cond_place), span: None },
@@ -292,7 +292,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                             self.push_assignment(
                                 current,
                                 discr,
-                                Rvalue::CheckedBinaryOp(
+                                Rvalue::BinaryOp(
                                     BinOp::Le,
                                     c,
                                     Operand { kind: OperandKind::Copy(place_len), span: None },
@@ -412,7 +412,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     self.push_assignment(
                         current,
                         tmp2,
-                        Rvalue::CheckedBinaryOp(
+                        Rvalue::BinaryOp(
                             BinOp::Eq,
                             Operand { kind: OperandKind::Copy(tmp), span: None },
                             Operand { kind: OperandKind::Copy(cond_place), span: None },
@@ -559,7 +559,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         self.push_assignment(
             current,
             discr,
-            Rvalue::CheckedBinaryOp(
+            Rvalue::BinaryOp(
                 BinOp::Eq,
                 c,
                 Operand { kind: OperandKind::Copy(cond_place), span: None },
@@ -606,13 +606,19 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     );
                     current = next;
                 }
+                let variant_idx =
+                    rac_abi::VariantIdx::from_usize(v.lookup(self.db).index as usize);
+                let downcast_place = cond_place.project(
+                    ProjectionElem::Downcast(variant_idx),
+                    &mut self.result.projection_store,
+                );
                 self.pattern_matching_variant_fields(
                     shape,
                     v.fields(self.db),
                     variant,
                     current,
                     current_else,
-                    &cond_place,
+                    &downcast_place,
                     mode,
                 )?
             }

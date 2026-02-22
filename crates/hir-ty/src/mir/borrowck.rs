@@ -176,8 +176,9 @@ fn moved_out_of_ref<'db>(
                     Rvalue::CopyForDeref(_)
                     | Rvalue::Discriminant(_)
                     | Rvalue::Len(_)
-                    | Rvalue::Ref(_, _) => (),
-                    Rvalue::CheckedBinaryOp(_, o1, o2) => {
+                    | Rvalue::Ref(_, _)
+                    | Rvalue::AddressOf(_, _) => (),
+                    Rvalue::BinaryOp(_, o1, o2) => {
                         for_operand(o1, statement.span);
                         for_operand(o2, statement.span);
                     }
@@ -186,13 +187,11 @@ fn moved_out_of_ref<'db>(
                             for_operand(op, statement.span);
                         }
                     }
-                    Rvalue::ThreadLocalRef(n)
-                    | Rvalue::AddressOf(n)
-                    | Rvalue::BinaryOp(n)
-                    | Rvalue::NullaryOp(n) => match *n {},
+                    Rvalue::ThreadLocalRef(n) => match *n {},
                 },
                 StatementKind::FakeRead(_)
                 | StatementKind::Deinit(_)
+                | StatementKind::SetDiscriminant { .. }
                 | StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
                 | StatementKind::Nop => (),
@@ -270,8 +269,9 @@ fn partially_moved<'db>(
                     Rvalue::CopyForDeref(_)
                     | Rvalue::Discriminant(_)
                     | Rvalue::Len(_)
-                    | Rvalue::Ref(_, _) => (),
-                    Rvalue::CheckedBinaryOp(_, o1, o2) => {
+                    | Rvalue::Ref(_, _)
+                    | Rvalue::AddressOf(_, _) => (),
+                    Rvalue::BinaryOp(_, o1, o2) => {
                         for_operand(o1, statement.span);
                         for_operand(o2, statement.span);
                     }
@@ -280,13 +280,11 @@ fn partially_moved<'db>(
                             for_operand(op, statement.span);
                         }
                     }
-                    Rvalue::ThreadLocalRef(n)
-                    | Rvalue::AddressOf(n)
-                    | Rvalue::BinaryOp(n)
-                    | Rvalue::NullaryOp(n) => match *n {},
+                    Rvalue::ThreadLocalRef(n) => match *n {},
                 },
                 StatementKind::FakeRead(_)
                 | StatementKind::Deinit(_)
+                | StatementKind::SetDiscriminant { .. }
                 | StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
                 | StatementKind::Nop => (),
@@ -395,7 +393,7 @@ fn place_case<'db>(
             | ProjectionElem::Index(_) => {
                 is_part_of = true;
             }
-            ProjectionElem::OpaqueCast(_) => (),
+            ProjectionElem::Downcast(_) | ProjectionElem::OpaqueCast(_) => (),
         }
         ty = proj.projected_ty(
             infcx,
@@ -440,6 +438,7 @@ fn ever_initialized_map(
                         }
                     }
                     StatementKind::Deinit(_)
+                    | StatementKind::SetDiscriminant { .. }
                     | StatementKind::FakeRead(_)
                     | StatementKind::Nop
                     | StatementKind::StorageLive(_) => (),
@@ -566,14 +565,15 @@ fn mutability_of_locals<'db>(
                         Rvalue::CopyForDeref(p)
                         | Rvalue::Discriminant(p)
                         | Rvalue::Len(p)
-                        | Rvalue::Ref(_, p) => {
+                        | Rvalue::Ref(_, p)
+                        | Rvalue::AddressOf(_, p) => {
                             record_usage(p.local, &mut result);
                         }
                         Rvalue::Use(o)
                         | Rvalue::Repeat(o, _)
                         | Rvalue::Cast(_, o, _)
                         | Rvalue::UnaryOp(_, o) => record_usage_for_operand(o, &mut result),
-                        Rvalue::CheckedBinaryOp(_, o1, o2) => {
+                        Rvalue::BinaryOp(_, o1, o2) => {
                             for o in [o1, o2] {
                                 record_usage_for_operand(o, &mut result);
                             }
@@ -584,10 +584,7 @@ fn mutability_of_locals<'db>(
                             }
                         }
                         Rvalue::ShallowInitBox(_, _) | Rvalue::ShallowInitBoxWithAlloc(_) => (),
-                        Rvalue::ThreadLocalRef(n)
-                        | Rvalue::AddressOf(n)
-                        | Rvalue::BinaryOp(n)
-                        | Rvalue::NullaryOp(n) => match *n {},
+                        Rvalue::ThreadLocalRef(n) => match *n {},
                     }
                     if let Rvalue::Ref(
                         BorrowKind::Mut {
@@ -606,7 +603,10 @@ fn mutability_of_locals<'db>(
                 StatementKind::StorageDead(p) => {
                     ever_init_map.insert(*p, false);
                 }
-                StatementKind::Deinit(_) | StatementKind::StorageLive(_) | StatementKind::Nop => (),
+                StatementKind::Deinit(_)
+                | StatementKind::SetDiscriminant { .. }
+                | StatementKind::StorageLive(_)
+                | StatementKind::Nop => (),
             }
         }
         let Some(terminator) = &block.terminator else {

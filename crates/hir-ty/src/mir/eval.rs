@@ -862,6 +862,10 @@ impl<'db> Evaluator<'db> {
                         metadata = None;
                     }
                 }
+                ProjectionElem::Downcast(_) => {
+                    // Downcast is a no-op in evaluation - it just marks which variant
+                    // we're accessing, but doesn't change the address or type.
+                }
                 ProjectionElem::OpaqueCast(_) => not_supported!("opaque cast"),
             }
         }
@@ -955,6 +959,9 @@ impl<'db> Evaluator<'db> {
                                 locals.drop_flags.add_place(*l, &locals.body.projection_store);
                             }
                             StatementKind::Deinit(_) => not_supported!("de-init statement"),
+                            StatementKind::SetDiscriminant { .. } => {
+                                not_supported!("set-discriminant statement")
+                            }
                             StatementKind::StorageLive(_)
                             | StatementKind::FakeRead(_)
                             | StatementKind::StorageDead(_)
@@ -1159,7 +1166,7 @@ impl<'db> Evaluator<'db> {
         use IntervalOrOwned::*;
         Ok(match r {
             Rvalue::Use(it) => Borrowed(self.eval_operand(it, locals)?),
-            Rvalue::Ref(_, p) => {
+            Rvalue::Ref(_, p) | Rvalue::AddressOf(_, p) => {
                 let (addr, _, metadata) = self.place_addr_and_ty_and_metadata(p, locals)?;
                 let mut r = addr.to_bytes().to_vec();
                 if let Some(metadata) = metadata {
@@ -1227,7 +1234,7 @@ impl<'db> Evaluator<'db> {
                     Owned(c)
                 }
             }
-            Rvalue::CheckedBinaryOp(op, lhs, rhs) => 'binary_op: {
+            Rvalue::BinaryOp(op, lhs, rhs) => 'binary_op: {
                 let lc = self.eval_operand(lhs, locals)?;
                 let rc = self.eval_operand(rhs, locals)?;
                 let mut lc = lc.get(self)?;
@@ -1437,6 +1444,63 @@ impl<'db> Evaluator<'db> {
                             Owned(r.to_bytes())
                         }
                         BinOp::Offset => not_supported!("offset binop"),
+                        BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
+                            let (r, overflow) = match op {
+                                BinOp::AddWithOverflow => l128.overflowing_add(r128),
+                                BinOp::SubWithOverflow => l128.overflowing_sub(r128),
+                                BinOp::MulWithOverflow => l128.overflowing_mul(r128),
+                                _ => unreachable!(),
+                            };
+                            let mut result = r.to_bytes();
+                            result.push(u8::from(overflow));
+                            Owned(result)
+                        }
+                        BinOp::AddUnchecked | BinOp::SubUnchecked | BinOp::MulUnchecked => {
+                            let r = match op {
+                                BinOp::AddUnchecked => l128.checked_add(r128).ok_or_else(|| {
+                                    MirEvalError::Panic(format!("Overflow in {op:?}"))
+                                })?,
+                                BinOp::SubUnchecked => l128.checked_sub(r128).ok_or_else(|| {
+                                    MirEvalError::Panic(format!("Overflow in {op:?}"))
+                                })?,
+                                BinOp::MulUnchecked => l128.checked_mul(r128).ok_or_else(|| {
+                                    MirEvalError::Panic(format!("Overflow in {op:?}"))
+                                })?,
+                                _ => unreachable!(),
+                            };
+                            Owned(r.to_bytes())
+                        }
+                        BinOp::ShlUnchecked | BinOp::ShrUnchecked => {
+                            let r = 'b: {
+                                if let Some(shift_amount) = r128.as_u32() {
+                                    if shift_amount as usize >= lc.len() * 8 {
+                                        return Err(MirEvalError::Panic(format!(
+                                            "Overflow in {op:?}"
+                                        )));
+                                    }
+                                    let r = match op {
+                                        BinOp::ShlUnchecked => l128.checked_shl(shift_amount),
+                                        BinOp::ShrUnchecked => l128.checked_shr(shift_amount),
+                                        _ => unreachable!(),
+                                    };
+                                    if let Some(r) = r {
+                                        break 'b r;
+                                    }
+                                };
+                                return Err(MirEvalError::Panic(format!("Overflow in {op:?}")));
+                            };
+                            Owned(r.to_bytes())
+                        }
+                        BinOp::Cmp => {
+                            let r = l128.cmp(&r128);
+                            // std::cmp::Ordering: Less = -1i8, Equal = 0, Greater = 1
+                            let v = match r {
+                                std::cmp::Ordering::Less => -1i8 as u8,
+                                std::cmp::Ordering::Equal => 0u8,
+                                std::cmp::Ordering::Greater => 1u8,
+                            };
+                            Owned(vec![v])
+                        }
                     }
                 }
             }
@@ -1649,10 +1713,7 @@ impl<'db> Evaluator<'db> {
                 }
                 CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
             },
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::ThreadLocalRef(n) => match *n {},
         })
     }
 
@@ -3106,6 +3167,20 @@ macro_rules! int_bit_shifts {
     };
 }
 
+macro_rules! overflowing_int_op {
+    ( [ $op:ident ] $( $int_ty:ident )+ ) => {
+        fn $op(self, other: Self) -> (Self, bool) {
+            match (self, other) {
+                $( (Self::$int_ty(a), Self::$int_ty(b)) => {
+                    let (r, o) = a.$op(b);
+                    (Self::$int_ty(r), o)
+                } )+
+                _ => panic!("incompatible integer types"),
+            }
+        }
+    };
+}
+
 macro_rules! unchecked_int_op {
     ( [ $name:ident, $op:tt ]  $( $int_ty:ident )+ ) => {
         fn $name(self, other: Self) -> Self {
@@ -3167,6 +3242,10 @@ impl IntValue {
 
     for_each_int_type!(int_bit_shifts, [checked_shl]);
     for_each_int_type!(int_bit_shifts, [checked_shr]);
+
+    for_each_int_type!(overflowing_int_op, [overflowing_add]);
+    for_each_int_type!(overflowing_int_op, [overflowing_sub]);
+    for_each_int_type!(overflowing_int_op, [overflowing_mul]);
 }
 
 impl std::ops::BitAnd for IntValue {

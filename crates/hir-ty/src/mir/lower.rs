@@ -400,7 +400,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     (*m).into(),
                 ),
                 Adjust::Borrow(AutoBorrow::RawPtr(m)) => {
-                    self.lower_expr_to_place_with_borrow_adjust(expr_id, place, current, rest, *m)
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
+                    else {
+                        return Ok(None);
+                    };
+                    self.push_assignment(
+                        current,
+                        place,
+                        Rvalue::AddressOf(*m, p),
+                        expr_id.into(),
+                    );
+                    Ok(Some(current))
                 }
                 Adjust::Pointer(cast) => {
                     let Some((p, current)) =
@@ -991,12 +1002,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.push_assignment(current, place, rvalue, expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Ref { expr, rawness: _, mutability } => {
+            Expr::Ref { expr, rawness, mutability } => {
                 let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
                     return Ok(None);
                 };
-                let bk = BorrowKind::from_hir(*mutability);
-                self.push_assignment(current, place, Rvalue::Ref(bk, p), expr_id.into());
+                let rvalue = if rawness.is_raw() {
+                    let m = match mutability {
+                        hir_def::type_ref::Mutability::Shared => Mutability::Not,
+                        hir_def::type_ref::Mutability::Mut => Mutability::Mut,
+                    };
+                    Rvalue::AddressOf(m, p)
+                } else {
+                    let bk = BorrowKind::from_hir(*mutability);
+                    Rvalue::Ref(bk, p)
+                };
+                self.push_assignment(current, place, rvalue, expr_id.into());
                 Ok(Some(current))
             }
             Expr::Box { expr } => {
@@ -1117,7 +1137,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     else {
                         return Ok(None);
                     };
-                    let r_value = Rvalue::CheckedBinaryOp(
+                    let r_value = Rvalue::BinaryOp(
                         op.into(),
                         Operand { kind: OperandKind::Copy(lhs_place), span: None },
                         rhs_op,
@@ -1165,7 +1185,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.push_assignment(
                     current,
                     place,
-                    Rvalue::CheckedBinaryOp(
+                    Rvalue::BinaryOp(
                         match op {
                             hir_def::hir::BinaryOp::LogicOp(op) => match op {
                                 hir_def::hir::LogicOp::And => BinOp::BitAnd, // FIXME: make these short circuit

@@ -174,18 +174,17 @@ impl<'db> Filler<'db> {
                             self.fill_const(len)?;
                         }
                         Rvalue::Ref(_, _)
+                        | Rvalue::AddressOf(_, _)
                         | Rvalue::Len(_)
                         | Rvalue::Cast(_, _, _)
-                        | Rvalue::CheckedBinaryOp(_, _, _)
+                        | Rvalue::BinaryOp(_, _, _)
                         | Rvalue::UnaryOp(_, _)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
-                        Rvalue::ThreadLocalRef(n)
-                        | Rvalue::AddressOf(n)
-                        | Rvalue::BinaryOp(n)
-                        | Rvalue::NullaryOp(n) => match *n {},
+                        Rvalue::ThreadLocalRef(n) => match *n {},
                     },
                     StatementKind::Deinit(_)
+                    | StatementKind::SetDiscriminant { .. }
                     | StatementKind::FakeRead(_)
                     | StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)

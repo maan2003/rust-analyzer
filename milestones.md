@@ -17,6 +17,13 @@ for r-a's `Ty` (via `AbiTy` newtype), `HasDataLayout`, `HasTargetSpec`,
 `HasX86AbiOpt` on `CodegenCx`. `compute_fn_abi` calls rac-abi's real
 `adjust_for_rust_abi`.
 
+### M0.5: MIR aligned with rustc for codegen ✅
+
+Aligned r-a's MIR data structures with rustc so cg_clif can translate them:
+`BinaryOp` with overflow/unchecked variants, `AddressOf`, `Downcast`
+projection, `SetDiscriminant` statement. Removed dead stubs (`NullaryOp`,
+old `BinaryOp(Infallible)`).
+
 ---
 
 ## Phase 1: Single-function codegen spike
@@ -49,7 +56,7 @@ fn bar(a: i32, b: i32) -> i32 {
 
 Compile, dlopen, call with args, check result.
 
-Proves: `CheckedBinaryOp` translation, local variables, argument passing
+Proves: `BinaryOp` translation, local variables, argument passing
 through the ABI layer. This is where `FnAbi`/`PassMode` gets exercised
 for real.
 

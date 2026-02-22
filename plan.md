@@ -141,11 +141,39 @@ need their MIR. This may let us defer the converter even further.
 ## Phase 5: Fill r-a's MIR gaps
 
 Incrementally improve r-a's native MIR lowering so fewer things need the
-rustc roundtrip:
+rustc roundtrip.
 
-- `BinaryOp` as a real Rvalue (currently everything is `CheckedBinaryOp`)
-- `Downcast`, `SetDiscriminant`
-- async/await, inline asm, const blocks — as needed
+### Done
+
+- `BinaryOp` as a real Rvalue (renamed from `CheckedBinaryOp`)
+- `NullaryOp` stub removed (rustc replaced with lang items)
+- `AddressOf(Mutability, Place)` for raw pointer creation
+- `Downcast(VariantIdx)` projection for enum variant field access
+- `SetDiscriminant` statement
+- Overflow/unchecked `BinOp` variants (`AddWithOverflow`, `SubWithOverflow`,
+  `MulWithOverflow`, `AddUnchecked`, `SubUnchecked`, `MulUnchecked`,
+  `ShlUnchecked`, `ShrUnchecked`, `Cmp`)
+
+### Remaining (by priority for codegen)
+
+- `ThreadLocalRef(StaticId)` — still Infallible stub, low priority (only
+  thread-local statics)
+- `OperandKind::Static` — non-standard, rustc uses `Constant` for statics.
+  Works for codegen but diverges from cg_clif's expectations.
+- `ShallowInitBoxWithAlloc` — non-standard r-a invention. cg_clif won't
+  recognize it; needs lowering to alloc call + `ShallowInitBox`.
+- `DropAndReplace` — rustc removed this terminator, replaced with
+  `Drop` + assignment. r-a still emits it.
+- `Intrinsic` statement (`NonDivergingIntrinsic`: `assume`,
+  `copy_nonoverlapping`) — needed when lowering uses these intrinsics
+- Coroutine support (`AggregateKind::Coroutine`, `Yield`/`CoroutineDrop`
+  terminators) — needed for async/await
+- async/await, inline asm, const blocks, tail calls — as needed
+
+### Skippable (not needed for codegen)
+
+- `Retag` — only for Stacked Borrows / Miri, not emitted in codegen
+- `AscribeUserType` — only for type checking, stripped before codegen
 
 Each improvement means that function's MIR comes from r-a (Salsa-cached,
 incremental) instead of the converter (batch, from-scratch).
