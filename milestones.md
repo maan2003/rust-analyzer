@@ -326,3 +326,76 @@ producing an object file.
 
 Change a function body, recompile only that function, re-run. Salsa
 identifies invalidated MIR, Cranelift recompiles, function pointer swapped.
+
+### M19: Hot-reload JIT
+
+Live-patching running programs. Editing a function body recompiles exactly
+that one function and patches it into the running process.
+
+#### Salsa caching strategy
+
+Key queries for incremental codegen:
+
+- `compiled_fn_object(fn_id, generic_args, env) -> Vec<u8>` — per-function
+  compiled machine code. The main cache: avoids re-running Cranelift
+  lowering/regalloc when MIR hasn't changed.
+- `direct_callees(fn_id) -> Vec<FunctionId>` — extracted from MIR call
+  terminators. Splitting this from reachability avoids O(N) re-walks when
+  one function's MIR changes but its call targets didn't.
+- `reachable_functions(root) -> Vec<FunctionId>` — transitive closure of
+  `direct_callees`. Backdated when the call graph is unchanged.
+- `fn_abi_cranelift(fn_id, env) -> Signature` — Cranelift calling convention
+  for a function. Separating this from `compiled_fn_object` means callers
+  don't recompile when a callee's body changes (only when its signature does).
+
+#### Firewalls in the dependency graph
+
+Salsa "backdates" queries whose output didn't change despite re-execution,
+preventing unnecessary downstream invalidation:
+
+- `item_tree` — structural (declarations, not bodies). Body-only edits
+  re-execute but produce the same result, firewalling all other functions
+  in the same file.
+- `crate_def_map` / `resolve_path` — name resolution. Adding a file
+  re-executes the def map, but existing resolutions resolve to the same
+  IDs and get backdated.
+- `direct_callees` — if a function's MIR changed but it still calls the
+  same set of functions, reachability is backdated.
+
+#### Propagation for common edit patterns
+
+- **Body-only edit**: O(1) recompile. `item_tree` backdated, only the
+  edited function's `mir_body` and `compiled_fn_object` re-execute.
+- **Signature change**: O(callers) recompile. `fn_abi_cranelift` changes,
+  all callers' MIR re-lowers (new arg count), their `compiled_fn_object`
+  re-executes. Cross-crate callers included.
+- **New file**: O(new functions) compile. Existing name resolutions
+  backdated, no existing code recompiled.
+- **Type layout change**: O(users of that type) recompile. Unavoidable —
+  machine code genuinely changes (different stack offsets, field accesses).
+
+#### Auto-boxing user types (dev-mode optimization)
+
+All structs defined in user code (not rlibs) are heap-allocated and passed
+as pointers between user functions. This means:
+
+- Function ABIs for user code are always pointer-based — changing a struct's
+  fields never changes any caller's compiled code (pointer is still 8 bytes).
+- Only functions that directly access fields of a changed struct recompile.
+- Layout changes are fully firewalled except at rlib call boundaries.
+- At user→rlib boundaries (e.g. `Vec::push(my_struct)`), thin shims
+  unbox/box values to match the rlib's expected ABI. These shims recompile
+  on layout change, but callers of the shims don't.
+- Small scalar types (integers, floats, scalar-pairs) can be exempted —
+  they fit in registers and boxing them wastes a heap allocation for no
+  incremental benefit.
+- Runtime cost (heap allocs + indirection) is acceptable for dev-mode;
+  release builds use normal by-value layouts.
+
+#### Indirect call table for hot patching
+
+All intra-user-code calls go through an indirection table (like a PLT/GOT):
+`call [fn_table + fn_index]`. Recompiling a function only requires updating
+one pointer in the table. Callers don't recompile even though the machine
+code address changed. Combined with salsa, editing one function body =
+recompile one function + write one pointer.
