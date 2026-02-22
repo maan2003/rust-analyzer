@@ -440,6 +440,11 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.operand_list(it);
                 w!(self, ")");
             }
+            Rvalue::Aggregate(AggregateKind::RawPtr(_, m), it) => {
+                w!(self, "*{} from(", if *m == Mutability::Mut { "mut" } else { "const" });
+                self.operand_list(it);
+                w!(self, ")");
+            }
             Rvalue::Len(p) => {
                 w!(self, "Len(");
                 self.place(p);

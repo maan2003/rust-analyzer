@@ -1582,6 +1582,9 @@ impl<'db> Evaluator<'db> {
                             values.iter().map(|&it| it.into()),
                         )?)
                     }
+                    AggregateKind::RawPtr(_, _) => {
+                        not_supported!("raw pointer aggregate")
+                    }
                 }
             }
             Rvalue::Cast(kind, operand, target_ty) => match kind {
@@ -1615,8 +1618,8 @@ impl<'db> Evaluator<'db> {
                 CastKind::DynStar => not_supported!("dyn star cast"),
                 CastKind::IntToInt
                 | CastKind::PtrToPtr
-                | CastKind::PointerExposeAddress
-                | CastKind::PointerFromExposedAddress => {
+                | CastKind::PointerExposeProvenance
+                | CastKind::PointerWithExposedProvenance => {
                     let current_ty = self.operand_ty(operand, locals)?;
                     let is_signed = matches!(current_ty.kind(), TyKind::Int(_));
                     let current = pad16(self.eval_operand(operand, locals)?.get(self)?, is_signed);
@@ -1712,6 +1715,9 @@ impl<'db> Evaluator<'db> {
                     }
                 }
                 CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
+                CastKind::Transmute => {
+                    Borrowed(self.eval_operand(operand, locals)?)
+                }
             },
             Rvalue::ThreadLocalRef(_) => not_supported!("thread local ref"),
         })

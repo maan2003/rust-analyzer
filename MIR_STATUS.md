@@ -12,18 +12,47 @@ Tracks how r-a's MIR aligns with rustc's MIR, focused on codegen via cg_clif.
 | `ThreadLocalRef(StaticId)` | type-aligned | Not emitted by lowering yet (r-a doesn't track `#[thread_local]` attribute) |
 | `AddressOf(Mutability, Place)` | aligned | Emitted for raw pointer creation (`&raw`, `addr_of!`) |
 | `Len` | aligned | |
-| `Cast` | aligned | |
+| `Cast` | aligned | All cast kinds including `Transmute` |
 | `BinaryOp` | aligned | Includes overflow/unchecked variants (`AddWithOverflow`, etc.) |
 | `UnaryOp` | aligned | |
 | `Discriminant` | aligned | |
-| `Aggregate` | aligned | |
+| `Aggregate` | aligned | Includes `RawPtr(Ty, Mutability)` for fat pointer construction |
 | `ShallowInitBox` | aligned | Exists but not emitted (rustc removed it too) |
-| `ShallowInitBoxWithAlloc` | non-standard | r-a invention for `#[rustc_box]` / `Expr::Box`. Handles heap allocation + box init. Codegen layer should decompose to alloc call. Rustc removed both `ShallowInitBox` and `NullaryOp`; modern `vec![]` uses `Box::new_uninit()` + intrinsics instead. |
+| `ShallowInitBoxWithAlloc` | non-standard | r-a invention for `#[rustc_box]` / `Expr::Box` backward compat. |
 | `CopyForDeref` | aligned | |
+
+### CastKind variants
+
+| Variant | Status | Notes |
+|---------|--------|-------|
+| `PointerExposeProvenance` | aligned | Renamed from `PointerExposeAddress` |
+| `PointerWithExposedProvenance` | aligned | Renamed from `PointerFromExposedAddress` |
+| `PtrToPtr` | aligned | |
+| `PointerCoercion` | aligned | |
+| `DynStar` | aligned | Not emitted, `not_supported!` in eval |
+| `IntToInt` | aligned | |
+| `FloatToInt` | aligned | |
+| `FloatToFloat` | aligned | |
+| `IntToFloat` | aligned | |
+| `FnPtrToPtr` | aligned | |
+| `Transmute` | aligned | Lowered from `transmute`/`transmute_unchecked` intrinsic calls |
+
+### AggregateKind variants
+
+| Variant | Status | Notes |
+|---------|--------|-------|
+| `Array` | aligned | |
+| `Tuple` | aligned | |
+| `Adt` | aligned | |
+| `Union` | aligned | |
+| `Closure` | aligned | |
+| `RawPtr(Ty, Mutability)` | type-aligned | Not emitted by lowering yet |
+| `Coroutine` | missing | Needed for async/await |
+| `CoroutineClosure` | missing | Needed for async closures |
 
 ### Removed
 
-- `NullaryOp(Infallible)` -- rustc removed `NullaryOp` entirely. r-a had it stubbed with `Infallible`. Removed.
+- `NullaryOp(Infallible)` -- rustc removed `NullaryOp` entirely. Removed.
 
 ## StatementKind
 
@@ -39,7 +68,7 @@ Tracks how r-a's MIR aligns with rustc's MIR, focused on codegen via cg_clif.
 
 ### Not implemented
 
-- `Intrinsic(NonDivergingIntrinsic)` -- `assume`, `copy_nonoverlapping`. Commented out. Low priority for initial codegen.
+- `Intrinsic(NonDivergingIntrinsic)` -- `assume`, `copy_nonoverlapping`. Low priority for initial codegen.
 - `Retag` -- Miri/Stacked Borrows only. Not needed for codegen.
 - `AscribeUserType` -- type checking only. Not needed for codegen.
 
@@ -63,7 +92,7 @@ Tracks how r-a's MIR aligns with rustc's MIR, focused on codegen via cg_clif.
 
 ### Removed
 
-- `DropAndReplace` -- rustc removed this. Was defined but never emitted by r-a's lowering. Deleted.
+- `DropAndReplace` -- rustc removed this. Deleted.
 
 ## ProjectionElem
 
@@ -85,24 +114,47 @@ Tracks how r-a's MIR aligns with rustc's MIR, focused on codegen via cg_clif.
 | `Copy` | aligned | |
 | `Move` | aligned | |
 | `Constant` | aligned | |
-| `Static(StaticId)` | non-standard | r-a uses a separate variant for statics. rustc uses `Constant`. Works for codegen but diverges from cg_clif expectations. |
+| `Static(StaticId)` | non-standard | r-a uses a separate variant for statics. rustc uses `Constant`. |
 
 ## Shortcuts taken
 
-- **Eval not updated for new constructs**: `ThreadLocalRef`, `SetDiscriminant` return `not_supported!` in const eval. These constructs are type-correct but eval can't execute them.
-- **Borrowck minimally updated**: New rvalue/statement variants added to match arms but with no-op handling. Sufficient since codegen doesn't depend on borrowck.
+- **Eval not updated for new constructs**: `ThreadLocalRef`, `SetDiscriminant`, `RawPtr` aggregate return `not_supported!` in const eval.
+- **Borrowck minimally updated**: New rvalue/statement variants added to match arms with no-op handling.
+- **Transmute**: Lowering emits `Cast(Transmute)` instead of intrinsic call. Eval handles it (copies bytes).
 
 ## Non-standard constructs (kept intentionally)
 
-- **`ShallowInitBoxWithAlloc`**: r-a invention for `#[rustc_box]` backward compat (toolchains < 1.86). Rustc removed both `ShallowInitBox` and `NullaryOp`, so there's no standard equivalent to align with. Codegen handles it directly.
-- **`OperandKind::Static`**: r-a uses a separate variant. Codegen handles it specially.
-- **`TupleOrClosureField`**: r-a uses this instead of `Field` for tuples/closures. Codegen handles it specially.
+- **`ShallowInitBoxWithAlloc`**: r-a invention for `#[rustc_box]` backward compat (toolchains < 1.86). Rustc removed both `ShallowInitBox` and `NullaryOp`.
+- **`OperandKind::Static`**: r-a uses a separate variant.
+- **`TupleOrClosureField`**: r-a uses this instead of `Field` for tuples/closures.
 
 ## No Infallible stubs remain
 
 All `Infallible` stubs have been removed from MIR types.
 
+## Lowering correctness notes
+
+- **Arithmetic**: Lowering emits wrapping `BinOp::Add/Sub/Mul` for `+`/`-`/`*`. This matches rustc — overflow checks are inserted by a later MIR pass (`Assert` terminators using `AddWithOverflow`), not during initial lowering. The `WithOverflow`/`Unchecked` variants are defined for use by MIR passes and intrinsic lowering.
+- **Intrinsics as calls**: Most intrinsics (`unchecked_add`, `saturating_add`, `copy_nonoverlapping`, `offset`, etc.) are lowered as regular `Call` terminators and handled by the eval shim. Only `transmute`/`transmute_unchecked` are specially lowered to `Cast(Transmute)`. Codegen will need to recognize these intrinsic calls.
+- **Cast lowering**: `cast_kind()` in `lower.rs` covers Ptr↔Int, Int↔Int, Float↔Int, Float↔Float, Ptr↔Ptr, FnPtr→Ptr. Returns `not_supported!` for unknown combinations (conservative).
+- **Downcast**: Correctly emitted before field access on enum variants in pattern matching.
+- **AddressOf**: Correctly emitted for `&raw const/mut` and `addr_of!` coercions.
+- **LogicOp**: `&&`/`||` lowered as `BitAnd`/`BitOr` (not short-circuit). Has a FIXME.
+
+## Expressions not lowered (`not_supported!`)
+
+- async/await, async blocks, yield
+- inline assembly (`builtin#asm`)
+- const blocks
+- `builtin#offset_of`
+- tail calls (`become`)
+- box patterns
+
+These are intentional gaps — uncommon or unstable features.
+
 ## Remaining work (by priority for codegen)
 
-1. `Intrinsic` statement -- needed when MIR uses `assume`/`copy_nonoverlapping`.
-2. Coroutine support (`AggregateKind::Coroutine`, `Yield`/`CoroutineDrop`) -- needed for async/await.
+1. Coroutine/CoroutineClosure aggregates -- needed for async/await.
+2. `Intrinsic` statement -- `assume`, `copy_nonoverlapping`.
+3. `UnwindAction` enum -- rustc uses this instead of `Option<BasicBlockId>` for unwind. Only matters for panic=unwind.
+4. Lower more intrinsics to MIR constructs (e.g. `offset` → `BinOp::Offset`) as needed by codegen.

@@ -158,7 +158,8 @@ impl<'db> Filler<'db> {
                             match ak {
                                 super::AggregateKind::Array(ty)
                                 | super::AggregateKind::Tuple(ty)
-                                | super::AggregateKind::Closure(ty) => self.fill_ty(ty)?,
+                                | super::AggregateKind::Closure(ty)
+                                | super::AggregateKind::RawPtr(ty, _) => self.fill_ty(ty)?,
                                 super::AggregateKind::Adt(_, subst) => self.fill_args(subst)?,
                                 super::AggregateKind::Union(_, _) => (),
                             }
