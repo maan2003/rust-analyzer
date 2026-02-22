@@ -966,3 +966,56 @@ fn foo() -> i32 {
     );
     assert_eq!(result, 42);
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end: compile → link → run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compile_and_run_empty_main() {
+    let full_src = "//- /main.rs\nfn main() {}\n";
+    let (db, file_ids) = TestDB::with_many_files(full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, "main");
+        let (body, env) = get_mir_and_env(&db, func_id);
+        let dl = get_target_data_layout(&db, func_id);
+        let interner = DbInterner::new_no_crate(&db);
+        let generic_args = GenericArgs::empty(interner);
+
+        let tmp_dir = std::env::temp_dir().join(format!("rac_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let output_path = tmp_dir.join("empty_main");
+
+        let result = crate::compile_executable(
+            &db, &dl, &env, &body, func_id, generic_args, &output_path,
+        );
+
+        // Clean up on both success and failure
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        };
+
+        match result {
+            Ok(()) => {
+                // Run the executable
+                let output = std::process::Command::new(&output_path)
+                    .output()
+                    .expect("failed to run compiled binary");
+
+                cleanup();
+
+                assert!(
+                    output.status.success(),
+                    "binary exited with {}: stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            Err(e) => {
+                cleanup();
+                panic!("compile_executable failed: {e}");
+            }
+        }
+    });
+}

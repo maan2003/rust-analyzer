@@ -106,13 +106,17 @@ from any `_R`-prefixed symbol in their rlib, no rmeta parsing needed.
 
 Proves: symbols will resolve at link time.
 
-### M5: Empty main runs
+### M5: Empty main runs ✅
 
-Compile `fn main() {}` → `.o` → link against std → run.
+Compiled `fn main() {}` → `.o` → linked against std → runs as executable.
+Added `emit_entry_point()` (C-ABI `main` wrapper that calls user's Rust main
+and returns 0, skipping `lang_start`), `link.rs` (shells out to `cc` with all
+sysroot rlibs from `rustc --print target-libdir`), and `compile_executable()`
+orchestrating the full pipeline. Integration test `compile_and_run_empty_main`
+verifies the binary exits with code 0.
 
-Proves: `cranelift-object` emits valid object, linker invocation works,
-entry point glue (`lang_start` → `main`) is correct, v0 mangling produces
-the right symbol name.
+Proves: cranelift-object emits valid object code, linker invocation works,
+entry point glue is correct, v0 mangling produces the right symbol name.
 
 ### M6: Exit code
 

@@ -3,6 +3,7 @@
 //! Translates r-a's MIR representation to Cranelift IR and emits object files
 //! via cranelift-object. Based on patterns from cg_clif (rustc's Cranelift backend).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -26,6 +27,7 @@ use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 
+pub mod link;
 mod pointer;
 pub mod symbol_mangling;
 
@@ -975,6 +977,96 @@ pub fn compile_to_object(
     let product = module.finish();
     let bytes = product.emit().map_err(|e| format!("emit: {e}"))?;
     Ok(bytes)
+}
+
+/// Emit a C-ABI `main(argc, argv) -> isize` entry point that calls the user's
+/// Rust `main()` and returns 0. Skips `lang_start` for now.
+pub fn emit_entry_point(
+    module: &mut ObjectModule,
+    isa: &dyn TargetIsa,
+    user_main_func_id: FuncId,
+) -> Result<(), String> {
+    let ptr_ty = module.target_config().pointer_type();
+
+    // C main signature: (argc: isize, argv: *const *const u8) -> isize
+    let mut cmain_sig = Signature::new(isa.default_call_conv());
+    cmain_sig.params.push(AbiParam::new(ptr_ty));
+    cmain_sig.params.push(AbiParam::new(ptr_ty));
+    cmain_sig.returns.push(AbiParam::new(ptr_ty));
+
+    let cmain_func_id = module
+        .declare_function("main", Linkage::Export, &cmain_sig)
+        .map_err(|e| format!("declare main: {e}"))?;
+
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, cmain_func_id.as_u32()),
+        cmain_sig,
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        bcx.append_block_params_for_function_params(block);
+
+        // Call user's main()
+        let user_main_ref = module.declare_func_in_func(user_main_func_id, bcx.func);
+        bcx.ins().call(user_main_ref, &[]);
+
+        // Return 0
+        let zero = bcx.ins().iconst(ptr_ty, 0);
+        bcx.ins().return_(&[zero]);
+
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::for_function(func);
+    module
+        .define_function(cmain_func_id, &mut ctx)
+        .map_err(|e| format!("define main: {e}"))?;
+
+    Ok(())
+}
+
+/// Compile `fn main() {}` to an executable: compile → emit entry point → link.
+pub fn compile_executable(
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    main_body: &MirBody,
+    main_func_id: hir_def::FunctionId,
+    generic_args: hir_ty::next_solver::GenericArgs<'_>,
+    output_path: &Path,
+) -> Result<(), String> {
+    let isa = build_host_isa(true);
+
+    let builder =
+        ObjectBuilder::new(isa.clone(), "rac_output", cranelift_module::default_libcall_names())
+            .map_err(|e| format!("ObjectBuilder: {e}"))?;
+    let mut module = ObjectModule::new(builder);
+
+    let fn_name = symbol_mangling::mangle_function(db, main_func_id, generic_args);
+    let user_main_id =
+        compile_fn(&mut module, &*isa, db, dl, env, main_body, &fn_name, Linkage::Export)?;
+
+    emit_entry_point(&mut module, &*isa, user_main_id)?;
+
+    // Emit object file to a temp path
+    let product = module.finish();
+    let obj_bytes = product.emit().map_err(|e| format!("emit: {e}"))?;
+
+    let obj_path = output_path.with_extension("o");
+    std::fs::write(&obj_path, &obj_bytes)
+        .map_err(|e| format!("write {}: {e}", obj_path.display()))?;
+
+    // Link
+    let result = link::link_executable(&obj_path, output_path);
+
+    // Clean up .o file
+    let _ = std::fs::remove_file(&obj_path);
+
+    result
 }
 
 #[cfg(test)]
