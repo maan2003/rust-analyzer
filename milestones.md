@@ -200,7 +200,7 @@ real std rlib at link time. Required:
 Proves: v0 mangling produces symbols that match real rlibs, cross-crate
 function detection works, type-based signatures are correct.
 
-### M8: Structs and enums
+### M8: Structs and enums ✅
 
 ```rust
 struct Point { x: i32, y: i32 }
@@ -212,27 +212,33 @@ fn main() -> ! {
         Dir::Left => p.x,
         Dir::Right => p.y,
     };
-    std::process::exit(code);
+    std::process::exit(code)
 }
 ```
 
-Proves: `Aggregate` construction, field projection, enum discriminant,
-layout correctness (wrong offsets produce wrong values silently).
+ADT codegen (M3.3) already handled struct construction, field projection,
+enum discriminant read/write, and layout. This milestone confirms it all
+works end-to-end as a compiled+linked executable calling into std.
+Integration test `compile_and_run_structs_and_enums` exits with code 4.
 
-### M9: Generics and monomorphization
+### M9: Generics and monomorphization ✅
 
 ```rust
-fn pick<T: Copy>(a: T, b: T, first: bool) -> T {
+fn pick<T>(a: T, b: T, first: bool) -> T {
     if first { a } else { b }
 }
 
 fn main() -> ! {
-    std::process::exit(pick(7, 3, true));
+    std::process::exit(pick(7, 3, true))
 }
 ```
 
-Proves: mono-item collection, type substitution in MIR, compiled code
-uses concrete types.
+`collect_reachable_fns()` now tracks `(FunctionId, StoredGenericArgs)` pairs
+instead of bare `FunctionId`, so each monomorphized instance is discovered
+and compiled separately. `compile_executable()` passes the correct generic
+args to `monomorphized_mir_body()` and `mangle_function()`. The codegen
+call path (`codegen_direct_call`) already handled generic args correctly.
+Integration test `compile_and_run_generics` exits with code 7.
 
 ### M10: Trait objects and dynamic dispatch
 

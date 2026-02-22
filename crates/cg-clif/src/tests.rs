@@ -1258,6 +1258,54 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn compile_and_run_generics() {
+    let code = compile_and_run(
+        r#"
+//- /std.rs crate:std
+pub mod process {
+    pub fn exit(code: i32) -> ! { loop {} }
+}
+//- /main.rs crate:main deps:std
+fn pick<T>(a: T, b: T, first: bool) -> T {
+    if first { a } else { b }
+}
+
+fn main() -> ! {
+    std::process::exit(pick(7, 3, true))
+}
+"#,
+        "generics",
+    );
+    assert_eq!(code, 7);
+}
+
+#[test]
+fn compile_and_run_structs_and_enums() {
+    let code = compile_and_run(
+        r#"
+//- /std.rs crate:std
+pub mod process {
+    pub fn exit(code: i32) -> ! { loop {} }
+}
+//- /main.rs crate:main deps:std
+struct Point { x: i32, y: i32 }
+enum Dir { Left, Right }
+
+fn main() -> ! {
+    let p = Point { x: 3, y: 4 };
+    let code = match Dir::Right {
+        Dir::Left => p.x,
+        Dir::Right => p.y,
+    };
+    std::process::exit(code)
+}
+"#,
+        "structs_and_enums",
+    );
+    assert_eq!(code, 4);
+}
+
+#[test]
 fn compile_and_run_std_exit() {
     let code = compile_and_run(
         r#"

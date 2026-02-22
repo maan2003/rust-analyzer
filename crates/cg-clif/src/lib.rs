@@ -23,7 +23,7 @@ use hir_ty::mir::{
     ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use either::Either;
-use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredTy, TyKind};
+use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
 use rac_abi::VariantIdx;
@@ -1976,15 +1976,16 @@ pub fn emit_entry_point(
     Ok(())
 }
 
-/// Collect all non-extern, non-intrinsic, local functions reachable from `root` by
-/// walking MIR call terminators. Returns them in BFS order with `root` first.
-/// Cross-crate functions are skipped (they are already compiled in rlibs).
+/// Collect all non-extern, non-intrinsic, local monomorphized function instances
+/// reachable from `root` by walking MIR call terminators. Returns them in BFS
+/// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
+/// representing a specific monomorphization. Cross-crate functions are skipped.
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     root: hir_def::FunctionId,
     local_crate: base_db::Crate,
-) -> Vec<hir_def::FunctionId> {
+) -> Vec<(hir_def::FunctionId, StoredGenericArgs)> {
     use std::collections::{HashSet, VecDeque};
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
@@ -1994,10 +1995,10 @@ fn collect_reachable_fns(
     let mut queue = VecDeque::new();
     let mut result = Vec::new();
 
-    queue.push_back(root);
+    queue.push_back((root, empty_args));
 
-    while let Some(func_id) = queue.pop_front() {
-        if !visited.insert(func_id) {
+    while let Some((func_id, generic_args)) = queue.pop_front() {
+        if !visited.insert((func_id, generic_args.clone())) {
             continue;
         }
 
@@ -2016,12 +2017,12 @@ fn collect_reachable_fns(
             continue;
         }
 
-        result.push(func_id);
+        result.push((func_id, generic_args.clone()));
 
-        // Get MIR and scan for direct callees
+        // Get monomorphized MIR and scan for direct callees
         let Ok(body) = db.monomorphized_mir_body(
             func_id.into(),
-            empty_args.clone(),
+            generic_args,
             env.clone(),
         ) else {
             continue;
@@ -2031,9 +2032,9 @@ fn collect_reachable_fns(
             let Some(term) = &bb.terminator else { continue };
             let TerminatorKind::Call { func, .. } = &term.kind else { continue };
             let OperandKind::Constant { ty, .. } = &func.kind else { continue };
-            let TyKind::FnDef(def, _) = ty.as_ref().kind() else { continue };
+            let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
             if let CallableDefId::FunctionId(callee_id) = def.0 {
-                queue.push_back(callee_id);
+                queue.push_back((callee_id, callee_args.store()));
             }
         }
     }
@@ -2051,8 +2052,6 @@ pub fn compile_executable(
     output_path: &Path,
 ) -> Result<(), String> {
     let isa = build_host_isa(true);
-    let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
-    let empty_args = GenericArgs::empty(interner);
 
     // Extract real crate disambiguators from sysroot rlibs
     let ext_crate_disambiguators = link::extract_crate_disambiguators(
@@ -2065,23 +2064,23 @@ pub fn compile_executable(
             .map_err(|e| format!("ObjectBuilder: {e}"))?;
     let mut module = ObjectModule::new(builder);
 
-    // Discover and compile all reachable local functions
+    // Discover and compile all reachable local monomorphized function instances
     let reachable = collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 
-    for &func_id in &reachable {
+    for (func_id, generic_args) in &reachable {
         let body = db
-            .monomorphized_mir_body(func_id.into(), empty_args.store(), env.clone())
+            .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
             .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
         let fn_name = symbol_mangling::mangle_function(
-            db, func_id, empty_args, &ext_crate_disambiguators,
+            db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
         );
         let func_clif_id = compile_fn(
             &mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export,
             local_crate, &ext_crate_disambiguators,
         )?;
 
-        if func_id == main_func_id {
+        if *func_id == main_func_id {
             user_main_id = Some(func_clif_id);
         }
     }
