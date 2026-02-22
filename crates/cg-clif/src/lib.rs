@@ -1571,27 +1571,100 @@ pub fn emit_entry_point(
     Ok(())
 }
 
-/// Compile `fn main() {}` to an executable: compile → emit entry point → link.
+/// Collect all non-extern, non-intrinsic functions reachable from `root` by
+/// walking MIR call terminators. Returns them in BFS order with `root` first.
+fn collect_reachable_fns(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    root: hir_def::FunctionId,
+) -> Vec<hir_def::FunctionId> {
+    use std::collections::{HashSet, VecDeque};
+
+    let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
+    let empty_args = GenericArgs::empty(interner).store();
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    let mut result = Vec::new();
+
+    queue.push_back(root);
+
+    while let Some(func_id) = queue.pop_front() {
+        if !visited.insert(func_id) {
+            continue;
+        }
+
+        // Skip extern functions (no MIR to compile)
+        if matches!(func_id.loc(db).container, ItemContainerId::ExternBlockId(_)) {
+            continue;
+        }
+
+        // Skip intrinsics (handled inline during codegen)
+        if FunctionSignature::is_intrinsic(db, func_id) {
+            continue;
+        }
+
+        result.push(func_id);
+
+        // Get MIR and scan for direct callees
+        let Ok(body) = db.monomorphized_mir_body(
+            func_id.into(),
+            empty_args.clone(),
+            env.clone(),
+        ) else {
+            continue;
+        };
+
+        for (_, bb) in body.basic_blocks.iter() {
+            let Some(term) = &bb.terminator else { continue };
+            let TerminatorKind::Call { func, .. } = &term.kind else { continue };
+            let OperandKind::Constant { ty, .. } = &func.kind else { continue };
+            let TyKind::FnDef(def, _) = ty.as_ref().kind() else { continue };
+            if let CallableDefId::FunctionId(callee_id) = def.0 {
+                queue.push_back(callee_id);
+            }
+        }
+    }
+
+    result
+}
+
+/// Compile a crate to an executable: discover reachable functions from main,
+/// compile them all, emit entry point, link.
 pub fn compile_executable(
     db: &dyn HirDatabase,
     dl: &TargetDataLayout,
     env: &StoredParamEnvAndCrate,
-    main_body: &MirBody,
     main_func_id: hir_def::FunctionId,
-    generic_args: hir_ty::next_solver::GenericArgs<'_>,
     output_path: &Path,
 ) -> Result<(), String> {
     let isa = build_host_isa(true);
+    let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
+    let empty_args = GenericArgs::empty(interner);
 
     let builder =
         ObjectBuilder::new(isa.clone(), "rac_output", cranelift_module::default_libcall_names())
             .map_err(|e| format!("ObjectBuilder: {e}"))?;
     let mut module = ObjectModule::new(builder);
 
-    let fn_name = symbol_mangling::mangle_function(db, main_func_id, generic_args);
-    let user_main_id =
-        compile_fn(&mut module, &*isa, db, dl, env, main_body, &fn_name, Linkage::Export)?;
+    // Discover and compile all reachable functions
+    let reachable = collect_reachable_fns(db, env, main_func_id);
+    let mut user_main_id = None;
 
+    for &func_id in &reachable {
+        let body = db
+            .monomorphized_mir_body(func_id.into(), empty_args.store(), env.clone())
+            .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
+        let fn_name = symbol_mangling::mangle_function(db, func_id, empty_args);
+        let func_clif_id =
+            compile_fn(&mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export)?;
+
+        if func_id == main_func_id {
+            user_main_id = Some(func_clif_id);
+        }
+    }
+
+    let user_main_id = user_main_id.expect("main not in reachable functions");
     emit_entry_point(&mut module, &*isa, user_main_id)?;
 
     // Emit object file to a temp path
