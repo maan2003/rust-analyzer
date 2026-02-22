@@ -1019,3 +1019,59 @@ fn compile_and_run_empty_main() {
         }
     });
 }
+
+#[test]
+fn compile_and_run_exit_code() {
+    let full_src = r#"
+//- /main.rs
+extern "C" {
+    fn exit(code: i32) -> !;
+}
+fn main() -> ! {
+    unsafe { exit(42) }
+}
+"#;
+    let (db, file_ids) = TestDB::with_many_files(full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, "main");
+        let (body, env) = get_mir_and_env(&db, func_id);
+        let dl = get_target_data_layout(&db, func_id);
+        let interner = DbInterner::new_no_crate(&db);
+        let generic_args = GenericArgs::empty(interner);
+
+        let tmp_dir = std::env::temp_dir().join(format!("rac_test_exit_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let output_path = tmp_dir.join("exit_code");
+
+        let result = crate::compile_executable(
+            &db, &dl, &env, &body, func_id, generic_args, &output_path,
+        );
+
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        };
+
+        match result {
+            Ok(()) => {
+                let output = std::process::Command::new(&output_path)
+                    .output()
+                    .expect("failed to run compiled binary");
+
+                cleanup();
+
+                assert_eq!(
+                    output.status.code(),
+                    Some(42),
+                    "expected exit code 42, got {:?}: stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            Err(e) => {
+                cleanup();
+                panic!("compile_executable failed: {e}");
+            }
+        }
+    });
+}

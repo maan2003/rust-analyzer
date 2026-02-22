@@ -26,6 +26,10 @@ What works:
   ZST args filtered. Tested with call chains and calls combined with branches.
   Includes direct lowering of pointer intrinsics used by raw-pointer methods:
   `offset`, `arith_offset`, `ptr_offset_from`, `ptr_offset_from_unsigned`.
+  Extern `"C"` function calls supported: detects `ExternBlockId` container,
+  builds signature from type info (`callable_item_signature`) instead of MIR,
+  uses raw (unmangled) symbol name. Diverging calls (`-> !`) terminate the
+  block with a trap instruction.
 - `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
 
 ## Upstream comparison (`./cg_clif`)

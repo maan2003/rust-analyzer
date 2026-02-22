@@ -14,7 +14,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::CallableDefId;
+use hir_def::{CallableDefId, ItemContainerId};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
@@ -559,7 +559,7 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
             fx.bcx.ins().jump(block, &[]);
         }
         TerminatorKind::Unreachable => {
-            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
         }
         TerminatorKind::SwitchInt { discr, targets } => {
             let discr_val = codegen_operand(fx, body, &discr.kind);
@@ -634,18 +634,29 @@ fn codegen_direct_call(
         return;
     }
 
-    // Get callee MIR to determine its signature
-    let callee_body = fx
-        .db
-        .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
-        .expect("failed to get callee MIR");
+    // Check if this is an extern function (no MIR available)
+    let is_extern = matches!(
+        callee_func_id.loc(fx.db).container,
+        ItemContainerId::ExternBlockId(_)
+    );
 
-    // Build callee's Cranelift signature
-    let callee_sig =
-        build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
-
-    // Get callee name using v0 symbol mangling
-    let callee_name = symbol_mangling::mangle_function(fx.db, callee_func_id, generic_args);
+    let (callee_sig, callee_name) = if is_extern {
+        // Extern functions: build signature from type info, use raw symbol name
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+            .expect("extern fn sig");
+        let name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+        (sig, name)
+    } else {
+        // Regular functions: build signature from MIR, use v0 mangled name
+        let callee_body = fx
+            .db
+            .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
+            .expect("failed to get callee MIR");
+        let sig =
+            build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
+        let name = symbol_mangling::mangle_function(fx.db, callee_func_id, generic_args);
+        (sig, name)
+    };
 
     // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
     let callee_id = fx
@@ -680,10 +691,14 @@ fn codegen_direct_call(
     let results = fx.bcx.inst_results(call);
     write_call_destination(fx, destination, results.get(0).copied());
 
-    // Jump to continuation block
+    // Jump to continuation block (or trap for diverging calls)
     if let Some(target) = target {
         let block = fx.clif_block(*target);
         fx.bcx.ins().jump(block, &[]);
+    } else {
+        // Diverging call (returns `!`) — the callee never returns,
+        // but Cranelift requires the block to be terminated.
+        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
     }
 }
 
@@ -830,6 +845,51 @@ fn build_fn_sig(
         let param = &body.locals[param_local];
         let param_layout = db
             .layout_of_ty(param.ty.clone(), env.clone())
+            .map_err(|e| format!("param layout error: {:?}", e))?;
+        if let BackendRepr::Scalar(scalar) = param_layout.backend_repr {
+            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+        } else if param_layout.is_zst() {
+            // ZST params ignored
+        } else {
+            return Err("unsupported param type: non-scalar, non-ZST".into());
+        }
+    }
+
+    Ok(sig)
+}
+
+/// Build a Cranelift signature from a function's type information (via `callable_item_signature`)
+/// instead of from a MIR body. Needed for extern functions where we don't have MIR.
+fn build_fn_sig_from_ty(
+    isa: &dyn TargetIsa,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    func_id: hir_def::FunctionId,
+) -> Result<Signature, String> {
+    let mut sig = Signature::new(isa.default_call_conv());
+
+    let fn_sig = db
+        .callable_item_signature(func_id.into())
+        .skip_binder()
+        .skip_binder();
+
+    // Return type — skip if `!` (never) or ZST
+    let output = *fn_sig.inputs_and_output.as_slice().split_last().unwrap().0;
+    if !output.is_never() {
+        let ret_layout = db
+            .layout_of_ty(output.store(), env.clone())
+            .map_err(|e| format!("return type layout error: {:?}", e))?;
+        if let BackendRepr::Scalar(scalar) = ret_layout.backend_repr {
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
+        }
+        // ZST returns → no return param (already handled by not pushing)
+    }
+
+    // Parameter types
+    for &param_ty in fn_sig.inputs_and_output.inputs() {
+        let param_layout = db
+            .layout_of_ty(param_ty.store(), env.clone())
             .map_err(|e| format!("param layout error: {:?}", e))?;
         if let BackendRepr::Scalar(scalar) = param_layout.backend_repr {
             sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));

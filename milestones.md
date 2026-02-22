@@ -118,35 +118,49 @@ verifies the binary exits with code 0.
 Proves: cranelift-object emits valid object code, linker invocation works,
 entry point glue is correct, v0 mangling produces the right symbol name.
 
-### M6: Exit code
+### M6: Exit code ✅
 
 ```rust
+extern "C" {
+    fn exit(code: i32) -> !;
+}
 fn main() -> ! {
-    std::process::exit(42);
+    unsafe { exit(42) }
 }
 ```
 
-Proves: calling an extern function with arguments, linking against std
-symbols. Verify by checking exit code.
+Calls libc `exit` directly via `extern "C"` (no std). Added
+`build_fn_sig_from_ty()` to build Cranelift signatures from type info
+(`callable_item_signature`) for extern functions (no MIR available).
+`codegen_direct_call` detects extern functions via `ExternBlockId`
+container, uses raw symbol names (no v0 mangling), and inserts a trap
+after diverging calls (`-> !`). Integration test
+`compile_and_run_exit_code` verifies exit code 42.
+
+Proves: extern function detection, type-based signature building,
+raw symbol names, never type handling, linking against libc.
 
 ---
 
 ## Phase 3: Codegen breadth
 
-### M7: Control flow + function calls (partially done)
+### M7: Control flow + function calls
 
-`SwitchInt`, branching, and intra-crate direct calls already work for
-scalar types (tested via JIT in M3). What remains: linking compiled
-functions together in an object file, calling `std::process::exit`
-(extern/ABI), and running as a real executable.
+`SwitchInt`, branching, intra-crate direct calls, and extern `"C"` calls
+all work for scalar types (tested via JIT in M3, extern calls in M6).
+What remains: compiling multiple local functions into one executable and
+calling between them in a linked binary.
 
 ```rust
+extern "C" {
+    fn exit(code: i32) -> !;
+}
 fn add(a: i32, b: i32) -> i32 {
     if a > 0 { a + b } else { b }
 }
 
 fn main() -> ! {
-    std::process::exit(add(19, 23));
+    unsafe { exit(add(19, 23)) }
 }
 ```
 
