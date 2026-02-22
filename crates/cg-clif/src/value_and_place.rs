@@ -135,7 +135,7 @@ pub(crate) struct CPlace {
 pub(crate) enum CPlaceInner {
     Var(Variable),
     VarPair(Variable, Variable),
-    Addr(Pointer),
+    Addr(Pointer, Option<Value>),
 }
 
 impl CPlace {
@@ -145,7 +145,7 @@ impl CPlace {
     ) -> Self {
         if layout.size.bytes() == 0 {
             return CPlace {
-                inner: CPlaceInner::Addr(Pointer::dangling(layout.align.abi)),
+                inner: CPlaceInner::Addr(Pointer::dangling(layout.align.abi), None),
                 layout,
             };
         }
@@ -155,7 +155,7 @@ impl CPlace {
             size,
             align_to_shift(layout.align.abi.bytes()),
         ));
-        CPlace { inner: CPlaceInner::Addr(Pointer::stack_slot(slot)), layout }
+        CPlace { inner: CPlaceInner::Addr(Pointer::stack_slot(slot), None), layout }
     }
 
     pub(crate) fn new_var(
@@ -201,7 +201,11 @@ impl CPlace {
     }
 
     pub(crate) fn for_ptr(ptr: Pointer, layout: Arc<Layout>) -> Self {
-        CPlace { inner: CPlaceInner::Addr(ptr), layout }
+        CPlace { inner: CPlaceInner::Addr(ptr, None), layout }
+    }
+
+    pub(crate) fn for_ptr_with_extra(ptr: Pointer, extra: Value, layout: Arc<Layout>) -> Self {
+        CPlace { inner: CPlaceInner::Addr(ptr, Some(extra)), layout }
     }
 
     /// Define the i-th SSA variable in this place. Used during parameter
@@ -224,7 +228,7 @@ impl CPlace {
                 1 => bcx.def_var(var2, val),
                 _ => panic!("def_var index {i} out of range for VarPair"),
             },
-            CPlaceInner::Addr(_) => panic!("def_var on Addr CPlace"),
+            CPlaceInner::Addr(_, _) => panic!("def_var on Addr CPlace"),
         }
     }
 
@@ -236,8 +240,16 @@ impl CPlace {
 
     pub(crate) fn to_ptr(&self) -> Pointer {
         match self.inner {
-            CPlaceInner::Addr(ptr) => ptr,
+            CPlaceInner::Addr(ptr, None) => ptr,
+            CPlaceInner::Addr(_, Some(_)) => panic!("to_ptr on unsized CPlace; use to_ptr_unsized"),
             _ => panic!("to_ptr on non-Addr CPlace"),
+        }
+    }
+
+    pub(crate) fn to_ptr_unsized(&self) -> (Pointer, Value) {
+        match self.inner {
+            CPlaceInner::Addr(ptr, Some(extra)) => (ptr, extra),
+            _ => panic!("to_ptr_unsized on non-unsized CPlace"),
         }
     }
 
@@ -253,9 +265,12 @@ impl CPlace {
                 let val2 = fx.bcx.use_var(var2);
                 CValue::by_val_pair(val1, val2, self.layout.clone())
             }
-            CPlaceInner::Addr(ptr) => {
+            CPlaceInner::Addr(ptr, extra) => {
                 if self.layout.is_zst() {
                     CValue::zst(self.layout.clone())
+                } else if let Some(_extra) = extra {
+                    // Unsized place — for now we only support sized reads
+                    CValue::by_ref(ptr, self.layout.clone())
                 } else {
                     CValue::by_ref(ptr, self.layout.clone())
                 }
@@ -294,7 +309,7 @@ impl CPlace {
                 fx.bcx.def_var(var1, val1);
                 fx.bcx.def_var(var2, val2);
             }
-            CPlaceInner::Addr(ptr) => {
+            CPlaceInner::Addr(ptr, _extra) => {
                 if self.layout.size == Size::ZERO {
                     return;
                 }
@@ -387,7 +402,7 @@ impl CPlace {
                 assert_eq!(field_idx, 0, "field index {field_idx} out of range for single Var");
                 CPlace { inner: CPlaceInner::Var(var), layout: field_layout }
             }
-            CPlaceInner::Addr(ptr) => {
+            CPlaceInner::Addr(ptr, _extra) => {
                 let offset = self.layout.fields.offset(field_idx);
                 let field_ptr = ptr.offset_i64(
                     &mut fx.bcx,
@@ -395,6 +410,26 @@ impl CPlace {
                     i64::try_from(offset.bytes()).unwrap(),
                 );
                 CPlace::for_ptr(field_ptr, field_layout)
+            }
+        }
+    }
+
+    /// Take a reference to this place, producing a CValue.
+    /// For unsized places (with metadata), produces a fat pointer (ScalarPair).
+    /// For sized places, produces a thin pointer (Scalar).
+    pub(crate) fn place_ref(
+        &self,
+        fx: &mut FunctionCx<'_, impl Module>,
+        ref_layout: Arc<Layout>,
+    ) -> CValue {
+        match self.inner {
+            CPlaceInner::Addr(ptr, Some(extra)) => {
+                let addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+                CValue::by_val_pair(addr, extra, ref_layout)
+            }
+            _ => {
+                let addr = self.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+                CValue::by_val(addr, ref_layout)
             }
         }
     }

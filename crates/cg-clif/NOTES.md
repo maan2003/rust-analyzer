@@ -33,8 +33,12 @@ What works:
   block with a trap instruction.
 - `TerminatorKind::Drop` — no-op jump (scalar types only, no drop glue yet)
 - **CValue/CPlace abstractions** — `value_and_place.rs` ported with
-  CValue (ByRef | ByVal | ByValPair) and CPlace (Var | VarPair | Addr).
-  All locals use CPlace, operands flow through CValue.
+  CValue (ByRef | ByVal | ByValPair) and CPlace (Var | VarPair |
+  Addr(Pointer, Option<Value>)). The `Option<Value>` in Addr carries
+  unsized metadata (e.g. vtable pointer for `dyn Trait`), matching
+  upstream. `place_ref()` produces fat or thin pointer CValues
+  depending on metadata presence. All locals use CPlace, operands
+  flow through CValue.
 - **ScalarPair locals** — tuples like `(i32, i32)` stored as VarPair,
   properly wired for function params and returns.
 - **Non-scalar locals** — Memory-repr types allocated as stack slots.
@@ -55,6 +59,17 @@ What works:
 - **Rvalue::Discriminant** — reads enum discriminant. Supports Direct and
   Niche tag encodings. Handles Scalar, ScalarPair, and memory-repr places.
 - **Rvalue::Len** — returns fixed-size array length as a constant.
+- **Trait objects / dynamic dispatch** — `PointerCoercion(Unsize)` cast
+  produces fat pointer `(data_ptr, vtable_ptr)`. Vtable construction
+  builds data constants with standard layout (drop null, size, align,
+  method fn ptrs) using `TraitImpls::for_crate` + `simplify_type` from
+  `rustc_type_ir` to find impl methods. Virtual calls detected via
+  `is_dyn_method`, dispatched through `call_indirect` with fn ptr loaded
+  from vtable. Fat pointer deref via `CPlace::for_ptr_with_extra`
+  carries metadata (vtable ptr) in `CPlaceInner::Addr`; `place_ref()`
+  recovers it for re-borrows (matches upstream `place_deref`/`place_ref`).
+  Reachability scans for unsizing casts to discover vtable impl methods;
+  skips abstract trait defs.
 
 ## Upstream comparison (`./cg_clif`)
 
@@ -81,16 +96,21 @@ Recently aligned with upstream:
   Direct encoding uses intcast (`discriminant.rs:126-134`). Niche encoding
   uses relative_tag/is_niche/select pattern (`discriminant.rs:135-216`).
   `codegen_icmp_imm` ported from `common.rs:105-147` for I128 support.
+- **CPlaceInner::Addr carries metadata like upstream** — our `Addr(Pointer,
+  Option<Value>)` matches upstream's `Addr(Pointer, Option<Value>)` in
+  `value_and_place.rs:366`. Fat pointer deref uses `for_ptr_with_extra` to
+  carry metadata, `place_ref()` emits thin or fat pointer based on metadata
+  presence. Matches upstream's `place_deref` (`value_and_place.rs:815-823`)
+  and `place_ref` (`value_and_place.rs:825-836`).
 
 Still diverges from upstream:
-- **Pointer coercion casts are incomplete** — upstream handles
-  `PointerCoercion::{ReifyFnPointer, UnsafeFnPointer, ClosureFnPointer, Unsize}`
-  explicitly (plus borrowck-only `MutToConstPointer`/`ArrayToPointer` cases).
-  Our current code treats `CastKind::PointerCoercion(_)` as a scalar cast,
-  which is not sufficient for full parity.
-- **Wide-pointer cast behavior is missing** — upstream has dedicated
-  scalar-pair handling (wide<->wide and wide->thin paths). Our scalar-only
-  path does not yet implement this.
+- **Pointer coercion casts partially handled** — `PointerCoercion::Unsize`
+  (`&T → &dyn Trait`) now produces fat pointers with vtable. Other coercions
+  (`ReifyFnPointer`, `UnsafeFnPointer`, `ClosureFnPointer`) still treated
+  as scalar casts. `MutToConstPointer`/`ArrayToPointer` are no-ops (correct).
+- **Wide-pointer cast behavior is partial** — trait object fat pointers work.
+  Upstream has additional wide<->wide and wide->thin cast paths for slices
+  and trait upcasting that we don't yet implement.
 - **Cast edge semantics are still simplified** — upstream handles i128
   conversion libcalls and float->int nuances (NaN behavior / saturating cast
   details) that we have not fully ported.

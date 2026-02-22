@@ -13,9 +13,9 @@ use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{CallableDefId, HasModule, ItemContainerId, Lookup, VariantId};
+use hir_def::{AssocItemId, CallableDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use hir_ty::mir::{
@@ -23,6 +23,8 @@ use hir_ty::mir::{
     ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use either::Either;
+use hir_ty::PointerCast;
+use hir_ty::method_resolution::TraitImpls;
 use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
@@ -234,6 +236,11 @@ fn codegen_cast(
     target_ty: &StoredTy,
     result_layout: &LayoutArc,
 ) -> CValue {
+    // Handle Unsize coercion separately — it produces a fat pointer (ScalarPair)
+    if let CastKind::PointerCoercion(PointerCast::Unsize) = kind {
+        return codegen_unsize_coercion(fx, body, operand, target_ty, result_layout);
+    }
+
     let from_ty = operand_ty(fx.db, body, &operand.kind);
     let from_cval = codegen_operand(fx, body, &operand.kind);
     let from_val = from_cval.load_scalar(fx);
@@ -275,6 +282,8 @@ fn codegen_cast(
         | CastKind::PointerExposeProvenance
         | CastKind::PointerWithExposedProvenance
         | CastKind::PointerCoercion(_) => {
+            // All remaining PointerCoercion variants (MutToConstPointer, ReifyFnPointer, etc.)
+            // are thin ptr → thin ptr, handled as intcast.
             let from_signed = ty_is_signed_int(from_ty);
             codegen_intcast(fx, from_val, target_clif_ty, from_signed)
         }
@@ -296,6 +305,172 @@ fn codegen_cast(
         CastKind::DynStar => todo!("dyn* cast"),
     };
     CValue::by_val(val, result_layout.clone())
+}
+
+/// Handle `PointerCoercion(Unsize)`: `&T → &dyn Trait`.
+/// Produces a fat pointer `(data_ptr, vtable_ptr)`.
+/// Reference: cg_clif/src/unsize.rs `coerce_unsized_into`
+fn codegen_unsize_coercion(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    operand: &Operand,
+    target_ty: &StoredTy,
+    result_layout: &LayoutArc,
+) -> CValue {
+    let from_cval = codegen_operand(fx, body, &operand.kind);
+    let data_ptr = from_cval.load_scalar(fx);
+
+    // Extract the trait from the target type (&dyn Trait → Dyn → trait_id)
+    let pointee_ty = target_ty.as_ref().builtin_deref(true)
+        .expect("Unsize target must be a pointer/reference type");
+    let trait_id = pointee_ty.dyn_trait()
+        .expect("Unsize target pointee must be dyn Trait");
+
+    // Extract the concrete source type (what's behind the thin pointer)
+    let from_ty = operand_ty(fx.db, body, &operand.kind);
+    let source_pointee = from_ty.as_ref().builtin_deref(true)
+        .expect("Unsize source must be a pointer/reference type");
+
+    let vtable_ptr = get_or_create_vtable(fx, source_pointee.store(), trait_id);
+
+    CValue::by_val_pair(data_ptr, vtable_ptr, result_layout.clone())
+}
+
+/// Build or retrieve a vtable for `concrete_ty` implementing `trait_id`.
+///
+/// Vtable layout (matches rustc):
+/// - Slot 0: drop_in_place fn ptr (null for now)
+/// - Slot 1: size of concrete type (usize)
+/// - Slot 2: alignment of concrete type (usize)
+/// - Slot 3+: trait methods in declaration order
+///
+/// Reference: cg_clif/src/vtable.rs `get_vtable` + cg_clif/src/constant.rs `data_id_for_vtable`
+fn get_or_create_vtable(
+    fx: &mut FunctionCx<'_, impl Module>,
+    concrete_ty: StoredTy,
+    trait_id: TraitId,
+) -> Value {
+    let ptr_size = fx.dl.pointer_size().bytes() as usize;
+
+    // Get concrete type layout for size/align
+    let concrete_layout = fx.db
+        .layout_of_ty(concrete_ty.clone(), fx.env.clone())
+        .expect("layout error for vtable concrete type");
+    let concrete_size = concrete_layout.size.bytes();
+    let concrete_align = concrete_layout.align.abi.bytes();
+
+    // Get trait methods in declaration order
+    let trait_items = trait_id.trait_items(fx.db);
+    let method_func_ids: Vec<hir_def::FunctionId> = trait_items.items.iter()
+        .filter_map(|(_name, item)| match item {
+            AssocItemId::FunctionId(fid) => Some(*fid),
+            _ => None,
+        })
+        .collect();
+    let num_methods = method_func_ids.len();
+
+    // Find the impl for this concrete type
+    let krate = fx.local_crate;
+    let trait_impls = TraitImpls::for_crate(fx.db, krate);
+    let interner = DbInterner::new_no_crate(fx.db);
+
+    // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
+    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
+    let simplified = simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
+        .expect("cannot simplify concrete type for vtable lookup");
+    let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
+    assert!(!impl_ids.is_empty(), "no impl found for vtable");
+    let impl_id = impl_ids[0]; // Take first matching impl
+
+    // Build unique vtable name
+    let vtable_name = format!(
+        "__vtable_{}_for_{:?}",
+        trait_id.trait_items(fx.db).items.first().map(|(n, _)| n.as_str().to_string()).unwrap_or_default(),
+        simplified,
+    );
+
+    // Declare the vtable data object
+    let data_id = fx.module
+        .declare_data(&vtable_name, Linkage::Local, false, false)
+        .expect("declare vtable data");
+
+    // Build vtable data
+    let total_size = ptr_size * (3 + num_methods);
+    let mut data = DataDescription::new();
+    let mut vtable_bytes = vec![0u8; total_size];
+
+    // Slot 0: drop_in_place — null for now (no drop glue)
+    // (already zeroed)
+
+    // Slot 1: size
+    vtable_bytes[ptr_size..ptr_size * 2].copy_from_slice(&(concrete_size as u64).to_le_bytes()[..ptr_size]);
+
+    // Slot 2: alignment
+    vtable_bytes[ptr_size * 2..ptr_size * 3].copy_from_slice(&(concrete_align as u64).to_le_bytes()[..ptr_size]);
+
+    data.define(vtable_bytes.into_boxed_slice());
+
+    // Slot 3+: trait method fn ptrs — emit as relocations
+    let impl_items = impl_id.impl_items(fx.db);
+    for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
+        // Find the corresponding impl method by name
+        let trait_method_name = fx.db.function_signature(*trait_method_func_id).name.clone();
+        let impl_func_id = impl_items.items.iter()
+            .find_map(|(name, item)| {
+                if *name == trait_method_name {
+                    match item {
+                        AssocItemId::FunctionId(fid) => Some(*fid),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("impl method `{}` not found for vtable", trait_method_name.as_str()));
+
+        // Declare/import the impl function
+        let impl_body = fx.db
+            .monomorphized_mir_body(
+                impl_func_id.into(),
+                GenericArgs::empty(interner).store(),
+                fx.env.clone(),
+            )
+            .expect("failed to get impl method MIR for vtable");
+        let impl_sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &impl_body)
+            .expect("impl method sig for vtable");
+        let impl_fn_name = symbol_mangling::mangle_function(
+            fx.db,
+            impl_func_id,
+            GenericArgs::empty(interner),
+            fx.ext_crate_disambiguators,
+        );
+
+        let func_id = fx.module
+            .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
+            .expect("declare vtable method");
+        let func_ref = fx.module.declare_func_in_data(func_id, &mut data);
+        data.write_function_addr(((3 + method_idx) * ptr_size) as u32, func_ref);
+    }
+
+    // Define the vtable data — ignore duplicate definition errors (vtable may be
+    // created more than once if multiple unsizing coercions target the same pair)
+    match fx.module.define_data(data_id, &data) {
+        Ok(()) => {}
+        Err(cranelift_module::ModuleError::DuplicateDefinition(_)) => {}
+        Err(e) => panic!("define vtable data: {e}"),
+    }
+
+    // Get a pointer to the vtable in the current function
+    let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+    fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+}
+
+/// MemFlags for vtable loads: always aligned, readonly, notrap.
+/// Reference: cg_clif/src/vtable.rs `vtable_memflags`
+fn vtable_memflags() -> MemFlags {
+    let mut flags = MemFlags::trusted();
+    flags.set_readonly();
+    flags
 }
 
 // ---------------------------------------------------------------------------
@@ -341,9 +516,24 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                     .layout_of_ty(inner_ty.store(), fx.env.clone())
                     .expect("deref layout error");
 
-                // Load the pointer value from the current place
-                let ptr_val = cplace.to_cvalue(fx).load_scalar(fx);
-                cplace = CPlace::for_ptr(pointer::Pointer::new(ptr_val), inner_layout);
+                // Load the pointer value from the current place.
+                // For fat pointers (e.g. &dyn Trait = ScalarPair), extract both
+                // data ptr and metadata, and carry the metadata in the CPlace.
+                let cval = cplace.to_cvalue(fx);
+                cplace = match cval.layout.backend_repr {
+                    BackendRepr::ScalarPair(_, _) => {
+                        let (data_ptr, meta) = cval.load_scalar_pair(fx);
+                        CPlace::for_ptr_with_extra(
+                            pointer::Pointer::new(data_ptr),
+                            meta,
+                            inner_layout,
+                        )
+                    }
+                    _ => {
+                        let ptr_val = cval.load_scalar(fx);
+                        CPlace::for_ptr(pointer::Pointer::new(ptr_val), inner_layout)
+                    }
+                };
                 cur_ty = inner_ty.store();
             }
             ProjectionElem::Downcast(variant_idx) => {
@@ -533,9 +723,8 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &
         }
         Rvalue::Ref(_, ref_place) | Rvalue::AddressOf(_, ref_place) => {
             let place = codegen_place(fx, body, ref_place);
-            let ptr = place.to_ptr();
-            let val = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
-            dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+            let ref_val = place.place_ref(fx, dest.layout.clone());
+            dest.write_cvalue(fx, ref_val);
             return;
         }
         Rvalue::Discriminant(disc_place) => {
@@ -1406,6 +1595,20 @@ fn codegen_direct_call(
         return;
     }
 
+    // Check for virtual dispatch: trait method called on dyn Trait
+    if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db).container {
+        let interner = DbInterner::new_no_crate(fx.db);
+        if hir_ty::method_resolution::is_dyn_method(
+            interner,
+            fx.env.param_env(),
+            callee_func_id,
+            generic_args,
+        ).is_some() {
+            codegen_virtual_call(fx, body, callee_func_id, trait_id, args, destination, target);
+            return;
+        }
+    }
+
     // Check if this is an extern function (no MIR available)
     let is_extern = matches!(
         callee_func_id.loc(fx.db).container,
@@ -1512,6 +1715,132 @@ fn codegen_direct_call(
     } else {
         // Diverging call (returns `!`) — the callee never returns,
         // but Cranelift requires the block to be terminated.
+        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+    }
+}
+
+/// Virtual dispatch: load fn ptr from vtable, call indirectly.
+/// Reference: cg_clif/src/vtable.rs `get_ptr_and_method_ref` + cg_clif/src/abi/mod.rs:525-543
+fn codegen_virtual_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    callee_func_id: hir_def::FunctionId,
+    trait_id: TraitId,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    let ptr_size = fx.dl.pointer_size().bytes();
+
+    // Compute vtable index: 3 (header slots) + method position in trait
+    let trait_items = trait_id.trait_items(fx.db);
+    let callee_name = fx.db.function_signature(callee_func_id).name.clone();
+    let mut method_idx = 0;
+    let mut found = false;
+    for (name, item) in trait_items.items.iter() {
+        if let AssocItemId::FunctionId(fid) = item {
+            if *fid == callee_func_id {
+                found = true;
+                break;
+            }
+            if *name == callee_name {
+                found = true;
+                break;
+            }
+            method_idx += 1;
+        }
+    }
+    assert!(found, "method `{}` not found in trait", callee_name.as_str());
+
+    let vtable_offset = (3 + method_idx) * ptr_size as usize;
+
+    // Get self arg (&dyn Trait = ScalarPair(data_ptr, vtable_ptr))
+    let self_cval = codegen_operand(fx, body, &args[0].kind);
+    let (data_ptr, vtable_ptr) = self_cval.load_scalar_pair(fx);
+
+    // Load fn ptr from vtable
+    let fn_ptr = fx.bcx.ins().load(
+        fx.pointer_type,
+        vtable_memflags(),
+        vtable_ptr,
+        vtable_offset as i32,
+    );
+
+    // Build the indirect call signature:
+    // - self param is a thin pointer (data_ptr)
+    // - other params from the remaining args
+    // - return type from destination layout
+    let mut sig = Signature::new(fx.isa.default_call_conv());
+
+    // Return type
+    let dest = codegen_place(fx, body, destination);
+    match dest.layout.backend_repr {
+        BackendRepr::Scalar(scalar) => {
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
+        }
+        BackendRepr::ScalarPair(a, b) => {
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
+            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
+        }
+        _ if dest.layout.is_zst() => {}
+        _ => todo!("virtual call with non-scalar return"),
+    }
+
+    // Self param: thin pointer
+    sig.params.push(AbiParam::new(fx.pointer_type));
+
+    // Build call args: data_ptr first (thin self), then remaining args
+    let mut call_args: Vec<Value> = vec![data_ptr];
+
+    // Remaining args (after self)
+    for arg in &args[1..] {
+        let cval = codegen_operand(fx, body, &arg.kind);
+        if cval.layout.is_zst() {
+            continue;
+        }
+        match cval.layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
+                call_args.push(cval.load_scalar(fx));
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
+                let (va, vb) = cval.load_scalar_pair(fx);
+                call_args.push(va);
+                call_args.push(vb);
+            }
+            _ => todo!("virtual call with non-scalar arg"),
+        }
+    }
+
+    // Emit indirect call
+    let sig_ref = fx.bcx.import_signature(sig);
+    let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
+
+    // Store return value
+    let results = fx.bcx.inst_results(call);
+    if !dest.layout.is_zst() {
+        match dest.layout.backend_repr {
+            BackendRepr::Scalar(_) => {
+                let val = results[0];
+                dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+            }
+            BackendRepr::ScalarPair(_, _) => {
+                dest.write_cvalue(
+                    fx,
+                    CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Jump to continuation or trap for diverging
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
+    } else {
         fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
     }
 }
@@ -1976,6 +2305,52 @@ pub fn emit_entry_point(
     Ok(())
 }
 
+/// When an unsizing coercion `&T → &dyn Trait` is found, discover the impl
+/// methods that will be placed in the vtable and add them to the work queue.
+fn collect_vtable_methods(
+    db: &dyn HirDatabase,
+    _env: &StoredParamEnvAndCrate,
+    body: &MirBody,
+    operand: &Operand,
+    target_ty: &StoredTy,
+    local_crate: base_db::Crate,
+    empty_args: &StoredGenericArgs,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+) {
+    // Extract the trait from the target type
+    let Some(pointee_ty) = target_ty.as_ref().builtin_deref(true) else { return };
+    let Some(trait_id) = pointee_ty.dyn_trait() else { return };
+
+    // Extract the concrete source type
+    let from_ty = operand_ty(db, body, &operand.kind);
+    let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
+
+    // Find the impl for this concrete type
+    let interner = DbInterner::new_no_crate(db);
+    let trait_impls = TraitImpls::for_crate(db, local_crate);
+    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
+    let Some(simplified) = simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer) else { return };
+    let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
+    let Some(&impl_id) = impl_ids.first() else { return };
+
+    // Add all trait method implementations to the queue
+    let trait_items = trait_id.trait_items(db);
+    let impl_items = impl_id.impl_items(db);
+    for (trait_method_name, trait_item) in trait_items.items.iter() {
+        let AssocItemId::FunctionId(_) = trait_item else { continue };
+        // Find the corresponding impl method
+        for (impl_name, impl_item) in impl_items.items.iter() {
+            if impl_name == trait_method_name {
+                if let AssocItemId::FunctionId(impl_func_id) = impl_item {
+                    if impl_func_id.krate(db) == local_crate {
+                        queue.push_back((*impl_func_id, empty_args.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Collect all non-extern, non-intrinsic, local monomorphized function instances
 /// reachable from `root` by walking MIR call terminators. Returns them in BFS
 /// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
@@ -1990,6 +2365,7 @@ fn collect_reachable_fns(
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
     let empty_args = GenericArgs::empty(interner).store();
+    let empty_args_stored = empty_args.clone();
 
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -2017,6 +2393,12 @@ fn collect_reachable_fns(
             continue;
         }
 
+        // Skip abstract trait method definitions (they have no MIR body;
+        // only their impl methods are compiled)
+        if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
+            continue;
+        }
+
         result.push((func_id, generic_args.clone()));
 
         // Get monomorphized MIR and scan for direct callees
@@ -2029,11 +2411,33 @@ fn collect_reachable_fns(
         };
 
         for (_, bb) in body.basic_blocks.iter() {
+            // Scan statements for unsizing coercions → discover vtable impl methods
+            for stmt in &bb.statements {
+                if let StatementKind::Assign(_, Rvalue::Cast(CastKind::PointerCoercion(PointerCast::Unsize), operand, target_ty)) = &stmt.kind {
+                    collect_vtable_methods(
+                        db, env, &body, operand, target_ty, local_crate,
+                        &empty_args_stored, &mut queue,
+                    );
+                }
+            }
+
             let Some(term) = &bb.terminator else { continue };
             let TerminatorKind::Call { func, .. } = &term.kind else { continue };
             let OperandKind::Constant { ty, .. } = &func.kind else { continue };
             let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
             if let CallableDefId::FunctionId(callee_id) = def.0 {
+                // Skip virtual calls — trait methods on dyn types are dispatched
+                // through vtables, not compiled as standalone functions.
+                if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                    if hir_ty::method_resolution::is_dyn_method(
+                        interner,
+                        env.param_env(),
+                        callee_id,
+                        callee_args,
+                    ).is_some() {
+                        continue;
+                    }
+                }
                 queue.push_back((callee_id, callee_args.store()));
             }
         }

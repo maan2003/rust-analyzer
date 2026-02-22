@@ -276,6 +276,7 @@ dependencies = [
  "object 0.37.3",
  "postcard",
  "ra-ap-rustc_abi",
+ "ra-ap-rustc_type_ir",
  "rac-abi",
  "salsa",
  "salsa-macros",

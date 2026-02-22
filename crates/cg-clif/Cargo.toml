@@ -22,6 +22,7 @@ hir-ty.path = "../hir-ty"
 hir-def.path = "../hir-def"
 rac-abi.path = "../rac-abi"
 rustc_abi = { package = "ra-ap-rustc_abi", version = "0.143" }
+rustc_type_ir = { package = "ra-ap-rustc_type_ir", version = "0.143", default-features = false }
 la-arena.workspace = true
 intern.path = "../intern"
 base-db.path = "../base-db"

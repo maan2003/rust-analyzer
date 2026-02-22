@@ -239,7 +239,7 @@ args to `monomorphized_mir_body()` and `mangle_function()`. The codegen
 call path (`codegen_direct_call`) already handled generic args correctly.
 Integration test `compile_and_run_generics` exits with code 7.
 
-### M10: Trait objects and dynamic dispatch
+### M10: Trait objects and dynamic dispatch ✅
 
 ```rust
 trait Animal {
@@ -257,7 +257,29 @@ fn main() -> ! {
 }
 ```
 
-Proves: vtable generation, dynamic dispatch, unsizing coercion.
+Implemented vtable generation, dynamic dispatch via indirect calls, and
+unsizing coercion (`&T → &dyn Trait`). Key components:
+
+- **Vtable construction** (`get_or_create_vtable`): builds vtable data
+  constants with the standard layout (drop_in_place null, size, align,
+  method fn ptrs). Uses `TraitImpls::for_crate` + `simplify_type` to
+  find impl methods by name. Vtable data is declared as immutable,
+  methods emitted as function address relocations.
+- **Unsizing coercion** (`codegen_unsize_coercion`): handles
+  `CastKind::PointerCoercion(Unsize)` by producing a fat pointer
+  `(data_ptr, vtable_ptr)` as `CValue::by_val_pair`.
+- **Virtual dispatch** (`codegen_virtual_call`): detects dyn calls via
+  `is_dyn_method`, loads fn ptr from vtable at computed offset,
+  emits `call_indirect` with thin self pointer.
+- **Fat pointer deref**: `ProjectionElem::Deref` now handles ScalarPair
+  pointers by extracting the data pointer. `Rvalue::Ref` re-borrows
+  recover metadata via `extract_place_metadata`.
+- **Reachability** (`collect_reachable_fns`): scans for unsizing casts
+  to discover vtable impl methods; skips abstract trait method defs
+  and virtual call targets.
+
+JIT tests (`jit_dyn_dispatch`, `jit_dyn_dispatch_multiple_methods`) and
+end-to-end test (`compile_and_run_dyn_dispatch`) all pass. 60 total tests.
 
 ### M11: Drop and heap allocation
 

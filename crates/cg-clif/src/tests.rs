@@ -174,7 +174,9 @@ fn find_fn(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Functi
     let module_id = module_for_file(db, file_id.file_id(db));
     let def_map = module_id.def_map(db);
     let scope = &def_map[module_id].scope;
-    scope
+
+    // First try module-level declarations
+    if let Some(func) = scope
         .declarations()
         .find_map(|x| match x {
             hir_def::ModuleDefId::FunctionId(x) => {
@@ -186,7 +188,23 @@ fn find_fn(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Functi
             }
             _ => None,
         })
-        .unwrap_or_else(|| panic!("function `{name}` not found"))
+    {
+        return func;
+    }
+
+    // Then try functions inside impl blocks
+    for impl_id in scope.impls() {
+        let impl_items = impl_id.impl_items(db);
+        for (item_name, item) in impl_items.items.iter() {
+            if let hir_def::AssocItemId::FunctionId(fid) = item {
+                if item_name.display(db, Edition::CURRENT).to_string() == name {
+                    return *fid;
+                }
+            }
+        }
+    }
+
+    panic!("function `{name}` not found")
 }
 
 fn get_mir_and_env(
@@ -1308,6 +1326,101 @@ fn main() -> ! {
 }
 "#,
         "structs_and_enums",
+    );
+    assert_eq!(code, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Trait objects / dynamic dispatch tests (M10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_dyn_dispatch() {
+    let result = jit_run::<i32>(
+        r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+//- /main.rs
+trait Animal {
+    fn legs(&self) -> i32;
+}
+
+struct Dog;
+
+impl Animal for Dog {
+    fn legs(&self) -> i32 { 4 }
+}
+
+fn count(a: &dyn Animal) -> i32 {
+    a.legs()
+}
+
+fn foo() -> i32 {
+    count(&Dog)
+}
+"#,
+        &["legs", "count", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 4);
+}
+
+#[test]
+fn jit_dyn_dispatch_multiple_methods() {
+    let result = jit_run::<i32>(
+        r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+//- /main.rs
+trait Shape {
+    fn width(&self) -> i32;
+    fn height(&self) -> i32;
+}
+
+struct Rect;
+
+impl Shape for Rect {
+    fn width(&self) -> i32 { 10 }
+    fn height(&self) -> i32 { 20 }
+}
+
+fn area(s: &dyn Shape) -> i32 {
+    s.width() * s.height()
+}
+
+fn foo() -> i32 {
+    area(&Rect)
+}
+"#,
+        &["width", "height", "area", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 200);
+}
+
+#[test]
+fn compile_and_run_dyn_dispatch() {
+    let code = compile_and_run(
+        r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+//- /std.rs crate:std
+pub mod process {
+    pub fn exit(code: i32) -> ! { loop {} }
+}
+//- /main.rs crate:main deps:std
+trait Animal {
+    fn legs(&self) -> i32;
+}
+struct Dog;
+impl Animal for Dog {
+    fn legs(&self) -> i32 { 4 }
+}
+fn count(a: &dyn Animal) -> i32 {
+    a.legs()
+}
+fn main() -> ! {
+    std::process::exit(count(&Dog))
+}
+"#,
+        "dyn_dispatch",
     );
     assert_eq!(code, 4);
 }
