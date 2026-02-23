@@ -265,6 +265,15 @@ impl CPlace {
         }
     }
 
+    /// Get the metadata value for unsized places (e.g. slice length).
+    /// Returns `None` for sized places.
+    pub(crate) fn get_extra(&self) -> Option<Value> {
+        match self.inner {
+            CPlaceInner::Addr(_, extra) => extra,
+            _ => None,
+        }
+    }
+
     /// Read the place as a CValue.
     pub(crate) fn to_cvalue(&self, fx: &mut FunctionCx<'_, impl Module>) -> CValue {
         match self.inner {
@@ -277,12 +286,9 @@ impl CPlace {
                 let val2 = fx.bcx.use_var(var2);
                 CValue::by_val_pair(val1, val2, self.layout.clone())
             }
-            CPlaceInner::Addr(ptr, extra) => {
+            CPlaceInner::Addr(ptr, _extra) => {
                 if self.layout.is_zst() {
                     CValue::zst(self.layout.clone())
-                } else if let Some(_extra) = extra {
-                    // Unsized place — for now we only support sized reads
-                    CValue::by_ref(ptr, self.layout.clone())
                 } else {
                     CValue::by_ref(ptr, self.layout.clone())
                 }

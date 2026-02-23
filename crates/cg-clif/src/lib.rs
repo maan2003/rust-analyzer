@@ -286,6 +286,20 @@ fn const_to_i64(konst: Const<'_>, size: Size) -> i64 {
     }
 }
 
+/// Extract a `u64` from a constant. Used for array lengths and repeat counts.
+fn const_to_u64(konst: Const<'_>) -> u64 {
+    match konst.kind() {
+        ConstKind::Value(val) => {
+            let bytes = &val.value.inner().memory;
+            let mut buf = [0u8; 8];
+            let len = bytes.len().min(8);
+            buf[..len].copy_from_slice(&bytes[..len]);
+            u64::from_le_bytes(buf)
+        }
+        _ => panic!("const_to_u64: unsupported const kind: {:?}", konst),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type helpers
 // ---------------------------------------------------------------------------
@@ -1076,6 +1090,16 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &
             dest.write_cvalue(fx, CValue::by_val(disc_val, dest.layout.clone()));
             return;
         }
+        Rvalue::Repeat(operand, count) => {
+            let elem_val = codegen_operand(fx, &operand.kind);
+            let count_val = const_to_u64(count.as_ref());
+            let elem_layout = elem_val.layout.clone();
+            for i in 0..count_val {
+                let field_place = dest.place_field(fx, i as usize, elem_layout.clone());
+                field_place.write_cvalue(fx, elem_val.clone());
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -1101,23 +1125,35 @@ fn codegen_rvalue(
             let place_ty = place_ty(fx.db(), body, place);
             match place_ty.as_ref().kind() {
                 TyKind::Array(_, len) => {
-                    let len_val = match len.kind() {
-                        ConstKind::Value(val) => {
-                            let bytes = &val.value.inner().memory;
-                            let mut buf = [0u8; 8];
-                            let n = bytes.len().min(8);
-                            buf[..n].copy_from_slice(&bytes[..n]);
-                            u64::from_le_bytes(buf) as i64
-                        }
-                        _ => todo!("non-value const in array length"),
-                    };
+                    let len_val = const_to_u64(len) as i64;
                     CValue::by_val(
                         fx.bcx.ins().iconst(fx.pointer_type, len_val),
                         result_layout.clone(),
                     )
                 }
-                _ => todo!("Len on non-array type"),
+                TyKind::Slice(_) => {
+                    // Slice: length is the metadata of the fat pointer.
+                    // The place is behind a fat pointer; get the metadata
+                    // that was stored during deref projection.
+                    let cplace = codegen_place(fx, place);
+                    let meta = cplace.get_extra()
+                        .expect("slice Len requires fat pointer metadata");
+                    CValue::by_val(meta, result_layout.clone())
+                }
+                _ => todo!("Len on non-array/slice type: {:?}", place_ty),
             }
+        }
+        Rvalue::CopyForDeref(place) => {
+            // CopyForDeref is semantically identical to Copy at the codegen level.
+            codegen_place(fx, place).to_cvalue(fx)
+        }
+        Rvalue::Repeat(..) => {
+            unreachable!("Repeat should be handled in codegen_assign")
+        }
+        Rvalue::ShallowInitBox(operand, _ty) => {
+            // Transmute *mut u8 → Box<T>. At codegen level, just reinterpret.
+            let ptr = codegen_operand(fx, &operand.kind);
+            CValue::by_val(ptr.load_scalar(fx), result_layout.clone())
         }
         Rvalue::Aggregate(_, _)
         | Rvalue::Ref(_, _)
@@ -1126,6 +1162,81 @@ fn codegen_rvalue(
             unreachable!("handled in codegen_assign")
         }
         _ => todo!("rvalue: {:?}", rvalue),
+    }
+}
+
+/// Write ADT fields into `dest` with proper variant handling.
+///
+/// Handles Scalar/ScalarPair fast paths for single-variant ADTs, and
+/// multi-variant enums (spilling to a temp stack slot when needed).
+/// Used by both `AggregateKind::Adt` and `codegen_adt_constructor_call`.
+fn codegen_adt_fields(
+    fx: &mut FunctionCx<'_, impl Module>,
+    variant_idx: VariantIdx,
+    field_vals: &[CValue],
+    dest: CPlace,
+) {
+    use rustc_abi::Variants;
+    let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
+
+    // Fast path: Scalar ADT with single variant (wrapper struct)
+    if is_single_variant {
+        if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
+            let non_zst: Vec<_> = field_vals.iter()
+                .filter(|cv| !cv.layout.is_zst())
+                .collect();
+            assert_eq!(non_zst.len(), 1, "Scalar ADT expects 1 non-ZST field");
+            dest.write_cvalue(fx, non_zst[0].clone());
+            codegen_set_discriminant(fx, &dest, variant_idx);
+            return;
+        }
+
+        // Fast path: ScalarPair ADT with single variant (two-field struct)
+        if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
+            let non_zst: Vec<_> = field_vals.iter()
+                .filter(|cv| !cv.layout.is_zst())
+                .collect();
+            assert_eq!(non_zst.len(), 2, "ScalarPair ADT expects 2 non-ZST fields");
+            let val0 = non_zst[0].load_scalar(fx);
+            let val1 = non_zst[1].load_scalar(fx);
+            dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
+            codegen_set_discriminant(fx, &dest, variant_idx);
+            return;
+        }
+    }
+
+    // General case: for multi-variant enums on register places,
+    // spill to memory so field projections use correct offsets.
+    let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
+        && dest.is_register();
+    let (work_dest, original_dest) = if use_temp {
+        let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
+        (tmp, Some(dest))
+    } else {
+        (dest, None)
+    };
+
+    let variant_ly = match &work_dest.layout.variants {
+        Variants::Single { .. } => work_dest.layout.clone(),
+        Variants::Multiple { variants, .. } => TArc::new(variants[variant_idx].clone()),
+        Variants::Empty => panic!("aggregate on empty variants"),
+    };
+    let variant_dest = work_dest.downcast_variant(variant_ly);
+
+    for (i, field_cval) in field_vals.iter().enumerate() {
+        if field_cval.layout.is_zst() {
+            continue;
+        }
+        let field_layout = field_cval.layout.clone();
+        let field_place = variant_dest.place_field(fx, i, field_layout);
+        field_place.write_cvalue(fx, field_cval.clone());
+    }
+
+    codegen_set_discriminant(fx, &work_dest, variant_idx);
+
+    if let Some(orig) = original_dest {
+        let cval = work_dest.to_cvalue(fx);
+        orig.write_cvalue(fx, cval);
     }
 }
 
@@ -1167,80 +1278,19 @@ fn codegen_aggregate(
             }
         }
         AggregateKind::Adt(variant_id, _subst) => {
-            use rustc_abi::Variants;
             let variant_idx = variant_id_to_idx(fx.db(), *variant_id);
-            let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
-
-            // Fast path: Scalar ADT with single variant (wrapper struct)
-            if is_single_variant {
-                if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
-                    let non_zst: Vec<_> = operands
-                        .iter()
-                        .map(|op| codegen_operand(fx, &op.kind))
-                        .filter(|cv| !cv.layout.is_zst())
-                        .collect();
-                    assert_eq!(non_zst.len(), 1, "Scalar ADT aggregate expects 1 non-ZST operand");
-                    dest.write_cvalue(fx, non_zst.into_iter().next().unwrap());
-                    codegen_set_discriminant(fx, &dest, variant_idx);
-                    return;
-                }
-
-                // Fast path: ScalarPair ADT with single variant (two-field struct)
-                if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-                    let non_zst: Vec<_> = operands
-                        .iter()
-                        .map(|op| codegen_operand(fx, &op.kind))
-                        .filter(|cv| !cv.layout.is_zst())
-                        .collect();
-                    assert_eq!(non_zst.len(), 2, "ScalarPair ADT aggregate expects 2 non-ZST operands");
-                    let val0 = non_zst[0].load_scalar(fx);
-                    let val1 = non_zst[1].load_scalar(fx);
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(val0, val1, dest.layout.clone()),
-                    );
-                    codegen_set_discriminant(fx, &dest, variant_idx);
-                    return;
-                }
-            }
-
-            // General case: for multi-variant enums on register places,
-            // spill to memory so field projections use correct offsets.
-            let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
-                && dest.is_register();
-            let (work_dest, original_dest) = if use_temp {
-                let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
-                (tmp, Some(dest))
-            } else {
-                (dest, None)
-            };
-
-            let variant_ly = match &work_dest.layout.variants {
-                Variants::Single { .. } => work_dest.layout.clone(),
-                Variants::Multiple { variants, .. } => TArc::new(variants[variant_idx].clone()),
-                Variants::Empty => panic!("aggregate on empty variants"),
-            };
-            let variant_dest = work_dest.downcast_variant(variant_ly);
-
-            for (i, operand) in operands.iter().enumerate() {
-                let field_cval = codegen_operand(fx, &operand.kind);
-                if field_cval.layout.is_zst() {
-                    continue;
-                }
-                let field_layout = field_cval.layout.clone();
-                let field_place = variant_dest.place_field(fx, i, field_layout);
-                field_place.write_cvalue(fx, field_cval);
-            }
-
-            codegen_set_discriminant(fx, &work_dest, variant_idx);
-
-            if let Some(orig) = original_dest {
-                let cval = work_dest.to_cvalue(fx);
-                orig.write_cvalue(fx, cval);
-            }
+            let field_vals: Vec<_> = operands.iter()
+                .map(|op| codegen_operand(fx, &op.kind))
+                .collect();
+            codegen_adt_fields(fx, variant_idx, &field_vals, dest);
         }
         AggregateKind::Union(_, _) => {
-            todo!("Union aggregate")
+            // Union aggregate: single active field written at offset 0.
+            assert_eq!(operands.len(), 1, "union aggregate should have exactly 1 operand");
+            let field_val = codegen_operand(fx, &operands[0].kind);
+            let field_layout = field_val.layout.clone();
+            let field_place = dest.place_field(fx, 0, field_layout);
+            field_place.write_cvalue(fx, field_val);
         }
         AggregateKind::RawPtr(_, _) => {
             // RawPtr aggregate: (data_ptr, metadata) → thin or fat pointer
@@ -1868,6 +1918,45 @@ fn codegen_scalar_const(
     }
 }
 
+/// Store a call's return value into `dest` and jump to the continuation block
+/// (or trap for diverging calls). Shared by all call codegen paths.
+fn store_call_result_and_jump(
+    fx: &mut FunctionCx<'_, impl Module>,
+    call: cranelift_codegen::ir::Inst,
+    sret_slot: Option<CPlace>,
+    dest: CPlace,
+    target: &Option<BasicBlockId>,
+) {
+    if let Some(sret_slot) = sret_slot {
+        let cval = sret_slot.to_cvalue(fx);
+        dest.write_cvalue(fx, cval);
+    } else {
+        let results = fx.bcx.inst_results(call);
+        if !dest.layout.is_zst() {
+            match dest.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    let val = results[0];
+                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+                }
+                BackendRepr::ScalarPair(_, _) => {
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
+    } else {
+        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Terminator codegen
 // ---------------------------------------------------------------------------
@@ -2156,84 +2245,13 @@ fn codegen_adt_constructor_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
-    use rustc_abi::Variants;
     let dest = codegen_place(fx, destination);
     if !dest.layout.is_zst() {
         let variant_idx = variant_id_to_idx(fx.db(), variant_id);
-        let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
-
-        // Fast path: Scalar ADT with single variant
-        if is_single_variant {
-            if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
-                let non_zst: Vec<_> = args
-                    .iter()
-                    .map(|op| codegen_operand(fx, &op.kind))
-                    .filter(|cv| !cv.layout.is_zst())
-                    .collect();
-                assert_eq!(non_zst.len(), 1);
-                dest.write_cvalue(fx, non_zst.into_iter().next().unwrap());
-                codegen_set_discriminant(fx, &dest, variant_idx);
-                if let Some(target) = target {
-                    let block = fx.clif_block(*target);
-                    fx.bcx.ins().jump(block, &[]);
-                }
-                return;
-            }
-            if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-                let non_zst: Vec<_> = args
-                    .iter()
-                    .map(|op| codegen_operand(fx, &op.kind))
-                    .filter(|cv| !cv.layout.is_zst())
-                    .collect();
-                assert_eq!(non_zst.len(), 2);
-                let val0 = non_zst[0].load_scalar(fx);
-                let val1 = non_zst[1].load_scalar(fx);
-                dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
-                codegen_set_discriminant(fx, &dest, variant_idx);
-                if let Some(target) = target {
-                    let block = fx.clif_block(*target);
-                    fx.bcx.ins().jump(block, &[]);
-                }
-                return;
-            }
-        }
-
-        // For multi-variant enums on Var/VarPair places, use a temp stack
-        // slot so field projections use correct memory offsets, then write
-        // back to the original variable.
-        let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
-            && dest.is_register();
-        let (work_dest, original_dest) = if use_temp {
-            let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
-            (tmp, Some(dest))
-        } else {
-            (dest, None)
-        };
-
-        let variant_ly = match &work_dest.layout.variants {
-            Variants::Single { .. } => work_dest.layout.clone(),
-            Variants::Multiple { variants, .. } => TArc::new(variants[variant_idx].clone()),
-            Variants::Empty => panic!("constructor on empty variants"),
-        };
-        let variant_dest = work_dest.downcast_variant(variant_ly);
-
-        for (i, arg) in args.iter().enumerate() {
-            let field_cval = codegen_operand(fx, &arg.kind);
-            if field_cval.layout.is_zst() {
-                continue;
-            }
-            let field_layout = field_cval.layout.clone();
-            let field_place = variant_dest.place_field(fx, i, field_layout);
-            field_place.write_cvalue(fx, field_cval);
-        }
-
-        codegen_set_discriminant(fx, &work_dest, variant_idx);
-
-        // Read back from stack slot into the original variable place
-        if let Some(orig) = original_dest {
-            let cval = work_dest.to_cvalue(fx);
-            orig.write_cvalue(fx, cval);
-        }
+        let field_vals: Vec<_> = args.iter()
+            .map(|op| codegen_operand(fx, &op.kind))
+            .collect();
+        codegen_adt_fields(fx, variant_idx, &field_vals, dest);
     }
 
     if let Some(target) = target {
@@ -2340,38 +2358,7 @@ fn codegen_fn_ptr_call(
 
     // Emit indirect call
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-
-    // Store return value
-    if let Some(sret_slot) = sret_slot {
-        let cval = sret_slot.to_cvalue(fx);
-        dest.write_cvalue(fx, cval);
-    } else {
-        let results = fx.bcx.inst_results(call);
-        if !dest.layout.is_zst() {
-            match dest.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    let val = results.first().copied()
-                        .expect("call_indirect returns no values but destination expects Scalar");
-                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
-                }
-                BackendRepr::ScalarPair(_, _) => {
-                    assert!(results.len() >= 2);
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                    );
-                }
-                _ => unreachable!("non-sret memory return from call_indirect"),
-            }
-        }
-    }
-
-    if let Some(target) = target {
-        let block = fx.clif_block(*target);
-        fx.bcx.ins().jump(block, &[]);
-    } else {
-        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-    }
+    store_call_result_and_jump(fx, call, sret_slot, dest, target);
 }
 
 /// Call a closure body directly.
@@ -2448,35 +2435,7 @@ fn codegen_closure_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-
-    // Store return value
-    if let Some(sret_slot) = sret_slot {
-        let cval = sret_slot.to_cvalue(fx);
-        dest.write_cvalue(fx, cval);
-    } else {
-        let results = fx.bcx.inst_results(call);
-        if !dest.layout.is_zst() {
-            match dest.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    dest.write_cvalue(fx, CValue::by_val(results[0], dest.layout.clone()));
-                }
-                BackendRepr::ScalarPair(_, _) => {
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                    );
-                }
-                _ => unreachable!("non-sret memory return from closure call"),
-            }
-        }
-    }
-
-    if let Some(target) = target {
-        let block = fx.clif_block(*target);
-        fx.bcx.ins().jump(block, &[]);
-    } else {
-        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-    }
+    store_call_result_and_jump(fx, call, sret_slot, dest, target);
 }
 
 fn codegen_direct_call(
@@ -2613,42 +2572,7 @@ fn codegen_direct_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-
-    // Store return value into destination place
-    if let Some(sret_slot) = sret_slot {
-        // sret: result is in the stack slot, copy to destination
-        let cval = sret_slot.to_cvalue(fx);
-        dest.write_cvalue(fx, cval);
-    } else {
-        let results = fx.bcx.inst_results(call);
-        if !dest.layout.is_zst() {
-            match dest.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    let val = results.first().copied()
-                        .expect("call returns no values but destination expects Scalar");
-                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
-                }
-                BackendRepr::ScalarPair(_, _) => {
-                    assert!(results.len() >= 2, "call returns fewer than 2 values but destination expects ScalarPair");
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                    );
-                }
-                _ => unreachable!("non-sret memory return"),
-            }
-        }
-    }
-
-    // Jump to continuation block (or trap for diverging calls)
-    if let Some(target) = target {
-        let block = fx.clif_block(*target);
-        fx.bcx.ins().jump(block, &[]);
-    } else {
-        // Diverging call (returns `!`) — the callee never returns,
-        // but Cranelift requires the block to be terminated.
-        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-    }
+    store_call_result_and_jump(fx, call, sret_slot, dest, target);
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -2774,37 +2698,7 @@ fn codegen_virtual_call(
     // Emit indirect call
     let sig_ref = fx.bcx.import_signature(sig);
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-
-    // Store return value
-    if let Some(sret_slot) = sret_slot {
-        let cval = sret_slot.to_cvalue(fx);
-        dest.write_cvalue(fx, cval);
-    } else {
-        let results = fx.bcx.inst_results(call);
-        if !dest.layout.is_zst() {
-            match dest.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    let val = results[0];
-                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
-                }
-                BackendRepr::ScalarPair(_, _) => {
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Jump to continuation or trap for diverging
-    if let Some(target) = target {
-        let block = fx.clif_block(*target);
-        fx.bcx.ins().jump(block, &[]);
-    } else {
-        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-    }
+    store_call_result_and_jump(fx, call, sret_slot, dest, target);
 }
 
 fn codegen_intrinsic_call(
