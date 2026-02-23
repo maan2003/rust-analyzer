@@ -28,13 +28,13 @@ use hir_ty::method_resolution::TraitImpls;
 use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind};
 use rustc_type_ir::inherent::GenericArgs as _;
 use hir_ty::traits::StoredParamEnvAndCrate;
-use la_arena::ArenaMap;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 use triomphe::Arc as TArc;
 
 pub mod layout;
 pub mod link;
+pub mod mirdata_codegen;
 mod pointer;
 pub mod symbol_mangling;
 mod value_and_place;
@@ -80,36 +80,92 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
 }
 
 // ---------------------------------------------------------------------------
+// MirSource: backend-specific fields for FunctionCx
+// ---------------------------------------------------------------------------
+
+pub(crate) enum MirSource<'a> {
+    Ra {
+        db: &'a dyn HirDatabase,
+        env: StoredParamEnvAndCrate,
+        body: &'a MirBody,
+        local_crate: base_db::Crate,
+        ext_crate_disambiguators: &'a HashMap<String, u64>,
+    },
+    Mirdata {
+        #[allow(dead_code)]
+        body: &'a ra_mir_types::Body,
+        #[allow(dead_code)]
+        layouts: &'a [LayoutArc],
+    },
+}
+
+// ---------------------------------------------------------------------------
 // FunctionCx: per-function codegen state
 // ---------------------------------------------------------------------------
 
-struct FunctionCx<'a, M: Module> {
-    bcx: FunctionBuilder<'a>,
-    module: &'a mut M,
-    isa: &'a dyn TargetIsa,
-    pointer_type: Type,
-    db: &'a dyn HirDatabase,
-    dl: &'a TargetDataLayout,
-    env: StoredParamEnvAndCrate,
-
-    /// The crate being compiled (used to detect cross-crate calls).
-    local_crate: base_db::Crate,
-    /// Crate name → disambiguator from sysroot rlib symbols.
-    ext_crate_disambiguators: &'a HashMap<String, u64>,
-
-    /// MIR basic block → Cranelift block
-    block_map: ArenaMap<BasicBlockId, Block>,
-    /// MIR local → CPlace (SSA variable, variable pair, or stack slot)
-    local_map: ArenaMap<LocalId, CPlace>,
+pub(crate) struct FunctionCx<'a, M: Module> {
+    pub(crate) bcx: FunctionBuilder<'a>,
+    pub(crate) module: &'a mut M,
+    pub(crate) isa: &'a dyn TargetIsa,
+    pub(crate) pointer_type: Type,
+    pub(crate) dl: &'a TargetDataLayout,
+    pub(crate) mir: MirSource<'a>,
+    /// MIR basic block → Cranelift block (indexed by raw block id)
+    pub(crate) block_map: Vec<Block>,
+    /// MIR local → CPlace (indexed by raw local id)
+    pub(crate) local_map: Vec<CPlace>,
 }
 
-impl<M: Module> FunctionCx<'_, M> {
+impl<'a, M: Module> FunctionCx<'a, M> {
+    fn db(&self) -> &'a dyn HirDatabase {
+        match &self.mir {
+            MirSource::Ra { db, .. } => *db,
+            _ => panic!("db() called on non-Ra FunctionCx"),
+        }
+    }
+
+    fn env(&self) -> &StoredParamEnvAndCrate {
+        match &self.mir {
+            MirSource::Ra { env, .. } => env,
+            _ => panic!("env() called on non-Ra FunctionCx"),
+        }
+    }
+
+    fn ra_body(&self) -> &'a MirBody {
+        match &self.mir {
+            MirSource::Ra { body, .. } => body,
+            _ => panic!("ra_body() called on non-Ra FunctionCx"),
+        }
+    }
+
+    fn local_crate(&self) -> base_db::Crate {
+        match &self.mir {
+            MirSource::Ra { local_crate, .. } => *local_crate,
+            _ => panic!("local_crate() called on non-Ra FunctionCx"),
+        }
+    }
+
+    fn ext_crate_disambiguators(&self) -> &'a HashMap<String, u64> {
+        match &self.mir {
+            MirSource::Ra { ext_crate_disambiguators, .. } => ext_crate_disambiguators,
+            _ => panic!("ext_crate_disambiguators() called on non-Ra FunctionCx"),
+        }
+    }
+
     fn clif_block(&self, bb: BasicBlockId) -> Block {
-        self.block_map[bb]
+        self.block_map[bb.into_raw().into_u32() as usize]
+    }
+
+    fn clif_block_idx(&self, idx: usize) -> Block {
+        self.block_map[idx]
     }
 
     fn local_place(&self, local: LocalId) -> &CPlace {
-        &self.local_map[local]
+        &self.local_map[local.into_raw().into_u32() as usize]
+    }
+
+    fn local_place_idx(&self, idx: usize) -> &CPlace {
+        &self.local_map[idx]
     }
 }
 
@@ -236,21 +292,21 @@ fn codegen_libcall1(
 
 fn codegen_cast(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     kind: &CastKind,
     operand: &Operand,
     target_ty: &StoredTy,
     result_layout: &LayoutArc,
 ) -> CValue {
+    let body = fx.ra_body();
     // Handle Unsize coercion separately — it produces a fat pointer (ScalarPair)
     if let CastKind::PointerCoercion(PointerCast::Unsize) = kind {
-        return codegen_unsize_coercion(fx, body, operand, target_ty, result_layout);
+        return codegen_unsize_coercion(fx, operand, target_ty, result_layout);
     }
 
-    // Handle ReifyFnPointer: FnDef (ZST) → fn pointer.
+    // Handle ReifyFnPointer: FnDef (ZST) \x{2192} fn pointer.
     // Must be before the generic scalar path because FnDef is ZST and has no scalar value.
     if let CastKind::PointerCoercion(PointerCast::ReifyFnPointer) = kind {
-        let from_ty = operand_ty(fx.db, body, &operand.kind);
+        let from_ty = operand_ty(fx.db(), body, &operand.kind);
         let TyKind::FnDef(def, generic_args) = from_ty.as_ref().kind() else {
             panic!("ReifyFnPointer on non-FnDef type: {:?}", from_ty);
         };
@@ -259,30 +315,30 @@ fn codegen_cast(
         };
         // Declare the function in the module and get its address
         let is_extern = matches!(
-            callee_func_id.loc(fx.db).container,
+            callee_func_id.loc(fx.db()).container,
             ItemContainerId::ExternBlockId(_)
         );
-        let is_cross_crate = callee_func_id.krate(fx.db) != fx.local_crate;
+        let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
         let (callee_sig, callee_name) = if is_extern {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
                 .expect("extern fn sig");
-            let name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+            let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
             (sig, name)
         } else if is_cross_crate {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
                 .expect("cross-crate fn sig");
             let name = symbol_mangling::mangle_function(
-                fx.db, callee_func_id, generic_args, fx.ext_crate_disambiguators,
+                fx.db(), callee_func_id, generic_args, fx.ext_crate_disambiguators(),
             );
             (sig, name)
         } else {
-            let callee_body = fx.db
-                .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
+            let callee_body = fx.db()
+                .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env().clone())
                 .expect("failed to get callee MIR for ReifyFnPointer");
-            let sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body, &[])
+            let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body, &[])
                 .expect("callee sig");
             let name = symbol_mangling::mangle_function(
-                fx.db, callee_func_id, generic_args, fx.ext_crate_disambiguators,
+                fx.db(), callee_func_id, generic_args, fx.ext_crate_disambiguators(),
             );
             (sig, name)
         };
@@ -294,8 +350,8 @@ fn codegen_cast(
         return CValue::by_val(func_addr, result_layout.clone());
     }
 
-    let from_ty = operand_ty(fx.db, body, &operand.kind);
-    let from_cval = codegen_operand(fx, body, &operand.kind);
+    let from_ty = operand_ty(fx.db(), body, &operand.kind);
+    let from_cval = codegen_operand(fx, &operand.kind);
     let from_val = from_cval.load_scalar(fx);
     let from_clif_ty = fx.bcx.func.dfg.value_type(from_val);
 
@@ -365,12 +421,12 @@ fn codegen_cast(
 /// Reference: cg_clif/src/unsize.rs `coerce_unsized_into`
 fn codegen_unsize_coercion(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     operand: &Operand,
     target_ty: &StoredTy,
     result_layout: &LayoutArc,
 ) -> CValue {
-    let from_cval = codegen_operand(fx, body, &operand.kind);
+    let body = fx.ra_body();
+    let from_cval = codegen_operand(fx, &operand.kind);
     let data_ptr = from_cval.load_scalar(fx);
 
     // Extract the trait from the target type (&dyn Trait → Dyn → trait_id)
@@ -380,7 +436,7 @@ fn codegen_unsize_coercion(
         .expect("Unsize target pointee must be dyn Trait");
 
     // Extract the concrete source type (what's behind the thin pointer)
-    let from_ty = operand_ty(fx.db, body, &operand.kind);
+    let from_ty = operand_ty(fx.db(), body, &operand.kind);
     let source_pointee = from_ty.as_ref().builtin_deref(true)
         .expect("Unsize source must be a pointer/reference type");
 
@@ -406,14 +462,14 @@ fn get_or_create_vtable(
     let ptr_size = fx.dl.pointer_size().bytes() as usize;
 
     // Get concrete type layout for size/align
-    let concrete_layout = fx.db
-        .layout_of_ty(concrete_ty.clone(), fx.env.clone())
+    let concrete_layout = fx.db()
+        .layout_of_ty(concrete_ty.clone(), fx.env().clone())
         .expect("layout error for vtable concrete type");
     let concrete_size = concrete_layout.size.bytes();
     let concrete_align = concrete_layout.align.abi.bytes();
 
     // Get trait methods in declaration order
-    let trait_items = trait_id.trait_items(fx.db);
+    let trait_items = trait_id.trait_items(fx.db());
     let method_func_ids: Vec<hir_def::FunctionId> = trait_items.items.iter()
         .filter_map(|(_name, item)| match item {
             AssocItemId::FunctionId(fid) => Some(*fid),
@@ -423,9 +479,9 @@ fn get_or_create_vtable(
     let num_methods = method_func_ids.len();
 
     // Find the impl for this concrete type
-    let krate = fx.local_crate;
-    let trait_impls = TraitImpls::for_crate(fx.db, krate);
-    let interner = DbInterner::new_no_crate(fx.db);
+    let krate = fx.local_crate();
+    let trait_impls = TraitImpls::for_crate(fx.db(), krate);
+    let interner = DbInterner::new_no_crate(fx.db());
 
     // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
     use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
@@ -438,7 +494,7 @@ fn get_or_create_vtable(
     // Build unique vtable name
     let vtable_name = format!(
         "__vtable_{}_for_{:?}",
-        trait_id.trait_items(fx.db).items.first().map(|(n, _)| n.as_str().to_string()).unwrap_or_default(),
+        trait_id.trait_items(fx.db()).items.first().map(|(n, _)| n.as_str().to_string()).unwrap_or_default(),
         simplified,
     );
 
@@ -464,10 +520,10 @@ fn get_or_create_vtable(
     data.define(vtable_bytes.into_boxed_slice());
 
     // Slot 3+: trait method fn ptrs — emit as relocations
-    let impl_items = impl_id.impl_items(fx.db);
+    let impl_items = impl_id.impl_items(fx.db());
     for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
         // Find the corresponding impl method by name
-        let trait_method_name = fx.db.function_signature(*trait_method_func_id).name.clone();
+        let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
         let impl_func_id = impl_items.items.iter()
             .find_map(|(name, item)| {
                 if *name == trait_method_name {
@@ -482,20 +538,20 @@ fn get_or_create_vtable(
             .unwrap_or_else(|| panic!("impl method `{}` not found for vtable", trait_method_name.as_str()));
 
         // Declare/import the impl function
-        let impl_body = fx.db
+        let impl_body = fx.db()
             .monomorphized_mir_body(
                 impl_func_id.into(),
                 GenericArgs::empty(interner).store(),
-                fx.env.clone(),
+                fx.env().clone(),
             )
             .expect("failed to get impl method MIR for vtable");
-        let impl_sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &impl_body, &[])
+        let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body, &[])
             .expect("impl method sig for vtable");
         let impl_fn_name = symbol_mangling::mangle_function(
-            fx.db,
+            fx.db(),
             impl_func_id,
             GenericArgs::empty(interner),
-            fx.ext_crate_disambiguators,
+            fx.ext_crate_disambiguators(),
         );
 
         let func_id = fx.module
@@ -530,7 +586,8 @@ fn vtable_memflags() -> MemFlags {
 // Place codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &Place) -> CPlace {
+fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace {
+    let body = fx.ra_body();
     let projections = place.projection.lookup(&body.projection_store);
     if projections.is_empty() {
         return fx.local_place(place.local).clone();
@@ -550,10 +607,9 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                 };
 
                 // Determine the field type from the current type
-                let field_ty = field_type(fx.db, &cur_ty, field);
-                let field_layout = fx
-                    .db
-                    .layout_of_ty(field_ty.clone(), fx.env.clone())
+                let field_ty = field_type(fx.db(), &cur_ty, field);
+                let field_layout = fx.db()
+                    .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("field layout error");
 
                 cplace = cplace.place_field(fx, field_idx, field_layout);
@@ -564,9 +620,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                     .as_ref()
                     .builtin_deref(true)
                     .expect("deref on non-pointer type");
-                let inner_layout = fx
-                    .db
-                    .layout_of_ty(inner_ty.store(), fx.env.clone())
+                let inner_layout = fx.db()
+                    .layout_of_ty(inner_ty.store(), fx.env().clone())
                     .expect("deref layout error");
 
                 // Load the pointer value from the current place.
@@ -601,21 +656,20 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                     }
                 }
                 let variant_layout = variant_layout(
-                    fx.db,
+                    fx.db(),
                     &cur_ty,
                     &cplace.layout,
                     *variant_idx,
-                    &fx.env,
+                    fx.env(),
                 );
                 cplace = cplace.downcast_variant(variant_layout);
                 // cur_ty stays the same (Downcast is just a type assertion)
             }
             ProjectionElem::ClosureField(idx) => {
                 // Closure captures are stored as fields of the closure struct
-                let field_ty = closure_field_type(fx.db, &cur_ty, *idx);
-                let field_layout = fx
-                    .db
-                    .layout_of_ty(field_ty.clone(), fx.env.clone())
+                let field_ty = closure_field_type(fx.db(), &cur_ty, *idx);
+                let field_layout = fx.db()
+                    .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("closure field layout error");
                 cplace = cplace.place_field(fx, *idx, field_layout);
                 cur_ty = field_ty;
@@ -627,9 +681,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
                     _ => panic!("Index on non-array/slice type"),
                 };
-                let elem_layout = fx
-                    .db
-                    .layout_of_ty(elem_ty.clone(), fx.env.clone())
+                let elem_layout = fx.db()
+                    .layout_of_ty(elem_ty.clone(), fx.env().clone())
                     .expect("elem layout");
                 let offset = fx.bcx.ins().imul_imm(index_val, elem_layout.size.bytes() as i64);
                 // Arrays in registers → spill to memory
@@ -777,23 +830,23 @@ fn variant_id_to_idx(db: &dyn HirDatabase, variant_id: VariantId) -> VariantIdx 
 // Statement codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, stmt: &StatementKind) {
+fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &StatementKind) {
     match stmt {
         StatementKind::Assign(place, rvalue) => {
-            codegen_assign(fx, body, place, rvalue);
+            codegen_assign(fx, place, rvalue);
         }
         StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
         StatementKind::Nop | StatementKind::FakeRead(_) => {}
         StatementKind::Deinit(_) => {}
         StatementKind::SetDiscriminant { place, variant_index } => {
-            let dest = codegen_place(fx, body, place);
+            let dest = codegen_place(fx, place);
             codegen_set_discriminant(fx, &dest, *variant_index);
         }
     }
 }
 
-fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &Place, rvalue: &Rvalue) {
-    let dest = codegen_place(fx, body, place);
+fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &Rvalue) {
+    let dest = codegen_place(fx, place);
     if dest.layout.is_zst() {
         return;
     }
@@ -801,17 +854,17 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &
     // Some rvalues need to write directly to the destination place
     match rvalue {
         Rvalue::Aggregate(kind, operands) => {
-            codegen_aggregate(fx, body, kind, operands, dest);
+            codegen_aggregate(fx, kind, operands, dest);
             return;
         }
         Rvalue::Ref(_, ref_place) | Rvalue::AddressOf(_, ref_place) => {
-            let place = codegen_place(fx, body, ref_place);
+            let place = codegen_place(fx, ref_place);
             let ref_val = place.place_ref(fx, dest.layout.clone());
             dest.write_cvalue(fx, ref_val);
             return;
         }
         Rvalue::Discriminant(disc_place) => {
-            let disc_cplace = codegen_place(fx, body, disc_place);
+            let disc_cplace = codegen_place(fx, disc_place);
             let disc_val = codegen_get_discriminant(fx, &disc_cplace, &dest.layout);
             dest.write_cvalue(fx, CValue::by_val(disc_val, dest.layout.clone()));
             return;
@@ -819,26 +872,26 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &
         _ => {}
     }
 
-    let val = codegen_rvalue(fx, body, rvalue, &dest.layout);
+    let val = codegen_rvalue(fx, rvalue, &dest.layout);
     dest.write_cvalue(fx, val);
 }
 
 fn codegen_rvalue(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     rvalue: &Rvalue,
     result_layout: &LayoutArc,
 ) -> CValue {
     match rvalue {
-        Rvalue::Use(operand) => codegen_operand(fx, body, &operand.kind),
-        Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, body, op, lhs, rhs, result_layout),
-        Rvalue::UnaryOp(op, operand) => codegen_unop(fx, body, op, operand, result_layout),
+        Rvalue::Use(operand) => codegen_operand(fx, &operand.kind),
+        Rvalue::BinaryOp(op, lhs, rhs) => codegen_binop(fx, op, lhs, rhs, result_layout),
+        Rvalue::UnaryOp(op, operand) => codegen_unop(fx, op, operand, result_layout),
         Rvalue::Cast(kind, operand, target_ty) => {
-            codegen_cast(fx, body, kind, operand, target_ty, result_layout)
+            codegen_cast(fx, kind, operand, target_ty, result_layout)
         }
         Rvalue::Len(place) => {
             // For fixed-size arrays, length is a constant
-            let place_ty = place_ty(fx.db, body, place);
+            let body = fx.ra_body();
+            let place_ty = place_ty(fx.db(), body, place);
             match place_ty.as_ref().kind() {
                 TyKind::Array(_, len) => {
                     let len_val = match len.kind() {
@@ -871,7 +924,6 @@ fn codegen_rvalue(
 
 fn codegen_aggregate(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     kind: &hir_ty::mir::AggregateKind,
     operands: &[Operand],
     dest: CPlace,
@@ -882,8 +934,8 @@ fn codegen_aggregate(
             // For ScalarPair tuples, construct directly as a pair
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
                 assert_eq!(operands.len(), 2, "ScalarPair aggregate expects 2 operands");
-                let val0 = codegen_operand(fx, body, &operands[0].kind).load_scalar(fx);
-                let val1 = codegen_operand(fx, body, &operands[1].kind).load_scalar(fx);
+                let val0 = codegen_operand(fx, &operands[0].kind).load_scalar(fx);
+                let val1 = codegen_operand(fx, &operands[1].kind).load_scalar(fx);
                 dest.write_cvalue(
                     fx,
                     CValue::by_val_pair(val0, val1, dest.layout.clone()),
@@ -894,14 +946,14 @@ fn codegen_aggregate(
             // For single scalar, construct directly
             if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
                 assert_eq!(operands.len(), 1, "Scalar aggregate expects 1 operand");
-                let val = codegen_operand(fx, body, &operands[0].kind);
+                let val = codegen_operand(fx, &operands[0].kind);
                 dest.write_cvalue(fx, val);
                 return;
             }
 
             // General case: write each field to the destination place
             for (i, operand) in operands.iter().enumerate() {
-                let field_cval = codegen_operand(fx, body, &operand.kind);
+                let field_cval = codegen_operand(fx, &operand.kind);
                 let field_layout = field_cval.layout.clone();
                 let field_place = dest.place_field(fx, i, field_layout);
                 field_place.write_cvalue(fx, field_cval);
@@ -909,7 +961,7 @@ fn codegen_aggregate(
         }
         AggregateKind::Adt(variant_id, _subst) => {
             use rustc_abi::Variants;
-            let variant_idx = variant_id_to_idx(fx.db, *variant_id);
+            let variant_idx = variant_id_to_idx(fx.db(), *variant_id);
             let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
 
             // Fast path: Scalar ADT with single variant (wrapper struct)
@@ -917,7 +969,7 @@ fn codegen_aggregate(
                 if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
                     let non_zst: Vec<_> = operands
                         .iter()
-                        .map(|op| codegen_operand(fx, body, &op.kind))
+                        .map(|op| codegen_operand(fx, &op.kind))
                         .filter(|cv| !cv.layout.is_zst())
                         .collect();
                     assert_eq!(non_zst.len(), 1, "Scalar ADT aggregate expects 1 non-ZST operand");
@@ -930,7 +982,7 @@ fn codegen_aggregate(
                 if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
                     let non_zst: Vec<_> = operands
                         .iter()
-                        .map(|op| codegen_operand(fx, body, &op.kind))
+                        .map(|op| codegen_operand(fx, &op.kind))
                         .filter(|cv| !cv.layout.is_zst())
                         .collect();
                     assert_eq!(non_zst.len(), 2, "ScalarPair ADT aggregate expects 2 non-ZST operands");
@@ -964,7 +1016,7 @@ fn codegen_aggregate(
             let variant_dest = work_dest.downcast_variant(variant_ly);
 
             for (i, operand) in operands.iter().enumerate() {
-                let field_cval = codegen_operand(fx, body, &operand.kind);
+                let field_cval = codegen_operand(fx, &operand.kind);
                 if field_cval.layout.is_zst() {
                     continue;
                 }
@@ -1153,14 +1205,14 @@ fn codegen_set_discriminant(
 
 fn codegen_binop(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     op: &BinOp,
     lhs: &Operand,
     rhs: &Operand,
     result_layout: &LayoutArc,
 ) -> CValue {
-    let lhs_cval = codegen_operand(fx, body, &lhs.kind);
-    let rhs_cval = codegen_operand(fx, body, &rhs.kind);
+    let body = fx.ra_body();
+    let lhs_cval = codegen_operand(fx, &lhs.kind);
+    let rhs_cval = codegen_operand(fx, &rhs.kind);
     let lhs_val = lhs_cval.load_scalar(fx);
     let rhs_val = rhs_cval.load_scalar(fx);
 
@@ -1182,18 +1234,17 @@ fn codegen_binop(
         Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
         Primitive::Pointer(_) => match op {
             BinOp::Offset => {
-                let lhs_ty = operand_ty(fx.db, body, &lhs.kind);
+                let lhs_ty = operand_ty(fx.db(), body, &lhs.kind);
                 let pointee_ty = lhs_ty
                     .as_ref()
                     .builtin_deref(true)
                     .expect("Offset lhs must be a pointer/reference");
-                let pointee_layout = fx
-                    .db
-                    .layout_of_ty(pointee_ty.store(), fx.env.clone())
+                let pointee_layout = fx.db()
+                    .layout_of_ty(pointee_ty.store(), fx.env().clone())
                     .expect("layout error for pointee type");
                 let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
                 let rhs_ty = fx.bcx.func.dfg.value_type(rhs_val);
-                let rhs_signed = ty_is_signed_int(operand_ty(fx.db, body, &rhs.kind));
+                let rhs_signed = ty_is_signed_int(operand_ty(fx.db(), body, &rhs.kind));
                 let rhs = if rhs_ty == ptr_ty {
                     rhs_val
                 } else if ptr_ty.wider_or_equal(rhs_ty) {
@@ -1393,16 +1444,16 @@ fn codegen_float_binop(
 
 fn codegen_unop(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     op: &UnOp,
     operand: &Operand,
     result_layout: &LayoutArc,
 ) -> CValue {
-    let cval = codegen_operand(fx, body, &operand.kind);
+    let body = fx.ra_body();
+    let cval = codegen_operand(fx, &operand.kind);
     let val = cval.load_scalar(fx);
     let result = match op {
         UnOp::Not => {
-            let ty = operand_ty(fx.db, body, &operand.kind);
+            let ty = operand_ty(fx.db(), body, &operand.kind);
             if ty.as_ref().kind() == TyKind::Bool {
                 fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0)
             } else {
@@ -1425,14 +1476,12 @@ fn codegen_unop(
 
 fn codegen_operand(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     kind: &OperandKind,
 ) -> CValue {
     match kind {
         OperandKind::Constant { konst, ty } => {
-            let layout = fx
-                .db
-                .layout_of_ty(ty.clone(), fx.env.clone())
+            let layout = fx.db()
+                .layout_of_ty(ty.clone(), fx.env().clone())
                 .expect("layout error for constant type");
             if layout.is_zst() {
                 return CValue::zst(layout);
@@ -1501,7 +1550,7 @@ fn codegen_operand(
             }
         }
         OperandKind::Copy(place) | OperandKind::Move(place) => {
-            codegen_place(fx, body, place).to_cvalue(fx)
+            codegen_place(fx, place).to_cvalue(fx)
         }
         OperandKind::Static(_) => todo!("static operand"),
     }
@@ -1511,7 +1560,7 @@ fn codegen_operand(
 // Terminator codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term: &TerminatorKind) {
+fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKind) {
     match term {
         TerminatorKind::Return => {
             let ret_place = fx.local_place(hir_ty::mir::return_slot()).clone();
@@ -1544,7 +1593,7 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
         }
         TerminatorKind::SwitchInt { discr, targets } => {
-            let discr_cval = codegen_operand(fx, body, &discr.kind);
+            let discr_cval = codegen_operand(fx, &discr.kind);
             let discr_val = discr_cval.load_scalar(fx);
             let otherwise = fx.clif_block(targets.otherwise());
 
@@ -1556,7 +1605,7 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
             switch.emit(&mut fx.bcx, discr_val, otherwise);
         }
         TerminatorKind::Call { func, args, destination, target, .. } => {
-            codegen_call(fx, body, func, args, destination, target);
+            codegen_call(fx, func, args, destination, target);
         }
         TerminatorKind::Drop { target, .. } => {
             // For scalar types, drop is a no-op — just jump to target.
@@ -1570,14 +1619,14 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
 
 fn codegen_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     func: &Operand,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
     // Extract the function type from any operand (constant or non-constant)
-    let fn_ty_stored = operand_ty(fx.db, body, &func.kind);
+    let body = fx.ra_body();
+    let fn_ty_stored = operand_ty(fx.db(), body, &func.kind);
 
     match fn_ty_stored.as_ref().kind() {
         TyKind::FnDef(def, generic_args) => {
@@ -1586,7 +1635,6 @@ fn codegen_call(
                 CallableDefId::FunctionId(callee_func_id) => {
                     codegen_direct_call(
                         fx,
-                        body,
                         callee_func_id,
                         generic_args,
                         args,
@@ -1596,20 +1644,20 @@ fn codegen_call(
                 }
                 CallableDefId::StructId(struct_id) => {
                     codegen_adt_constructor_call(
-                        fx, body, VariantId::StructId(struct_id), generic_args,
+                        fx, VariantId::StructId(struct_id), generic_args,
                         args, destination, target,
                     );
                 }
                 CallableDefId::EnumVariantId(variant_id) => {
                     codegen_adt_constructor_call(
-                        fx, body, VariantId::EnumVariantId(variant_id), generic_args,
+                        fx, VariantId::EnumVariantId(variant_id), generic_args,
                         args, destination, target,
                     );
                 }
             }
         }
         TyKind::FnPtr(sig_tys, _header) => {
-            codegen_fn_ptr_call(fx, body, func, &sig_tys, args, destination, target);
+            codegen_fn_ptr_call(fx, func, &sig_tys, args, destination, target);
         }
         _ => todo!("non-FnDef/FnPtr call: {:?}", fn_ty_stored),
     }
@@ -1619,7 +1667,6 @@ fn codegen_call(
 /// calls but rather aggregate construction lowered as Call terminators.
 fn codegen_adt_constructor_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     variant_id: VariantId,
     _generic_args: GenericArgs<'_>,
     args: &[Operand],
@@ -1627,9 +1674,9 @@ fn codegen_adt_constructor_call(
     target: &Option<BasicBlockId>,
 ) {
     use rustc_abi::Variants;
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     if !dest.layout.is_zst() {
-        let variant_idx = variant_id_to_idx(fx.db, variant_id);
+        let variant_idx = variant_id_to_idx(fx.db(), variant_id);
         let is_single_variant = matches!(&dest.layout.variants, Variants::Single { .. });
 
         // Fast path: Scalar ADT with single variant
@@ -1637,7 +1684,7 @@ fn codegen_adt_constructor_call(
             if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
                 let non_zst: Vec<_> = args
                     .iter()
-                    .map(|op| codegen_operand(fx, body, &op.kind))
+                    .map(|op| codegen_operand(fx, &op.kind))
                     .filter(|cv| !cv.layout.is_zst())
                     .collect();
                 assert_eq!(non_zst.len(), 1);
@@ -1652,7 +1699,7 @@ fn codegen_adt_constructor_call(
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
                 let non_zst: Vec<_> = args
                     .iter()
-                    .map(|op| codegen_operand(fx, body, &op.kind))
+                    .map(|op| codegen_operand(fx, &op.kind))
                     .filter(|cv| !cv.layout.is_zst())
                     .collect();
                 assert_eq!(non_zst.len(), 2);
@@ -1688,7 +1735,7 @@ fn codegen_adt_constructor_call(
         let variant_dest = work_dest.downcast_variant(variant_ly);
 
         for (i, arg) in args.iter().enumerate() {
-            let field_cval = codegen_operand(fx, body, &arg.kind);
+            let field_cval = codegen_operand(fx, &arg.kind);
             if field_cval.layout.is_zst() {
                 continue;
             }
@@ -1717,7 +1764,6 @@ fn codegen_adt_constructor_call(
 /// and emits `call_indirect`.
 fn codegen_fn_ptr_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     func_operand: &Operand,
     sig_tys: &rustc_type_ir::Binder<DbInterner, rustc_type_ir::FnSigTys<DbInterner>>,
     args: &[Operand],
@@ -1725,7 +1771,7 @@ fn codegen_fn_ptr_call(
     target: &Option<BasicBlockId>,
 ) {
     // Load the fn pointer value
-    let fn_ptr_cval = codegen_operand(fx, body, &func_operand.kind);
+    let fn_ptr_cval = codegen_operand(fx, &func_operand.kind);
     let fn_ptr = fn_ptr_cval.load_scalar(fx);
 
     // Build signature from FnPtr type info
@@ -1734,7 +1780,7 @@ fn codegen_fn_ptr_call(
 
     // Return type
     let output = sig_tys_inner.output();
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     let is_sret_return = if output.is_never() || dest.layout.is_zst() {
         false
     } else {
@@ -1757,7 +1803,7 @@ fn codegen_fn_ptr_call(
 
     // Parameter types in signature
     for &param_ty in sig_tys_inner.inputs() {
-        let param_layout = fx.db.layout_of_ty(param_ty.store(), fx.env.clone())
+        let param_layout = fx.db().layout_of_ty(param_ty.store(), fx.env().clone())
             .expect("fn ptr param layout");
         match param_layout.backend_repr {
             BackendRepr::Scalar(scalar) => {
@@ -1789,7 +1835,7 @@ fn codegen_fn_ptr_call(
     };
 
     for arg in args {
-        let cval = codegen_operand(fx, body, &arg.kind);
+        let cval = codegen_operand(fx, &arg.kind);
         if cval.layout.is_zst() {
             continue;
         }
@@ -1852,7 +1898,6 @@ fn codegen_fn_ptr_call(
 /// MIR body instead of going through trait dispatch.
 fn codegen_closure_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     closure_id: hir_ty::db::InternedClosureId,
     closure_subst: StoredGenericArgs,
     args: &[Operand],
@@ -1860,15 +1905,15 @@ fn codegen_closure_call(
     target: &Option<BasicBlockId>,
 ) {
     // Get closure MIR body to build the signature
-    let closure_body = fx.db
-        .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env.clone())
+    let closure_body = fx.db()
+        .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
         .expect("closure MIR");
-    let sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &closure_body, &[])
+    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body, &[])
         .expect("closure sig");
 
     // Generate mangled name
     let closure_name = symbol_mangling::mangle_closure(
-        fx.db, closure_id, fx.ext_crate_disambiguators,
+        fx.db(), closure_id, fx.ext_crate_disambiguators(),
     );
 
     // Declare in module (Import linkage — defined elsewhere in same module)
@@ -1878,7 +1923,7 @@ fn codegen_closure_call(
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
     // Destination
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     let is_sret_return = !dest.layout.is_zst()
         && !matches!(
             dest.layout.backend_repr,
@@ -1898,7 +1943,7 @@ fn codegen_closure_call(
     };
 
     for arg in args {
-        let cval = codegen_operand(fx, body, &arg.kind);
+        let cval = codegen_operand(fx, &arg.kind);
         if cval.layout.is_zst() {
             continue;
         }
@@ -1953,27 +1998,26 @@ fn codegen_closure_call(
 
 fn codegen_direct_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     callee_func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
-    if codegen_intrinsic_call(fx, body, callee_func_id, generic_args, args, destination, target) {
+    if codegen_intrinsic_call(fx, callee_func_id, generic_args, args, destination, target) {
         return;
     }
 
     // Check for virtual dispatch: trait method called on dyn Trait
-    if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db).container {
-        let interner = DbInterner::new_no_crate(fx.db);
+    if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db()).container {
+        let interner = DbInterner::new_no_crate(fx.db());
         if hir_ty::method_resolution::is_dyn_method(
             interner,
-            fx.env.param_env(),
+            fx.env().param_env(),
             callee_func_id,
             generic_args,
         ).is_some() {
-            codegen_virtual_call(fx, body, callee_func_id, trait_id, args, destination, target);
+            codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
             return;
         }
 
@@ -1983,7 +2027,7 @@ fn codegen_direct_call(
             let self_ty = generic_args.type_at(0);
             if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
                 codegen_closure_call(
-                    fx, body, closure_id.0, closure_subst.store(),
+                    fx, closure_id.0, closure_subst.store(),
                     args, destination, target,
                 );
                 return;
@@ -1993,42 +2037,41 @@ fn codegen_direct_call(
 
     // Check if this is an extern function (no MIR available)
     let is_extern = matches!(
-        callee_func_id.loc(fx.db).container,
+        callee_func_id.loc(fx.db()).container,
         ItemContainerId::ExternBlockId(_)
     );
-    let is_cross_crate = callee_func_id.krate(fx.db) != fx.local_crate;
+    let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
 
     let (callee_sig, callee_name) = if is_extern {
         // Extern functions: build signature from type info, use raw symbol name
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
             .expect("extern fn sig");
-        let name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+        let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
         (sig, name)
     } else if is_cross_crate {
         // Cross-crate Rust functions: build signature from type info,
         // use v0 mangled name with real disambiguator from rlib
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
             .expect("cross-crate fn sig");
         let name = symbol_mangling::mangle_function(
-            fx.db,
+            fx.db(),
             callee_func_id,
             generic_args,
-            fx.ext_crate_disambiguators,
+            fx.ext_crate_disambiguators(),
         );
         (sig, name)
     } else {
         // Local functions: build signature from MIR, use v0 mangled name
-        let callee_body = fx
-            .db
-            .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
+        let callee_body = fx.db()
+            .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env().clone())
             .expect("failed to get callee MIR");
         let sig =
-            build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body, &[]).expect("callee sig");
+            build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body, &[]).expect("callee sig");
         let name = symbol_mangling::mangle_function(
-            fx.db,
+            fx.db(),
             callee_func_id,
             generic_args,
-            fx.ext_crate_disambiguators,
+            fx.ext_crate_disambiguators(),
         );
         (sig, name)
     };
@@ -2043,7 +2086,7 @@ fn codegen_direct_call(
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
     // Determine destination layout to check for sret return
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     let is_sret_return = !dest.layout.is_zst()
         && !matches!(
             dest.layout.backend_repr,
@@ -2064,7 +2107,7 @@ fn codegen_direct_call(
     };
 
     for arg in args {
-        let cval = codegen_operand(fx, body, &arg.kind);
+        let cval = codegen_operand(fx, &arg.kind);
         if cval.layout.is_zst() {
             continue;
         }
@@ -2129,7 +2172,6 @@ fn codegen_direct_call(
 /// Reference: cg_clif/src/vtable.rs `get_ptr_and_method_ref` + cg_clif/src/abi/mod.rs:525-543
 fn codegen_virtual_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     callee_func_id: hir_def::FunctionId,
     trait_id: TraitId,
     args: &[Operand],
@@ -2139,8 +2181,8 @@ fn codegen_virtual_call(
     let ptr_size = fx.dl.pointer_size().bytes();
 
     // Compute vtable index: 3 (header slots) + method position in trait
-    let trait_items = trait_id.trait_items(fx.db);
-    let callee_name = fx.db.function_signature(callee_func_id).name.clone();
+    let trait_items = trait_id.trait_items(fx.db());
+    let callee_name = fx.db().function_signature(callee_func_id).name.clone();
     let mut method_idx = 0;
     let mut found = false;
     for (name, item) in trait_items.items.iter() {
@@ -2161,7 +2203,7 @@ fn codegen_virtual_call(
     let vtable_offset = (3 + method_idx) * ptr_size as usize;
 
     // Get self arg (&dyn Trait = ScalarPair(data_ptr, vtable_ptr))
-    let self_cval = codegen_operand(fx, body, &args[0].kind);
+    let self_cval = codegen_operand(fx, &args[0].kind);
     let (data_ptr, vtable_ptr) = self_cval.load_scalar_pair(fx);
 
     // Load fn ptr from vtable
@@ -2179,7 +2221,7 @@ fn codegen_virtual_call(
     let mut sig = Signature::new(fx.isa.default_call_conv());
 
     // Return type
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     let is_sret_return = !dest.layout.is_zst()
         && !matches!(
             dest.layout.backend_repr,
@@ -2221,7 +2263,7 @@ fn codegen_virtual_call(
 
     // Remaining args (after self)
     for arg in &args[1..] {
-        let cval = codegen_operand(fx, body, &arg.kind);
+        let cval = codegen_operand(fx, &arg.kind);
         if cval.layout.is_zst() {
             continue;
         }
@@ -2284,25 +2326,25 @@ fn codegen_virtual_call(
 
 fn codegen_intrinsic_call(
     fx: &mut FunctionCx<'_, impl Module>,
-    body: &MirBody,
     callee_func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) -> bool {
-    if !FunctionSignature::is_intrinsic(fx.db, callee_func_id) {
+    let body = fx.ra_body();
+    if !FunctionSignature::is_intrinsic(fx.db(), callee_func_id) {
         return false;
     }
 
-    let sig = fx.db.function_signature(callee_func_id);
+    let sig = fx.db().function_signature(callee_func_id);
     let name = sig.name.as_str();
 
     // Pre-compute layout of the first generic type argument (e.g. size_of::<T>)
     // Done eagerly to avoid borrow conflicts with fx inside match arms.
     let generic_ty_layout = if generic_args.len() > 0 {
         let ty = generic_args.type_at(0);
-        fx.db.layout_of_ty(ty.store(), fx.env.clone()).ok()
+        fx.db().layout_of_ty(ty.store(), fx.env().clone()).ok()
     } else {
         None
     };
@@ -2311,24 +2353,23 @@ fn codegen_intrinsic_call(
         "offset" | "arith_offset" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
 
-            let ptr_cval = codegen_operand(fx, body, &args[0].kind);
-            let offset_cval = codegen_operand(fx, body, &args[1].kind);
+            let ptr_cval = codegen_operand(fx, &args[0].kind);
+            let offset_cval = codegen_operand(fx, &args[1].kind);
             let ptr = ptr_cval.load_scalar(fx);
             let offset = offset_cval.load_scalar(fx);
 
-            let ptr_ty = operand_ty(fx.db, body, &args[0].kind);
+            let ptr_ty = operand_ty(fx.db(), body, &args[0].kind);
             let pointee_ty = ptr_ty
                 .as_ref()
                 .builtin_deref(true)
                 .expect("offset intrinsic first argument must be a pointer");
-            let pointee_layout = fx
-                .db
-                .layout_of_ty(pointee_ty.store(), fx.env.clone())
+            let pointee_layout = fx.db()
+                .layout_of_ty(pointee_ty.store(), fx.env().clone())
                 .expect("layout error for offset intrinsic pointee");
 
             let ptr_clif_ty = fx.bcx.func.dfg.value_type(ptr);
             let offset_clif_ty = fx.bcx.func.dfg.value_type(offset);
-            let offset_signed = ty_is_signed_int(operand_ty(fx.db, body, &args[1].kind));
+            let offset_signed = ty_is_signed_int(operand_ty(fx.db(), body, &args[1].kind));
             let offset = if offset_clif_ty == ptr_clif_ty {
                 offset
             } else if ptr_clif_ty.wider_or_equal(offset_clif_ty) {
@@ -2347,19 +2388,18 @@ fn codegen_intrinsic_call(
         "ptr_offset_from" | "ptr_offset_from_unsigned" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
 
-            let ptr_cval = codegen_operand(fx, body, &args[0].kind);
-            let base_cval = codegen_operand(fx, body, &args[1].kind);
+            let ptr_cval = codegen_operand(fx, &args[0].kind);
+            let base_cval = codegen_operand(fx, &args[1].kind);
             let ptr = ptr_cval.load_scalar(fx);
             let base = base_cval.load_scalar(fx);
 
-            let ptr_ty = operand_ty(fx.db, body, &args[0].kind);
+            let ptr_ty = operand_ty(fx.db(), body, &args[0].kind);
             let pointee_ty = ptr_ty
                 .as_ref()
                 .builtin_deref(true)
                 .expect("ptr_offset_from first argument must be a pointer");
-            let pointee_layout = fx
-                .db
-                .layout_of_ty(pointee_ty.store(), fx.env.clone())
+            let pointee_layout = fx.db()
+                .layout_of_ty(pointee_ty.store(), fx.env().clone())
                 .expect("layout error for ptr_offset_from intrinsic pointee");
             let pointee_size = pointee_layout.size.bytes();
             assert!(pointee_size != 0, "ptr_offset_from on ZST pointee is unsupported");
@@ -2403,9 +2443,9 @@ fn codegen_intrinsic_call(
         // --- memory operations ---
         "copy_nonoverlapping" => {
             assert_eq!(args.len(), 3, "copy_nonoverlapping expects 3 args");
-            let src = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let dst = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+            let src = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let dst = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, &args[2].kind).load_scalar(fx);
 
             let layout = generic_ty_layout.clone().expect("copy_nonoverlapping: layout error");
             let elem_size = layout.size.bytes();
@@ -2420,9 +2460,9 @@ fn codegen_intrinsic_call(
         }
         "copy" => {
             assert_eq!(args.len(), 3, "copy expects 3 args");
-            let src = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let dst = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+            let src = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let dst = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, &args[2].kind).load_scalar(fx);
 
             let layout = generic_ty_layout.clone().expect("copy: layout error");
             let elem_size = layout.size.bytes();
@@ -2437,9 +2477,9 @@ fn codegen_intrinsic_call(
         }
         "write_bytes" => {
             assert_eq!(args.len(), 3, "write_bytes expects 3 args");
-            let dst = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let val = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+            let dst = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, &args[2].kind).load_scalar(fx);
 
             let layout = generic_ty_layout.clone().expect("write_bytes: layout error");
             let elem_size = layout.size.bytes();
@@ -2455,10 +2495,10 @@ fn codegen_intrinsic_call(
         "volatile_load" | "unaligned_volatile_load" => {
             // Cranelift treats loads as volatile by default
             assert_eq!(args.len(), 1);
-            let ptr = codegen_operand(fx, body, &args[0].kind);
+            let ptr = codegen_operand(fx, &args[0].kind);
             let inner_layout = generic_ty_layout.clone().expect("volatile_load: layout error");
             let val = CValue::by_ref(pointer::Pointer::new(ptr.load_scalar(fx)), inner_layout);
-            let dest = codegen_place(fx, body, destination);
+            let dest = codegen_place(fx, destination);
             dest.write_cvalue(fx, val);
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
@@ -2469,8 +2509,8 @@ fn codegen_intrinsic_call(
         "volatile_store" | "unaligned_volatile_store" | "nontemporal_store" => {
             // Cranelift treats stores as volatile by default
             assert_eq!(args.len(), 2);
-            let ptr = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let val = codegen_operand(fx, body, &args[1].kind);
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[1].kind);
             let dest = CPlace::for_ptr(pointer::Pointer::new(ptr), val.layout.clone());
             dest.write_cvalue(fx, val);
             if let Some(target) = target {
@@ -2486,13 +2526,13 @@ fn codegen_intrinsic_call(
         }
         "likely" | "unlikely" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             Some(val) // pass through
         }
         "black_box" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind);
-            let dest = codegen_place(fx, body, destination);
+            let val = codegen_operand(fx, &args[0].kind);
+            let dest = codegen_place(fx, destination);
             dest.write_cvalue(fx, val);
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
@@ -2504,26 +2544,26 @@ fn codegen_intrinsic_call(
         // --- bit manipulation ---
         "ctlz" | "ctlz_nonzero" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             let res = fx.bcx.ins().clz(val);
             // Result type is u32
             Some(codegen_intcast(fx, res, types::I32, false))
         }
         "cttz" | "cttz_nonzero" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             let res = fx.bcx.ins().ctz(val);
             Some(codegen_intcast(fx, res, types::I32, false))
         }
         "ctpop" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             let res = fx.bcx.ins().popcnt(val);
             Some(codegen_intcast(fx, res, types::I32, false))
         }
         "bswap" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             if fx.bcx.func.dfg.value_type(val) == types::I8 {
                 Some(val)
             } else {
@@ -2532,30 +2572,30 @@ fn codegen_intrinsic_call(
         }
         "bitreverse" => {
             assert_eq!(args.len(), 1);
-            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             Some(fx.bcx.ins().bitrev(val))
         }
 
         // --- rotate ---
         "rotate_left" => {
             assert_eq!(args.len(), 2);
-            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let x = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().rotl(x, y))
         }
         "rotate_right" => {
             assert_eq!(args.len(), 2);
-            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let x = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().rotr(x, y))
         }
 
         // --- exact_div ---
         "exact_div" => {
             assert_eq!(args.len(), 2);
-            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            let x = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
             if ty_is_signed_int(arg_ty) {
                 Some(fx.bcx.ins().sdiv(x, y))
             } else {
@@ -2566,33 +2606,33 @@ fn codegen_intrinsic_call(
         // --- wrapping arithmetic ---
         "wrapping_add" | "unchecked_add" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().iadd(a, b))
         }
         "wrapping_sub" | "unchecked_sub" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().isub(a, b))
         }
         "wrapping_mul" | "unchecked_mul" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().imul(a, b))
         }
         "unchecked_shl" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().ishl(a, b))
         }
         "unchecked_shr" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
             if ty_is_signed_int(arg_ty) {
                 Some(fx.bcx.ins().sshr(a, b))
             } else {
@@ -2601,9 +2641,9 @@ fn codegen_intrinsic_call(
         }
         "unchecked_div" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
             if ty_is_signed_int(arg_ty) {
                 Some(fx.bcx.ins().sdiv(a, b))
             } else {
@@ -2612,9 +2652,9 @@ fn codegen_intrinsic_call(
         }
         "unchecked_rem" => {
             assert_eq!(args.len(), 2);
-            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
-            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
             if ty_is_signed_int(arg_ty) {
                 Some(fx.bcx.ins().srem(a, b))
             } else {
@@ -2635,16 +2675,16 @@ fn codegen_intrinsic_call(
         // --- pointer masking ---
         "ptr_mask" => {
             assert_eq!(args.len(), 2);
-            let ptr = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
-            let mask = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let mask = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().band(ptr, mask))
         }
 
         // --- transmute ---
         "transmute" => {
             assert_eq!(args.len(), 1);
-            let src = codegen_operand(fx, body, &args[0].kind);
-            let dest = codegen_place(fx, body, destination);
+            let src = codegen_operand(fx, &args[0].kind);
+            let dest = codegen_place(fx, destination);
             // Force src to stack, then read back as dest type
             let ptr = src.force_stack(fx);
             let dest_val = CValue::by_ref(ptr, dest.layout.clone());
@@ -2669,7 +2709,7 @@ fn codegen_intrinsic_call(
     };
 
     // Write result to destination
-    let dest = codegen_place(fx, body, destination);
+    let dest = codegen_place(fx, destination);
     if let Some(val) = result {
         if !dest.layout.is_zst() {
             dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
@@ -2859,23 +2899,21 @@ pub fn compile_fn(
         let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
 
         // Create Cranelift blocks for MIR basic blocks
-        let mut block_map = ArenaMap::new();
-        for (bb_id, _bb) in body.basic_blocks.iter() {
+        let mut block_map = Vec::with_capacity(body.basic_blocks.len());
+        for (_bb_id, _bb) in body.basic_blocks.iter() {
             let block = bcx.create_block();
-            block_map.insert(bb_id, block);
+            block_map.push(block);
         }
 
         // Set up entry block
-        let entry_block = block_map[body.start_block];
+        let entry_block = block_map[body.start_block.into_raw().into_u32() as usize];
         bcx.switch_to_block(entry_block);
         bcx.append_block_params_for_function_params(entry_block);
 
-        // Build a temporary FunctionCx for local setup (needed by CPlace constructors)
-        let mut local_map = ArenaMap::new();
-
-        // First pass: create CPlace for each local using direct bcx access
+        // Build local_map: create CPlace for each local using direct bcx access
         // (We can't use FunctionCx yet because we're still building it)
-        for (local_id, local) in body.locals.iter() {
+        let mut local_map = Vec::with_capacity(body.locals.len());
+        for (_local_id, local) in body.locals.iter() {
             let local_layout = db
                 .layout_of_ty(local.ty.clone(), env.clone())
                 .map_err(|e| format!("local layout error: {:?}", e))?;
@@ -2918,7 +2956,7 @@ pub fn compile_fn(
                     CPlace::for_ptr(pointer::Pointer::stack_slot(slot), local_layout)
                 }
             };
-            local_map.insert(local_id, place);
+            local_map.push(place);
         }
 
         // Detect sret (indirect return): Memory-repr return type
@@ -2940,14 +2978,14 @@ pub fn compile_fn(
         if is_sret {
             let sret_ptr = block_params[param_idx];
             param_idx += 1;
-            local_map.insert(
-                hir_ty::mir::return_slot(),
-                CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout),
-            );
+            let ret_idx = hir_ty::mir::return_slot().into_raw().into_u32() as usize;
+            local_map[ret_idx] =
+                CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout);
         }
 
         for &param_local in &body.param_locals {
-            let place = &local_map[param_local];
+            let param_idx_local = param_local.into_raw().into_u32() as usize;
+            let place = &local_map[param_idx_local];
             if place.layout.is_zst() {
                 continue;
             }
@@ -2965,13 +3003,12 @@ pub fn compile_fn(
                     // Memory-repr param: block param is a pointer to the data
                     let ptr_val = block_params[param_idx];
                     param_idx += 1;
-                    local_map.insert(
-                        param_local,
+                    let layout = place.layout.clone();
+                    local_map[param_idx_local] =
                         CPlace::for_ptr(
                             pointer::Pointer::new(ptr_val),
-                            place.layout.clone(),
-                        ),
-                    );
+                            layout,
+                        );
                 }
             }
         }
@@ -2981,11 +3018,14 @@ pub fn compile_fn(
             module,
             isa,
             pointer_type,
-            db,
             dl,
-            env: env.clone(),
-            local_crate,
-            ext_crate_disambiguators,
+            mir: MirSource::Ra {
+                db,
+                env: env.clone(),
+                body,
+                local_crate,
+                ext_crate_disambiguators,
+            },
             block_map,
             local_map,
         };
@@ -2998,11 +3038,11 @@ pub fn compile_fn(
             }
 
             for stmt in &bb.statements {
-                codegen_statement(&mut fx, body, &stmt.kind);
+                codegen_statement(&mut fx, &stmt.kind);
             }
 
             if let Some(term) = &bb.terminator {
-                codegen_terminator(&mut fx, body, &term.kind);
+                codegen_terminator(&mut fx, &term.kind);
             }
         }
 
