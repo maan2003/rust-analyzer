@@ -1519,3 +1519,143 @@ fn foo() -> i32 {
     );
     assert_eq!(result, 20);
 }
+
+// ---------------------------------------------------------------------------
+// Essential intrinsics tests (M11c)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_size_of() {
+    let result: usize = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn size_of<T>() -> usize;
+}
+fn foo() -> usize {
+    unsafe { size_of::<i32>() }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 4);
+}
+
+#[test]
+fn jit_min_align_of() {
+    let result: usize = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn min_align_of<T>() -> usize;
+}
+fn foo() -> usize {
+    unsafe { min_align_of::<i32>() }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 4);
+}
+
+#[test]
+fn jit_bswap() {
+    let result: u32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn bswap<T>(x: T) -> T;
+}
+fn foo() -> u32 {
+    unsafe { bswap(0x12345678u32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 0x78563412);
+}
+
+#[test]
+fn jit_wrapping_add() {
+    let result: i32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn wrapping_add<T>(a: T, b: T) -> T;
+}
+fn foo() -> i32 {
+    unsafe { wrapping_add(100i32, 200i32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 300);
+}
+
+#[test]
+fn jit_transmute() {
+    let result: u32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn transmute<T, U>(x: T) -> U;
+}
+fn foo() -> u32 {
+    unsafe { transmute::<f32, u32>(1.0f32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 0x3f800000); // IEEE 754 representation of 1.0f32
+}
+
+#[test]
+fn jit_ctlz() {
+    let result: u32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn ctlz<T>(x: T) -> u32;
+}
+fn foo() -> u32 {
+    unsafe { ctlz(0x00FF0000u32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 8);
+}
+
+#[test]
+fn jit_rotate_left() {
+    let result: u32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn rotate_left<T>(x: T, y: u32) -> T;
+}
+fn foo() -> u32 {
+    unsafe { rotate_left(0x12345678u32, 8u32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 0x34567812);
+}
+
+#[test]
+fn jit_exact_div() {
+    let result: i32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn exact_div<T>(x: T, y: T) -> T;
+}
+fn foo() -> i32 {
+    unsafe { exact_div(42i32, 6i32) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 7);
+}

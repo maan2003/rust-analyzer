@@ -311,17 +311,24 @@ fn foo() -> i32 {
 
 Needs: `ProjectionElem::Index`, memory-repr array aggregates.
 
-### M11c: Essential intrinsics
+### M11c: Essential intrinsics ✅
 
-```rust
-fn foo() -> i32 {
-    core::mem::size_of::<i32>() as i32
-}
-```
+Implemented 30+ intrinsics in `codegen_intrinsic_call`:
+- Size/alignment: `size_of`, `min_align_of`/`pref_align_of`, `size_of_val`,
+  `min_align_of_val`, `needs_drop`
+- Memory: `copy_nonoverlapping` (memcpy), `copy` (memmove), `write_bytes`
+  (memset), `volatile_load`, `volatile_store`
+- Hints: `assume`, `likely`/`unlikely`, `black_box`, `assert_inhabited`/
+  `assert_zero_valid`/`assert_mem_uninitialized_valid` (no-ops)
+- Bit manipulation: `ctlz`/`cttz`/`ctpop`, `bswap`, `bitreverse`,
+  `rotate_left`/`rotate_right`
+- Arithmetic: `wrapping_add`/`sub`/`mul`, `unchecked_add`/`sub`/`mul`/
+  `shl`/`shr`/`div`/`rem`, `exact_div`
+- Other: `transmute` (force-to-stack + reinterpret), `abort` (trap),
+  `ptr_mask`, atomic fences
 
-Needs: `size_of`, `min_align_of`, `copy_nonoverlapping`, `write_bytes`,
-`transmute` (intrinsic form), `assume`, `likely`/`unlikely`. Used
-pervasively by alloc/Vec internals.
+8 JIT tests verify `size_of`, `min_align_of`, `bswap`, `wrapping_add`,
+`transmute`, `ctlz`, `rotate_left`, `exact_div`. 67 total tests pass.
 
 ### M11d: Non-scalar constants
 

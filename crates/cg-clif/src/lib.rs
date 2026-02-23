@@ -26,6 +26,7 @@ use either::Either;
 use hir_ty::PointerCast;
 use hir_ty::method_resolution::TraitImpls;
 use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind};
+use rustc_type_ir::inherent::GenericArgs as _;
 use hir_ty::traits::StoredParamEnvAndCrate;
 use la_arena::ArenaMap;
 use rac_abi::VariantIdx;
@@ -1622,7 +1623,7 @@ fn codegen_direct_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
-    if codegen_intrinsic_call(fx, body, callee_func_id, args, destination, target) {
+    if codegen_intrinsic_call(fx, body, callee_func_id, generic_args, args, destination, target) {
         return;
     }
 
@@ -1935,6 +1936,7 @@ fn codegen_intrinsic_call(
     fx: &mut FunctionCx<'_, impl Module>,
     body: &MirBody,
     callee_func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -1945,6 +1947,16 @@ fn codegen_intrinsic_call(
 
     let sig = fx.db.function_signature(callee_func_id);
     let name = sig.name.as_str();
+
+    // Pre-compute layout of the first generic type argument (e.g. size_of::<T>)
+    // Done eagerly to avoid borrow conflicts with fx inside match arms.
+    let generic_ty_layout = if generic_args.len() > 0 {
+        let ty = generic_args.type_at(0);
+        fx.db.layout_of_ty(ty.store(), fx.env.clone()).ok()
+    } else {
+        None
+    };
+
     let result = match name {
         "offset" | "arith_offset" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
@@ -2009,6 +2021,300 @@ fn codegen_intrinsic_call(
                 Some(fx.bcx.ins().sdiv_imm(diff_bytes, pointee_size as i64))
             }
         }
+
+        // --- size / alignment queries ---
+        "size_of" => {
+            let layout = generic_ty_layout.clone().expect("size_of: layout error");
+            Some(fx.bcx.ins().iconst(fx.pointer_type, layout.size.bytes() as i64))
+        }
+        "min_align_of" | "pref_align_of" => {
+            let layout = generic_ty_layout.clone().expect("align_of: layout error");
+            Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
+        }
+        "size_of_val" => {
+            // For sized types, same as size_of
+            let layout = generic_ty_layout.clone().expect("size_of_val: layout error");
+            Some(fx.bcx.ins().iconst(fx.pointer_type, layout.size.bytes() as i64))
+        }
+        "min_align_of_val" => {
+            let layout = generic_ty_layout.clone().expect("min_align_of_val: layout error");
+            Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
+        }
+        "needs_drop" => {
+            // TODO: actually check if the type needs drop; for now always return false
+            Some(fx.bcx.ins().iconst(types::I8, 0))
+        }
+        "type_id" | "type_name" => {
+            // These are complex; fall through to let them be unresolved
+            // (they need const eval or string allocation)
+            return false;
+        }
+
+        // --- memory operations ---
+        "copy_nonoverlapping" => {
+            assert_eq!(args.len(), 3, "copy_nonoverlapping expects 3 args");
+            let src = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let dst = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+
+            let layout = generic_ty_layout.clone().expect("copy_nonoverlapping: layout error");
+            let elem_size = layout.size.bytes();
+            let byte_amount = if elem_size != 1 {
+                fx.bcx.ins().imul_imm(count, elem_size as i64)
+            } else {
+                count
+            };
+            let tc = fx.module.target_config();
+            fx.bcx.call_memcpy(tc, dst, src, byte_amount);
+            None
+        }
+        "copy" => {
+            assert_eq!(args.len(), 3, "copy expects 3 args");
+            let src = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let dst = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+
+            let layout = generic_ty_layout.clone().expect("copy: layout error");
+            let elem_size = layout.size.bytes();
+            let byte_amount = if elem_size != 1 {
+                fx.bcx.ins().imul_imm(count, elem_size as i64)
+            } else {
+                count
+            };
+            let tc = fx.module.target_config();
+            fx.bcx.call_memmove(tc, dst, src, byte_amount);
+            None
+        }
+        "write_bytes" => {
+            assert_eq!(args.len(), 3, "write_bytes expects 3 args");
+            let dst = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let count = codegen_operand(fx, body, &args[2].kind).load_scalar(fx);
+
+            let layout = generic_ty_layout.clone().expect("write_bytes: layout error");
+            let elem_size = layout.size.bytes();
+            let byte_amount = if elem_size != 1 {
+                fx.bcx.ins().imul_imm(count, elem_size as i64)
+            } else {
+                count
+            };
+            let tc = fx.module.target_config();
+            fx.bcx.call_memset(tc, dst, val, byte_amount);
+            None
+        }
+        "volatile_load" | "unaligned_volatile_load" => {
+            // Cranelift treats loads as volatile by default
+            assert_eq!(args.len(), 1);
+            let ptr = codegen_operand(fx, body, &args[0].kind);
+            let inner_layout = generic_ty_layout.clone().expect("volatile_load: layout error");
+            let val = CValue::by_ref(pointer::Pointer::new(ptr.load_scalar(fx)), inner_layout);
+            let dest = codegen_place(fx, body, destination);
+            dest.write_cvalue(fx, val);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+        "volatile_store" | "unaligned_volatile_store" | "nontemporal_store" => {
+            // Cranelift treats stores as volatile by default
+            assert_eq!(args.len(), 2);
+            let ptr = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, body, &args[1].kind);
+            let dest = CPlace::for_ptr(pointer::Pointer::new(ptr), val.layout.clone());
+            dest.write_cvalue(fx, val);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+
+        // --- no-ops and hints ---
+        "assume" | "assert_inhabited" | "assert_zero_valid" | "assert_mem_uninitialized_valid" => {
+            None // no-op
+        }
+        "likely" | "unlikely" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            Some(val) // pass through
+        }
+        "black_box" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind);
+            let dest = codegen_place(fx, body, destination);
+            dest.write_cvalue(fx, val);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+
+        // --- bit manipulation ---
+        "ctlz" | "ctlz_nonzero" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let res = fx.bcx.ins().clz(val);
+            // Result type is u32
+            Some(codegen_intcast(fx, res, types::I32, false))
+        }
+        "cttz" | "cttz_nonzero" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let res = fx.bcx.ins().ctz(val);
+            Some(codegen_intcast(fx, res, types::I32, false))
+        }
+        "ctpop" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let res = fx.bcx.ins().popcnt(val);
+            Some(codegen_intcast(fx, res, types::I32, false))
+        }
+        "bswap" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            if fx.bcx.func.dfg.value_type(val) == types::I8 {
+                Some(val)
+            } else {
+                Some(fx.bcx.ins().bswap(val))
+            }
+        }
+        "bitreverse" => {
+            assert_eq!(args.len(), 1);
+            let val = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            Some(fx.bcx.ins().bitrev(val))
+        }
+
+        // --- rotate ---
+        "rotate_left" => {
+            assert_eq!(args.len(), 2);
+            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().rotl(x, y))
+        }
+        "rotate_right" => {
+            assert_eq!(args.len(), 2);
+            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().rotr(x, y))
+        }
+
+        // --- exact_div ---
+        "exact_div" => {
+            assert_eq!(args.len(), 2);
+            let x = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let y = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            if ty_is_signed_int(arg_ty) {
+                Some(fx.bcx.ins().sdiv(x, y))
+            } else {
+                Some(fx.bcx.ins().udiv(x, y))
+            }
+        }
+
+        // --- wrapping arithmetic ---
+        "wrapping_add" | "unchecked_add" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().iadd(a, b))
+        }
+        "wrapping_sub" | "unchecked_sub" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().isub(a, b))
+        }
+        "wrapping_mul" | "unchecked_mul" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().imul(a, b))
+        }
+        "unchecked_shl" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().ishl(a, b))
+        }
+        "unchecked_shr" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            if ty_is_signed_int(arg_ty) {
+                Some(fx.bcx.ins().sshr(a, b))
+            } else {
+                Some(fx.bcx.ins().ushr(a, b))
+            }
+        }
+        "unchecked_div" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            if ty_is_signed_int(arg_ty) {
+                Some(fx.bcx.ins().sdiv(a, b))
+            } else {
+                Some(fx.bcx.ins().udiv(a, b))
+            }
+        }
+        "unchecked_rem" => {
+            assert_eq!(args.len(), 2);
+            let a = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let b = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db, body, &args[0].kind);
+            if ty_is_signed_int(arg_ty) {
+                Some(fx.bcx.ins().srem(a, b))
+            } else {
+                Some(fx.bcx.ins().urem(a, b))
+            }
+        }
+
+        // --- abort ---
+        "abort" => {
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+
+        // --- pointer masking ---
+        "ptr_mask" => {
+            assert_eq!(args.len(), 2);
+            let ptr = codegen_operand(fx, body, &args[0].kind).load_scalar(fx);
+            let mask = codegen_operand(fx, body, &args[1].kind).load_scalar(fx);
+            Some(fx.bcx.ins().band(ptr, mask))
+        }
+
+        // --- transmute ---
+        "transmute" => {
+            assert_eq!(args.len(), 1);
+            let src = codegen_operand(fx, body, &args[0].kind);
+            let dest = codegen_place(fx, body, destination);
+            // Force src to stack, then read back as dest type
+            let ptr = src.force_stack(fx);
+            let dest_val = CValue::by_ref(ptr, dest.layout.clone());
+            dest.write_cvalue(fx, dest_val);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+
+        // --- atomic fence (no-op for single-threaded JIT) ---
+        "atomic_fence_seqcst" | "atomic_fence_acquire" | "atomic_fence_release"
+        | "atomic_fence_acqrel" | "atomic_singlethreadfence_seqcst"
+        | "atomic_singlethreadfence_acquire" | "atomic_singlethreadfence_release"
+        | "atomic_singlethreadfence_acqrel" => {
+            fx.bcx.ins().fence();
+            None
+        }
+
         _ => return false,
     };
 

@@ -27,6 +27,13 @@ What works:
   Tested with call chains and calls combined with branches.
   Includes direct lowering of pointer intrinsics used by raw-pointer methods:
   `offset`, `arith_offset`, `ptr_offset_from`, `ptr_offset_from_unsigned`.
+  Essential intrinsics: `size_of`, `min_align_of`/`pref_align_of`,
+  `copy_nonoverlapping`/`copy`/`write_bytes` (memcpy/memmove/memset),
+  `assume`/`likely`/`unlikely` (no-ops/passthrough), `needs_drop`,
+  `black_box`, `transmute`, `ctlz`/`cttz`/`ctpop`, `bswap`/`bitreverse`,
+  `rotate_left`/`rotate_right`, `exact_div`, `wrapping_add`/`sub`/`mul`,
+  `unchecked_add`/`sub`/`mul`/`shl`/`shr`/`div`/`rem`, `abort`, `ptr_mask`,
+  `volatile_load`/`volatile_store`, atomic fences.
   Extern `"C"` function calls supported: detects `ExternBlockId` container,
   builds signature from type info (`callable_item_signature`) instead of MIR,
   uses raw (unmangled) symbol name. Diverging calls (`-> !`) terminate the
@@ -109,6 +116,15 @@ Recently aligned with upstream:
   carry metadata, `place_ref()` emits thin or fat pointer based on metadata
   presence. Matches upstream's `place_deref` (`value_and_place.rs:815-823`)
   and `place_ref` (`value_and_place.rs:825-836`).
+- **Intrinsics match upstream patterns** — `volatile_load` uses
+  `CValue::by_ref(Pointer::new(ptr), layout)` matching upstream
+  (`intrinsics/mod.rs:804`). `volatile_store` uses
+  `CPlace::for_ptr(Pointer::new(ptr), layout)` + `write_cvalue` matching
+  upstream (`intrinsics/mod.rs:815-816`). Bit manipulation (`ctlz`/`cttz`/
+  `ctpop`/`bswap`/`bitreverse`), rotates, `copy`/`copy_nonoverlapping`/
+  `write_bytes` (memcpy/memmove/memset with `elem_size != 1` guard),
+  `ptr_mask`, `abort` (trap user(2)), and `black_box` (passthrough) all
+  follow upstream's exact lowering.
 
 Still diverges from upstream:
 - **Pointer coercion casts partially handled** — `PointerCoercion::Unsize`
@@ -134,6 +150,26 @@ Still diverges from upstream:
   `CallableDefId::StructId`/`EnumVariantId` as normal function calls
   through its full ABI machinery. We handle them as inline aggregate
   construction since we don't have the full call ABI for constructors.
+- **Intrinsic divergences from upstream** —
+  - `size_of`/`min_align_of`/`pref_align_of`: upstream uses fallback MIR
+    bodies (not explicitly handled). We emit `iconst` directly — correct
+    and simpler, since we lack fallback MIR.
+  - `size_of_val`/`min_align_of_val`: upstream handles unsized types via
+    `size_and_align_of(fx, layout, meta)`. We only handle sized types
+    (return static layout size/align). Needs extending for `dyn Trait`
+    and `[T]`.
+  - `needs_drop`: upstream uses fallback MIR. We hardcode `false`.
+    Needs actual type-level check.
+  - `assert_inhabited`/`assert_zero_valid`/`assert_mem_uninitialized_valid`:
+    upstream checks validity and can emit panics. We no-op.
+  - `exact_div`: upstream uses `codegen_int_binop(fx, BinOp::Div, x, y)`
+    on CValues (signedness inferred from layout). We manually check
+    `ty_is_signed_int` and emit `sdiv`/`udiv`. Same result.
+  - `wrapping_add`/`sub`/`mul`: upstream uses fallback MIR. We emit
+    `iadd`/`isub`/`imul` directly. Same semantics.
+  - `write_bytes`: upstream gets elem size from pointee deref
+    (`dst.layout().ty.builtin_deref`). We use generic arg layout.
+    Both resolve to the same `T`.
 - **Explicit discriminant values not supported** — upstream uses
   `layout.ty.discriminant_for_variant(fx.tcx, variant_index)` to get
   the actual discriminant value (e.g. `A = 100` → 100). We use the
@@ -171,7 +207,7 @@ What's missing:
 - Union and RawPtr aggregates
 - Indirect calls (fn pointers, closures)
 - Remaining casts (`DynStar`, wide-pointer coercions)
-- Intrinsics beyond pointer offset/distance
+- Non-scalar constants (arrays, ScalarPair, memory-repr)
 - Drop glue
 - Cross-crate generic function codegen (MIR bodies now available via .mirdata)
 
