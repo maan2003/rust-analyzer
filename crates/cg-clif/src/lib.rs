@@ -155,6 +155,10 @@ fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
             }
             ProjectionElem::Downcast(_) => ty, // Downcast doesn't change the Rust type
             ProjectionElem::ClosureField(idx) => closure_field_type(db, &ty, *idx),
+            ProjectionElem::Index(_) => match ty.as_ref().kind() {
+                TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
+                _ => panic!("Index on non-array/slice type"),
+            },
             _ => todo!("place_ty for {:?}", proj),
         };
     }
@@ -567,7 +571,30 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, place: &P
                 cplace = cplace.place_field(fx, *idx, field_layout);
                 cur_ty = field_ty;
             }
-            ProjectionElem::Index(_) => todo!("Index projection"),
+            ProjectionElem::Index(index_local) => {
+                let index_place = fx.local_place(*index_local).clone();
+                let index_val = index_place.to_cvalue(fx).load_scalar(fx);
+                let elem_ty = match cur_ty.as_ref().kind() {
+                    TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
+                    _ => panic!("Index on non-array/slice type"),
+                };
+                let elem_layout = fx
+                    .db
+                    .layout_of_ty(elem_ty.clone(), fx.env.clone())
+                    .expect("elem layout");
+                let offset = fx.bcx.ins().imul_imm(index_val, elem_layout.size.bytes() as i64);
+                // Arrays in registers → spill to memory
+                if cplace.is_register() {
+                    let cval = cplace.to_cvalue(fx);
+                    let ptr = cval.force_stack(fx);
+                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                }
+                cplace = CPlace::for_ptr(
+                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, offset),
+                    elem_layout,
+                );
+                cur_ty = elem_ty;
+            }
             ProjectionElem::ConstantIndex { .. } => todo!("ConstantIndex projection"),
             ProjectionElem::Subslice { .. } => todo!("Subslice projection"),
             ProjectionElem::OpaqueCast(_) => todo!("OpaqueCast projection"),

@@ -300,6 +300,85 @@ by pointer, matching upstream's `PassMode::Indirect` pattern:
 3 JIT tests: `jit_pass_and_return_big_struct`, `jit_pass_big_struct_and_modify`,
 `jit_big_struct_through_call_chain`. 55 total tests pass.
 
+### M11b: Array indexing
+
+```rust
+fn foo() -> i32 {
+    let arr = [10, 20, 30];
+    arr[1]
+}
+```
+
+Needs: `ProjectionElem::Index`, memory-repr array aggregates.
+
+### M11c: Essential intrinsics
+
+```rust
+fn foo() -> i32 {
+    core::mem::size_of::<i32>() as i32
+}
+```
+
+Needs: `size_of`, `min_align_of`, `copy_nonoverlapping`, `write_bytes`,
+`transmute` (intrinsic form), `assume`, `likely`/`unlikely`. Used
+pervasively by alloc/Vec internals.
+
+### M11d: Non-scalar constants
+
+```rust
+fn foo() -> i32 {
+    let arr = [10i32, 20, 30];
+    let r: &i32 = &arr[1];
+    *r
+}
+```
+
+Needs: constant arrays, references to static/const data (allocations).
+Currently only scalar constants are supported.
+
+### M11e: Fn pointers and indirect calls
+
+```rust
+fn add(a: i32, b: i32) -> i32 { a + b }
+fn foo() -> i32 {
+    let f: fn(i32, i32) -> i32 = add;
+    f(3, 4)
+}
+```
+
+Needs: fn pointer coercion (`ReifyFnPointer`), `call_indirect` for
+`TyKind::FnPtr`. Required for drop glue dispatch and closures.
+
+### M11f: Drop glue
+
+```rust
+struct Guard { val: i32 }
+impl Drop for Guard {
+    fn drop(&mut self) { /* side effect */ }
+}
+fn foo() -> i32 {
+    let g = Guard { val: 42 };
+    g.val
+}  // drop called on scope exit
+```
+
+Needs: `TerminatorKind::Drop` to call drop functions instead of being a
+no-op jump. Requires generating drop glue shims or resolving `Drop::drop`
+impl methods.
+
+### M11g: Closures
+
+```rust
+fn apply(f: impl Fn(i32) -> i32, x: i32) -> i32 { f(x) }
+fn foo() -> i32 {
+    let offset = 10;
+    apply(|x| x + offset, 32)
+}
+```
+
+Needs: closure field type resolution, closure call dispatch
+(`Fn`/`FnMut`/`FnOnce`), closure ABI.
+
 ### M11: Drop and heap allocation
 
 ```rust

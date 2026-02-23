@@ -162,6 +162,7 @@ mod tests {
                 CrateInfo { name: "core".to_string(), stable_crate_id: 0x5678 },
             ],
             bodies: vec![],
+            layouts: vec![],
         };
         let data = postcard::to_allocvec(&mir_data).expect("serialize");
         let decoded: MirData = postcard::from_bytes(&data).expect("deserialize");

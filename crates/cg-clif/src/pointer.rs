@@ -81,6 +81,29 @@ impl Pointer {
         }
     }
 
+    pub(crate) fn offset_value(self, bcx: &mut FunctionBuilder<'_>, pointer_type: Type, extra_offset: Value) -> Self {
+        match self.base {
+            PointerBase::Addr(addr) => Pointer {
+                base: PointerBase::Addr(bcx.ins().iadd(addr, extra_offset)),
+                offset: self.offset,
+            },
+            PointerBase::Stack(stack_slot) => {
+                let base_addr = bcx.ins().stack_addr(pointer_type, stack_slot, self.offset);
+                Pointer {
+                    base: PointerBase::Addr(bcx.ins().iadd(base_addr, extra_offset)),
+                    offset: Offset32::new(0),
+                }
+            }
+            PointerBase::Dangling(align) => {
+                let addr = bcx.ins().iconst(pointer_type, i64::try_from(align.bytes()).unwrap());
+                Pointer {
+                    base: PointerBase::Addr(bcx.ins().iadd(addr, extra_offset)),
+                    offset: self.offset,
+                }
+            }
+        }
+    }
+
     pub(crate) fn store(self, bcx: &mut FunctionBuilder<'_>, value: Value, flags: MemFlags) {
         match self.base {
             PointerBase::Addr(base_addr) => {

@@ -18,6 +18,7 @@ pub type DefPathHash = (u64, u64);
 pub struct MirData {
     pub crates: Vec<CrateInfo>,
     pub bodies: Vec<FnBody>,
+    pub layouts: Vec<TypeLayoutEntry>,
 }
 
 /// Crate name + StableCrateId.
@@ -54,6 +55,7 @@ pub struct Body {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Local {
     pub ty: Ty,
+    pub layout: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -312,4 +314,83 @@ pub enum GenericArg {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExistentialPredicate {
     pub trait_ref: Option<(DefPathHash, Vec<GenericArg>)>,
+}
+
+// ---------------------------------------------------------------------------
+// Layout types
+// ---------------------------------------------------------------------------
+
+/// A unique type with its layout, keyed by index into `MirData.layouts`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TypeLayoutEntry {
+    pub ty: Ty,
+    pub layout: LayoutInfo,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LayoutInfo {
+    pub size: u64,
+    pub align: u64,
+    pub backend_repr: ExportedBackendRepr,
+    pub fields: ExportedFieldsShape,
+    pub variants: ExportedVariants,
+    pub largest_niche: Option<ExportedNiche>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedBackendRepr {
+    Scalar(ExportedScalar),
+    ScalarPair(ExportedScalar, ExportedScalar),
+    Memory { sized: bool },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExportedScalar {
+    pub primitive: ExportedPrimitive,
+    pub valid_range_start: u128,
+    pub valid_range_end: u128,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedPrimitive {
+    Int { size_bytes: u8, signed: bool },
+    Float { size_bytes: u8 },
+    Pointer,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedFieldsShape {
+    Primitive,
+    Union(usize),
+    Array { stride: u64, count: u64 },
+    Arbitrary { offsets: Vec<u64> },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedVariants {
+    Empty,
+    Single { index: u32 },
+    Multiple {
+        tag: ExportedScalar,
+        tag_encoding: ExportedTagEncoding,
+        tag_field: u32,
+        variants: Vec<LayoutInfo>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedTagEncoding {
+    Direct,
+    Niche {
+        untagged_variant: u32,
+        niche_variants_start: u32,
+        niche_variants_end: u32,
+        niche_start: u128,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExportedNiche {
+    pub offset: u64,
+    pub scalar: ExportedScalar,
 }

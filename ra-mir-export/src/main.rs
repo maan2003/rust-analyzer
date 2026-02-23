@@ -10,6 +10,7 @@
 
 #![feature(rustc_private, box_patterns)]
 
+extern crate rustc_abi;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -20,7 +21,7 @@ extern crate rustc_span;
 mod translate;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use rustc_driver::Compilation;
@@ -28,7 +29,9 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
 
-use ra_mir_types::{CrateInfo, FnBody, MirData};
+use rustc_middle::ty;
+
+use ra_mir_types::{CrateInfo, FnBody, MirData, TypeLayoutEntry};
 
 struct ExportCallbacks {
     result: RefCell<Option<MirData>>,
@@ -41,8 +44,8 @@ impl rustc_driver::Callbacks for ExportCallbacks {
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
         let crates = extract_crate_ids(tcx);
-        let bodies = extract_mir_bodies(tcx);
-        *self.result.borrow_mut() = Some(MirData { crates, bodies });
+        let (bodies, layouts) = extract_mir_bodies(tcx);
+        *self.result.borrow_mut() = Some(MirData { crates, bodies, layouts });
         Compilation::Stop
     }
 }
@@ -75,14 +78,15 @@ fn extract_crate_ids(tcx: TyCtxt<'_>) -> Vec<CrateInfo> {
 // MIR body extraction
 // ---------------------------------------------------------------------------
 
-fn extract_mir_bodies(tcx: TyCtxt<'_>) -> Vec<FnBody> {
+fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
     let mut bodies = Vec::new();
     let mut stats = ExportStats::default();
     let mut visited = HashSet::new();
+    let mut layout_table = LayoutTable::new();
 
     for &cnum in tcx.crates(()) {
         let crate_def_id = cnum.as_def_id();
-        visit_module(tcx, crate_def_id, &mut bodies, &mut stats, &mut visited, 0);
+        visit_module(tcx, crate_def_id, &mut bodies, &mut stats, &mut visited, &mut layout_table, 0);
     }
 
     // Print stats
@@ -91,7 +95,7 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> Vec<FnBody> {
         stats.total_fns, stats.mir_available, stats.translated, stats.skipped
     );
 
-    bodies
+    (bodies, layout_table.entries)
 }
 
 #[derive(Default)]
@@ -102,15 +106,48 @@ struct ExportStats {
     skipped: usize,
 }
 
+struct LayoutTable<'tcx> {
+    entries: Vec<TypeLayoutEntry>,
+    dedup: HashMap<ty::Ty<'tcx>, u32>,
+    typing_env: ty::TypingEnv<'tcx>,
+}
+
+impl<'tcx> LayoutTable<'tcx> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            dedup: HashMap::new(),
+            typing_env: ty::TypingEnv::fully_monomorphized(),
+        }
+    }
+
+    fn get_or_insert(&mut self, tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<u32> {
+        if let Some(&idx) = self.dedup.get(&ty) {
+            return Some(idx);
+        }
+        let ty_and_layout = tcx.layout_of(self.typing_env.as_query_input(ty)).ok()?;
+        let exported_ty = translate::translate_ty(tcx, ty);
+        let layout_info = translate::translate_layout_data(&ty_and_layout.layout);
+        let idx = self.entries.len() as u32;
+        self.entries.push(TypeLayoutEntry {
+            ty: exported_ty,
+            layout: layout_info,
+        });
+        self.dedup.insert(ty, idx);
+        Some(idx)
+    }
+}
+
 /// Max module nesting depth to prevent stack overflow from re-exports.
 const MAX_MODULE_DEPTH: usize = 20;
 
-fn visit_module(
-    tcx: TyCtxt<'_>,
+fn visit_module<'tcx>(
+    tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
+    layout_table: &mut LayoutTable<'tcx>,
     depth: usize,
 ) {
     if depth > MAX_MODULE_DEPTH {
@@ -129,43 +166,45 @@ fn visit_module(
         }
         match tcx.def_kind(child_def_id) {
             DefKind::Mod => {
-                visit_module(tcx, child_def_id, out, stats, visited, depth + 1);
+                visit_module(tcx, child_def_id, out, stats, visited, layout_table, depth + 1);
             }
             DefKind::Fn | DefKind::AssocFn => {
-                try_export_fn(tcx, child_def_id, out, stats, visited);
+                try_export_fn(tcx, child_def_id, out, stats, visited, layout_table);
             }
             DefKind::Impl { .. } => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited);
+                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table);
             }
             DefKind::Trait => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited);
+                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table);
             }
             _ => {}
         }
     }
 }
 
-fn visit_impl_or_trait(
-    tcx: TyCtxt<'_>,
+fn visit_impl_or_trait<'tcx>(
+    tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
+    layout_table: &mut LayoutTable<'tcx>,
 ) {
     if !visited.insert(def_id) {
         return;
     }
     for &item in tcx.associated_item_def_ids(def_id) {
-        try_export_fn(tcx, item, out, stats, visited);
+        try_export_fn(tcx, item, out, stats, visited, layout_table);
     }
 }
 
-fn try_export_fn(
-    tcx: TyCtxt<'_>,
+fn try_export_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
+    layout_table: &mut LayoutTable<'tcx>,
 ) {
     if !visited.insert(def_id) {
         return;
@@ -191,7 +230,12 @@ fn try_export_fn(
             body: translated,
         }
     })) {
-        Ok(fn_body) => {
+        Ok(mut fn_body) => {
+            // Compute layouts for each local
+            let body = tcx.optimized_mir(def_id);
+            for (i, decl) in body.local_decls.iter().enumerate() {
+                fn_body.body.locals[i].layout = layout_table.get_or_insert(tcx, decl.ty);
+            }
             stats.translated += 1;
             out.push(fn_body);
         }
@@ -258,9 +302,10 @@ fn main() {
     });
 
     eprintln!(
-        "Wrote {} crate infos + {} function bodies to {}",
+        "Wrote {} crate infos + {} function bodies + {} type layouts to {}",
         mir_data.crates.len(),
         mir_data.bodies.len(),
+        mir_data.layouts.len(),
         output_path.display()
     );
     for info in &mir_data.crates {
@@ -271,6 +316,29 @@ fn main() {
     let generic_count = mir_data.bodies.iter().filter(|b| b.num_generic_params > 0).count();
     let mono_count = mir_data.bodies.len() - generic_count;
     eprintln!("  {} generic functions, {} monomorphic (#[inline])", generic_count, mono_count);
+
+    // Print layout stats
+    let locals_with_layout = mir_data.bodies.iter()
+        .flat_map(|b| &b.body.locals)
+        .filter(|l| l.layout.is_some())
+        .count();
+    let locals_without_layout = mir_data.bodies.iter()
+        .flat_map(|b| &b.body.locals)
+        .filter(|l| l.layout.is_none())
+        .count();
+    eprintln!("  {} locals with layout, {} without", locals_with_layout, locals_without_layout);
+
+    use ra_mir_types::ExportedBackendRepr;
+    let scalar_count = mir_data.layouts.iter()
+        .filter(|l| matches!(l.layout.backend_repr, ExportedBackendRepr::Scalar(_)))
+        .count();
+    let pair_count = mir_data.layouts.iter()
+        .filter(|l| matches!(l.layout.backend_repr, ExportedBackendRepr::ScalarPair(_, _)))
+        .count();
+    let memory_count = mir_data.layouts.iter()
+        .filter(|l| matches!(l.layout.backend_repr, ExportedBackendRepr::Memory { .. }))
+        .count();
+    eprintln!("  Layouts: {} Scalar, {} ScalarPair, {} Memory", scalar_count, pair_count, memory_count);
 
     let data = postcard::to_allocvec(&mir_data).expect("postcard serialize");
     std::fs::write(&output_path, &data)

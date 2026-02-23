@@ -32,6 +32,7 @@ pub fn translate_body<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> mir_ty
         .iter()
         .map(|decl| mir_types::Local {
             ty: translate_ty(tcx, decl.ty),
+            layout: None,
         })
         .collect();
 
@@ -730,5 +731,146 @@ fn translate_generic_arg<'tcx>(
             }
         }
         ty::GenericArgKind::Lifetime(_) => mir_types::GenericArg::Lifetime,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layouts
+// ---------------------------------------------------------------------------
+
+pub fn translate_layout_data(
+    layout: &rustc_abi::LayoutData<rustc_abi::FieldIdx, rustc_abi::VariantIdx>,
+) -> mir_types::LayoutInfo {
+    mir_types::LayoutInfo {
+        size: layout.size.bytes(),
+        align: layout.align.abi.bytes(),
+        backend_repr: translate_backend_repr(&layout.backend_repr),
+        fields: translate_fields_shape(&layout.fields),
+        variants: translate_variants(&layout.variants),
+        largest_niche: layout.largest_niche.as_ref().map(translate_niche),
+    }
+}
+
+fn translate_backend_repr(repr: &rustc_abi::BackendRepr) -> mir_types::ExportedBackendRepr {
+    match repr {
+        rustc_abi::BackendRepr::Scalar(s) => {
+            mir_types::ExportedBackendRepr::Scalar(translate_scalar(s))
+        }
+        rustc_abi::BackendRepr::ScalarPair(a, b) => {
+            mir_types::ExportedBackendRepr::ScalarPair(translate_scalar(a), translate_scalar(b))
+        }
+        rustc_abi::BackendRepr::Memory { sized } => {
+            mir_types::ExportedBackendRepr::Memory { sized: *sized }
+        }
+        rustc_abi::BackendRepr::SimdVector { .. }
+        | rustc_abi::BackendRepr::ScalableVector { .. } => {
+            mir_types::ExportedBackendRepr::Memory { sized: true }
+        }
+    }
+}
+
+fn translate_scalar(s: &rustc_abi::Scalar) -> mir_types::ExportedScalar {
+    match s {
+        rustc_abi::Scalar::Initialized { value, valid_range } => mir_types::ExportedScalar {
+            primitive: translate_primitive(value),
+            valid_range_start: valid_range.start,
+            valid_range_end: valid_range.end,
+        },
+        rustc_abi::Scalar::Union { value } => mir_types::ExportedScalar {
+            primitive: translate_primitive(value),
+            valid_range_start: 0,
+            valid_range_end: u128::MAX,
+        },
+    }
+}
+
+fn translate_primitive(p: &rustc_abi::Primitive) -> mir_types::ExportedPrimitive {
+    match p {
+        rustc_abi::Primitive::Int(int, signed) => {
+            let size_bytes = match int {
+                rustc_abi::Integer::I8 => 1,
+                rustc_abi::Integer::I16 => 2,
+                rustc_abi::Integer::I32 => 4,
+                rustc_abi::Integer::I64 => 8,
+                rustc_abi::Integer::I128 => 16,
+            };
+            mir_types::ExportedPrimitive::Int { size_bytes, signed: *signed }
+        }
+        rustc_abi::Primitive::Float(float) => {
+            let size_bytes = match float {
+                rustc_abi::Float::F16 => 2,
+                rustc_abi::Float::F32 => 4,
+                rustc_abi::Float::F64 => 8,
+                rustc_abi::Float::F128 => 16,
+            };
+            mir_types::ExportedPrimitive::Float { size_bytes }
+        }
+        rustc_abi::Primitive::Pointer(_) => mir_types::ExportedPrimitive::Pointer,
+    }
+}
+
+fn translate_fields_shape(
+    fields: &rustc_abi::FieldsShape<rustc_abi::FieldIdx>,
+) -> mir_types::ExportedFieldsShape {
+    match fields {
+        rustc_abi::FieldsShape::Primitive => mir_types::ExportedFieldsShape::Primitive,
+        rustc_abi::FieldsShape::Union(count) => mir_types::ExportedFieldsShape::Union(count.get()),
+        rustc_abi::FieldsShape::Array { stride, count } => {
+            mir_types::ExportedFieldsShape::Array {
+                stride: stride.bytes(),
+                count: *count,
+            }
+        }
+        rustc_abi::FieldsShape::Arbitrary { offsets, .. } => {
+            mir_types::ExportedFieldsShape::Arbitrary {
+                offsets: offsets.iter().map(|o| o.bytes()).collect(),
+            }
+        }
+    }
+}
+
+fn translate_variants(
+    variants: &rustc_abi::Variants<rustc_abi::FieldIdx, rustc_abi::VariantIdx>,
+) -> mir_types::ExportedVariants {
+    match variants {
+        rustc_abi::Variants::Empty => mir_types::ExportedVariants::Empty,
+        rustc_abi::Variants::Single { index } => {
+            mir_types::ExportedVariants::Single { index: index.as_u32() }
+        }
+        rustc_abi::Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+            mir_types::ExportedVariants::Multiple {
+                tag: translate_scalar(tag),
+                tag_encoding: translate_tag_encoding(tag_encoding),
+                tag_field: tag_field.as_u32(),
+                variants: variants.iter().map(|v| translate_layout_data(v)).collect(),
+            }
+        }
+    }
+}
+
+fn translate_tag_encoding(
+    enc: &rustc_abi::TagEncoding<rustc_abi::VariantIdx>,
+) -> mir_types::ExportedTagEncoding {
+    match enc {
+        rustc_abi::TagEncoding::Direct => mir_types::ExportedTagEncoding::Direct,
+        rustc_abi::TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+            mir_types::ExportedTagEncoding::Niche {
+                untagged_variant: untagged_variant.as_u32(),
+                niche_variants_start: niche_variants.start().as_u32(),
+                niche_variants_end: niche_variants.end().as_u32(),
+                niche_start: *niche_start,
+            }
+        }
+    }
+}
+
+fn translate_niche(niche: &rustc_abi::Niche) -> mir_types::ExportedNiche {
+    mir_types::ExportedNiche {
+        offset: niche.offset.bytes(),
+        scalar: mir_types::ExportedScalar {
+            primitive: translate_primitive(&niche.value),
+            valid_range_start: niche.valid_range.start,
+            valid_range_end: niche.valid_range.end,
+        },
     }
 }
