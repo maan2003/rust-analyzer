@@ -141,14 +141,10 @@ fn codegen_md_place(
                 };
                 let elem_layout = fx.md_layout(&elem_ty);
                 let offset = fx.bcx.ins().imul_imm(index_val, elem_layout.size.bytes() as i64);
-                // Arrays in registers → spill to memory
-                if cplace.is_register() {
-                    let cval = cplace.to_cvalue(fx);
-                    let ptr = cval.force_stack(fx);
-                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
-                }
+                // Get base pointer (handles both sized and unsized places)
+                let base_ptr = cplace.to_ptr_maybe_spill(fx);
                 cplace = CPlace::for_ptr(
-                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, offset),
+                    base_ptr.offset_value(&mut fx.bcx, fx.pointer_type, offset),
                     elem_layout,
                 );
                 cur_ty = elem_ty;
@@ -171,15 +167,10 @@ fn codegen_md_place(
                     };
                     fx.bcx.ins().iadd_imm(len, -(*offset as i64))
                 };
-                // Spill to memory if needed
-                if cplace.is_register() {
-                    let cval = cplace.to_cvalue(fx);
-                    let ptr = cval.force_stack(fx);
-                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
-                }
+                let base_ptr = cplace.to_ptr_maybe_spill(fx);
                 let byte_offset = fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64);
                 cplace = CPlace::for_ptr(
-                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, byte_offset),
+                    base_ptr.offset_value(&mut fx.bcx, fx.pointer_type, byte_offset),
                     elem_layout,
                 );
                 cur_ty = elem_ty;
@@ -190,20 +181,14 @@ fn codegen_md_place(
                     _ => panic!("Subslice on non-array/slice type: {:?}", cur_ty),
                 };
                 let elem_layout = fx.md_layout(&elem_ty);
-                // Spill to memory if needed
-                if cplace.is_register() {
-                    let cval = cplace.to_cvalue(fx);
-                    let ptr = cval.force_stack(fx);
-                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
-                }
                 if !*from_end {
-                    // Array subslice: result is a smaller array [from..from+(to-from)]
-                    // `to` here is actually the end index
+                    // Array subslice: result is a smaller array [from..to]
                     let sub_len = *to - *from;
                     let sub_arr_ty = ra_mir_types::Ty::Array(Box::new(elem_ty.clone()), sub_len);
                     let sub_layout = fx.md_layout(&sub_arr_ty);
+                    let base_ptr = cplace.to_ptr_maybe_spill(fx);
                     cplace = CPlace::for_ptr(
-                        cplace.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, elem_layout.size.bytes() as i64 * (*from as i64)),
+                        base_ptr.offset_i64(&mut fx.bcx, fx.pointer_type, elem_layout.size.bytes() as i64 * (*from as i64)),
                         sub_layout,
                     );
                     cur_ty = sub_arr_ty;
@@ -275,10 +260,14 @@ fn codegen_md_operand(
             ConstKind::Slice(bytes, meta) => {
                 // Slice constant (e.g. string literal): create a data section for the bytes,
                 // return a ScalarPair (data_ptr, len).
+                use std::hash::{Hash, Hasher};
                 let data_id = {
                     let mut desc = cranelift_module::DataDescription::new();
                     desc.define(bytes.clone().into_boxed_slice());
-                    let name = format!("__const_slice_{}", bytes.len());
+                    // Use content hash for unique naming to avoid conflicts
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut hasher);
+                    let name = format!("__const_slice_{:x}", hasher.finish());
                     let data_id = fx.module
                         .declare_data(&name, Linkage::Local, false, false)
                         .expect("declare slice data");
@@ -290,8 +279,99 @@ fn codegen_md_operand(
                 let len_val = fx.bcx.ins().iconst(fx.pointer_type, *meta as i64);
                 CValue::by_val_pair(data_ptr, len_val, dest_layout.clone())
             }
-            _ => panic!("unsupported constant kind: {:?}", c.kind),
+            ConstKind::Unevaluated(hash, _args) => {
+                // Unevaluated const: try to handle as a ZST function reference
+                if dest_layout.is_zst() {
+                    return CValue::zst(dest_layout.clone());
+                }
+                // For non-ZST unevaluated consts, we'd need const evaluation
+                panic!("unsupported unevaluated constant (non-ZST): def_hash={:?}, ty={:?}", hash, c.ty);
+            }
+            ConstKind::Todo(desc) => {
+                panic!("unsupported constant (Todo): {}", desc);
+            }
         },
+    }
+}
+
+/// Extract the unsized metadata for an Unsize coercion.
+///
+/// Walks the source and dest pointee types to find the unsizing point:
+/// - `[T; N]` → `[T]`: returns array length N as an iconst
+/// - `dyn TraitA` → `dyn TraitB`: returns old info (vtable upcasting passthrough)
+fn md_unsized_info(
+    fx: &mut FunctionCx<'_, impl Module>,
+    src_pointee: &ra_mir_types::Ty,
+    _dst_pointee: &ra_mir_types::Ty,
+    old_info: Option<Value>,
+) -> Value {
+    match (src_pointee, _dst_pointee) {
+        (ra_mir_types::Ty::Array(_, len), ra_mir_types::Ty::Slice(_)) => {
+            fx.bcx.ins().iconst(fx.pointer_type, *len as i64)
+        }
+        (ra_mir_types::Ty::Dynamic(_), ra_mir_types::Ty::Dynamic(_)) => {
+            // Trait upcasting: pass through the existing vtable pointer
+            old_info.expect("dyn→dyn unsize requires old_info")
+        }
+        _ => todo!("md_unsized_info: {:?} → {:?}", src_pointee, _dst_pointee),
+    }
+}
+
+/// Get the pointee type from a reference/raw pointer type.
+fn pointee_ty(ty: &ra_mir_types::Ty) -> &ra_mir_types::Ty {
+    match ty {
+        ra_mir_types::Ty::Ref(_, inner) | ra_mir_types::Ty::RawPtr(_, inner) => inner,
+        _ => panic!("pointee_ty on non-pointer type: {:?}", ty),
+    }
+}
+
+/// Codegen for PointerCoercion::Unsize in mirdata.
+///
+/// Handles:
+/// - Thin → fat: `&[T; N]` → `&[T]` (emit ptr + array length)
+/// - Fat → fat: `&dyn A` → `&dyn B` (vtable passthrough)
+fn codegen_md_unsize(
+    fx: &mut FunctionCx<'_, impl Module>,
+    operand: &Operand,
+    from_cval: CValue,
+    dest_layout: &LayoutArc,
+) -> CValue {
+    let src_ty = operand_ty(fx, operand);
+
+    match from_cval.layout.backend_repr {
+        BackendRepr::Scalar(_) => {
+            // Thin → fat pointer
+            let src_pointee = pointee_ty(&src_ty);
+
+            // Walk the dest type from the Rvalue's target type
+            // The dest_layout tells us this is a ScalarPair (fat pointer)
+            let BackendRepr::ScalarPair(_, _) = dest_layout.backend_repr else {
+                // Thin → thin unsize (e.g. transparent wrapper), just pass through
+                return from_cval;
+            };
+
+            let ptr = from_cval.load_scalar(fx);
+            let info = md_unsized_info(fx, src_pointee, &infer_dst_pointee(src_pointee), None);
+            CValue::by_val_pair(ptr, info, dest_layout.clone())
+        }
+        BackendRepr::ScalarPair(_, _) => {
+            // Fat → fat (e.g. dyn A → dyn B upcasting, or &[T] passthrough)
+            let (ptr, old_info) = from_cval.load_scalar_pair(fx);
+            let src_pointee = pointee_ty(&src_ty);
+            let info = md_unsized_info(fx, src_pointee, &infer_dst_pointee(src_pointee), Some(old_info));
+            CValue::by_val_pair(ptr, info, dest_layout.clone())
+        }
+        _ => todo!("Unsize on memory-repr source in mirdata"),
+    }
+}
+
+/// Infer the destination pointee type for Unsize coercion from the source pointee.
+/// `[T; N]` → `[T]`, `dyn A` → `dyn A` (passthrough for upcasting).
+fn infer_dst_pointee(src_pointee: &ra_mir_types::Ty) -> ra_mir_types::Ty {
+    match src_pointee {
+        ra_mir_types::Ty::Array(elem, _) => ra_mir_types::Ty::Slice(elem.clone()),
+        ra_mir_types::Ty::Dynamic(preds) => ra_mir_types::Ty::Dynamic(preds.clone()),
+        _ => todo!("infer_dst_pointee: {:?}", src_pointee),
     }
 }
 
@@ -325,6 +405,13 @@ fn codegen_md_cast(
         return crate::codegen_transmute(fx, from_cval, dest_layout);
     }
 
+    // Handle Unsize coercion: thin ptr → fat ptr (array→slice, T→dyn Trait)
+    if let CastKind::PointerCoercion(PointerCoercion::Unsize) = kind {
+        let src_layout = md_operand_layout(fx, operand);
+        let from_cval = codegen_md_operand(fx, operand, &src_layout);
+        return codegen_md_unsize(fx, operand, from_cval, dest_layout);
+    }
+
     // All other casts
     let src_layout = md_operand_layout(fx, operand);
     let from_cval = codegen_md_operand(fx, operand, &src_layout);
@@ -338,8 +425,7 @@ fn codegen_md_cast(
                 return CValue::by_val_pair(a, b, dest_layout.clone());
             }
             BackendRepr::Scalar(_) => {
-                // Thin → fat: this should go through Unsize, not PtrToPtr
-                todo!("thin-to-fat pointer cast in mirdata: {:?}", kind);
+                todo!("thin-to-fat pointer cast (non-Unsize) in mirdata: {:?}", kind);
             }
             _ => todo!("non-scalar-pair to ScalarPair cast in mirdata"),
         }
@@ -377,7 +463,7 @@ fn codegen_md_cast(
             unreachable!("handled above")
         }
         CastKind::PointerCoercion(PointerCoercion::Unsize) => {
-            todo!("Unsize coercion in mirdata")
+            unreachable!("handled above")
         }
     };
     crate::codegen_scalar_cast(fx, scalar_kind, from_val, from_signed, &target_scalar, dest_layout)
@@ -481,14 +567,7 @@ fn codegen_md_rvalue(
         }
         Rvalue::Ref(_, place) | Rvalue::RawPtr(_, place) => {
             let place = codegen_md_place(fx, place);
-            // If the place is in registers, spill to a stack slot to get an address.
-            let ptr = if place.is_register() {
-                let cval = place.to_cvalue(fx);
-                cval.force_stack(fx)
-            } else {
-                place.to_ptr()
-            };
-            CValue::by_val(ptr.get_addr(&mut fx.bcx, fx.pointer_type), dest_layout.clone())
+            place.place_ref(fx, dest_layout.clone())
         }
         Rvalue::CopyForDeref(place) => {
             codegen_md_place(fx, place).to_cvalue(fx)
@@ -499,12 +578,51 @@ fn codegen_md_rvalue(
             CValue::by_val(discr, dest_layout.clone())
         }
         Rvalue::Aggregate(agg_kind, operands) => {
+            // Fast path for simple struct-like aggregates with Scalar/ScalarPair layout
+            match agg_kind {
+                ra_mir_types::AggregateKind::Tuple
+                | ra_mir_types::AggregateKind::Adt(_, 0, _)
+                | ra_mir_types::AggregateKind::Closure(_, _) => {
+                    // ZST fast path
+                    if dest_layout.is_zst() {
+                        return CValue::zst(dest_layout.clone());
+                    }
+                    // Scalar fast path (single non-ZST field)
+                    if let BackendRepr::Scalar(_) = dest_layout.backend_repr {
+                        for operand in operands {
+                            let op_layout = md_operand_layout(fx, operand);
+                            if !op_layout.is_zst() {
+                                let val = codegen_md_operand(fx, operand, &op_layout);
+                                return CValue::by_val(val.load_scalar(fx), dest_layout.clone());
+                            }
+                        }
+                    }
+                    // ScalarPair fast path (exactly two non-ZST scalars)
+                    if let BackendRepr::ScalarPair(_, _) = dest_layout.backend_repr {
+                        let mut non_zst = Vec::new();
+                        for operand in operands {
+                            let op_layout = md_operand_layout(fx, operand);
+                            if !op_layout.is_zst() {
+                                let val = codegen_md_operand(fx, operand, &op_layout);
+                                non_zst.push(val);
+                            }
+                        }
+                        if non_zst.len() == 2 {
+                            let a = non_zst[0].load_scalar(fx);
+                            let b = non_zst[1].load_scalar(fx);
+                            return CValue::by_val_pair(a, b, dest_layout.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+
             let dest_place = CPlace::new_stack_slot(fx, dest_layout.clone());
             match agg_kind {
                 ra_mir_types::AggregateKind::Tuple
                 | ra_mir_types::AggregateKind::Adt(_, 0, _)
                 | ra_mir_types::AggregateKind::Closure(_, _) => {
-                    // Simple struct-like: write each field
+                    // Memory-repr: write each field to stack slot
                     for (i, operand) in operands.iter().enumerate() {
                         let field_place = dest_place.place_field(
                             fx,
@@ -600,12 +718,26 @@ fn operand_ty(
                             ra_mir_types::Ty::Ref(_, inner) | ra_mir_types::Ty::RawPtr(_, inner) => (**inner).clone(),
                             _ => panic!("Deref on non-pointer"),
                         },
-                        ra_mir_types::Projection::Index(_) => match &ty {
+                        ra_mir_types::Projection::Index(_)
+                        | ra_mir_types::Projection::ConstantIndex { .. } => match &ty {
                             ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => (**elem).clone(),
-                            _ => panic!("Index on non-array"),
+                            _ => panic!("Index on non-array/slice"),
+                        },
+                        ra_mir_types::Projection::Subslice { from, to, from_end } => {
+                            if !from_end {
+                                let sub_len = *to - *from;
+                                match &ty {
+                                    ra_mir_types::Ty::Array(elem, _) => {
+                                        ra_mir_types::Ty::Array(elem.clone(), sub_len)
+                                    }
+                                    _ => panic!("Subslice on non-array"),
+                                }
+                            } else {
+                                ty // slice stays as slice
+                            }
                         },
                         ra_mir_types::Projection::Downcast(_) => ty, // type stays the same
-                        _ => panic!("unsupported projection in operand_ty"),
+                        ra_mir_types::Projection::OpaqueCast(cast_ty) => cast_ty.clone(),
                     };
                 }
                 ty
@@ -1018,6 +1150,13 @@ pub fn compile_mirdata_fn(
             let clif_block = fx.clif_block_idx(bb_idx);
             if bb_idx != 0 {
                 fx.bcx.switch_to_block(clif_block);
+            }
+
+            // Cleanup blocks are only reachable during unwinding.
+            // In our non-unwinding JIT context, emit a trap and skip codegen.
+            if bb.is_cleanup {
+                fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(3).unwrap());
+                continue;
             }
 
             for stmt in &bb.stmts {
@@ -3025,5 +3164,352 @@ mod tests {
 
         let result: usize = mirdata_jit_run(&fn_body, &layout_entries);
         assert_eq!(result, 5);
+    }
+
+    // -- Unsize: &[i32; 3] → &[i32] (array to slice) ---------------------------
+
+    fn slice_i32_ref_layout_entry() -> TypeLayoutEntry {
+        // &[i32] is ScalarPair(Pointer, Pointer) — (data_ptr, len)
+        TypeLayoutEntry {
+            ty: Ty::Ref(Mutability::Not, Box::new(Ty::Slice(Box::new(Ty::Int(IntTy::I32))))),
+            layout: LayoutInfo {
+                size: 16,
+                align: 8,
+                backend_repr: ExportedBackendRepr::ScalarPair(
+                    ExportedScalar {
+                        primitive: ExportedPrimitive::Pointer,
+                        valid_range_start: 1,
+                        valid_range_end: u64::MAX as u128,
+                    },
+                    ExportedScalar {
+                        primitive: ExportedPrimitive::Pointer,
+                        valid_range_start: 0,
+                        valid_range_end: u64::MAX as u128,
+                    },
+                ),
+                fields: ExportedFieldsShape::Arbitrary { offsets: vec![0, 8] },
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    fn arr3_i32_ref_layout_entry() -> TypeLayoutEntry {
+        // &[i32; 3] is a thin pointer (Scalar)
+        TypeLayoutEntry {
+            ty: Ty::Ref(Mutability::Not, Box::new(Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3))),
+            layout: LayoutInfo {
+                size: 8,
+                align: 8,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Pointer,
+                    valid_range_start: 1,
+                    valid_range_end: u64::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    fn arr3_i32_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3),
+            layout: LayoutInfo {
+                size: 12,
+                align: 4,
+                backend_repr: ExportedBackendRepr::Memory { sized: true },
+                fields: ExportedFieldsShape::Array { stride: 4, count: 3 },
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mirdata_unsize_array_to_slice() {
+        // fn foo() -> usize {
+        //   let arr: [i32; 3] = [10, 20, 30];
+        //   let arr_ref: &[i32; 3] = &arr;
+        //   let slice_ref: &[i32] = arr_ref as &[i32]; // Unsize coercion
+        //   PtrMetadata(slice_ref) // = 3
+        // }
+        let arr_ty = Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3);
+        let arr_ref_ty = Ty::Ref(Mutability::Not, Box::new(arr_ty.clone()));
+        let slice_ref_ty = Ty::Ref(Mutability::Not, Box::new(Ty::Slice(Box::new(Ty::Int(IntTy::I32)))));
+
+        let layout_entries = vec![
+            i32_layout_entry(),            // 0
+            arr3_i32_layout_entry(),       // 1
+            arr3_i32_ref_layout_entry(),   // 2
+            slice_i32_ref_layout_entry(),  // 3
+            usize_layout_entry(),          // 4
+        ];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "unsize_arr".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Uint(UintTy::Usize), layout: Some(4) },   // _0: return usize
+                    Local { ty: arr_ty.clone(), layout: Some(1) },              // _1: arr
+                    Local { ty: arr_ref_ty.clone(), layout: Some(2) },          // _2: &[i32; 3]
+                    Local { ty: slice_ref_ty.clone(), layout: Some(3) },        // _3: &[i32]
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        // _1 = [10, 20, 30]
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Aggregate(
+                                ra_mir_types::AggregateKind::Array(Ty::Int(IntTy::I32)),
+                                vec![
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(10, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(20, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(30, 4) }),
+                                ],
+                            ),
+                        ),
+                        // _2 = &_1
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::Ref(BorrowKind::Shared, Place { local: 1, projections: vec![] }),
+                        ),
+                        // _3 = _2 as &[i32] (Unsize)
+                        Statement::Assign(
+                            Place { local: 3, projections: vec![] },
+                            Rvalue::Cast(
+                                CastKind::PointerCoercion(PointerCoercion::Unsize),
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                slice_ref_ty.clone(),
+                            ),
+                        ),
+                        // _0 = PtrMetadata(_3) → should be 3
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::UnaryOp(
+                                ra_mir_types::UnOp::PtrMetadata,
+                                Operand::Copy(Place { local: 3, projections: vec![] }),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let result: usize = mirdata_jit_run(&fn_body, &layout_entries);
+        assert_eq!(result, 3);
+    }
+
+    // -- Unsize + deref: access element through unsized slice ref -----------------
+
+    #[test]
+    fn mirdata_unsize_then_deref() {
+        // fn foo() -> i32 {
+        //   let arr: [i32; 3] = [10, 20, 30];
+        //   let arr_ref: &[i32; 3] = &arr;
+        //   let slice_ref: &[i32] = arr_ref as &[i32]; // Unsize
+        //   (*slice_ref)[1]  // Deref + Index = 20
+        // }
+        let arr_ty = Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3);
+        let arr_ref_ty = Ty::Ref(Mutability::Not, Box::new(arr_ty.clone()));
+        let slice_ty = Ty::Slice(Box::new(Ty::Int(IntTy::I32)));
+        let slice_ref_ty = Ty::Ref(Mutability::Not, Box::new(slice_ty.clone()));
+
+        let layout_entries = vec![
+            i32_layout_entry(),            // 0
+            arr3_i32_layout_entry(),       // 1
+            arr3_i32_ref_layout_entry(),   // 2
+            slice_i32_ref_layout_entry(),  // 3
+            usize_layout_entry(),          // 4
+            // [i32] slice layout (unsized)
+            TypeLayoutEntry {
+                ty: slice_ty.clone(),
+                layout: LayoutInfo {
+                    size: 0, // unsized, size not meaningful
+                    align: 4,
+                    backend_repr: ExportedBackendRepr::Memory { sized: false },
+                    fields: ExportedFieldsShape::Array { stride: 4, count: 0 },
+                    variants: ExportedVariants::Single { index: 0 },
+                    largest_niche: None,
+                },
+            },
+        ];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "unsize_deref".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },        // _0: return i32
+                    Local { ty: arr_ty.clone(), layout: Some(1) },              // _1: arr
+                    Local { ty: arr_ref_ty.clone(), layout: Some(2) },          // _2: &[i32; 3]
+                    Local { ty: slice_ref_ty.clone(), layout: Some(3) },        // _3: &[i32]
+                    Local { ty: Ty::Uint(UintTy::Usize), layout: Some(4) },    // _4: index
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        // _1 = [10, 20, 30]
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Aggregate(
+                                ra_mir_types::AggregateKind::Array(Ty::Int(IntTy::I32)),
+                                vec![
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(10, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(20, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(30, 4) }),
+                                ],
+                            ),
+                        ),
+                        // _2 = &_1
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::Ref(BorrowKind::Shared, Place { local: 1, projections: vec![] }),
+                        ),
+                        // _3 = _2 as &[i32] (Unsize)
+                        Statement::Assign(
+                            Place { local: 3, projections: vec![] },
+                            Rvalue::Cast(
+                                CastKind::PointerCoercion(PointerCoercion::Unsize),
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                slice_ref_ty.clone(),
+                            ),
+                        ),
+                        // _4 = 1usize
+                        Statement::Assign(
+                            Place { local: 4, projections: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: Ty::Uint(UintTy::Usize),
+                                kind: ConstKind::Scalar(1, 8),
+                            })),
+                        ),
+                        // _0 = (*_3)[_4]  (Deref + Index)
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 3,
+                                projections: vec![
+                                    Projection::Deref,
+                                    Projection::Index(4),
+                                ],
+                            })),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let result: i32 = mirdata_jit_run(&fn_body, &layout_entries);
+        assert_eq!(result, 20);
+    }
+
+    // -- Fat pointer reborrow: &*fat_ptr preserves metadata ----------------------
+
+    #[test]
+    fn mirdata_fat_ptr_reborrow() {
+        // fn foo() -> usize {
+        //   let arr: [i32; 3] = [10, 20, 30];
+        //   let arr_ref: &[i32; 3] = &arr;
+        //   let slice_ref: &[i32] = arr_ref as &[i32]; // Unsize
+        //   let reborrowed: &[i32] = &*slice_ref;      // Ref(Deref)
+        //   PtrMetadata(reborrowed) // should still be 3
+        // }
+        let arr_ty = Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3);
+        let arr_ref_ty = Ty::Ref(Mutability::Not, Box::new(arr_ty.clone()));
+        let slice_ty = Ty::Slice(Box::new(Ty::Int(IntTy::I32)));
+        let slice_ref_ty = Ty::Ref(Mutability::Not, Box::new(slice_ty.clone()));
+
+        let layout_entries = vec![
+            i32_layout_entry(),            // 0
+            arr3_i32_layout_entry(),       // 1
+            arr3_i32_ref_layout_entry(),   // 2
+            slice_i32_ref_layout_entry(),  // 3
+            usize_layout_entry(),          // 4
+            // [i32] slice layout (unsized)
+            TypeLayoutEntry {
+                ty: slice_ty.clone(),
+                layout: LayoutInfo {
+                    size: 0,
+                    align: 4,
+                    backend_repr: ExportedBackendRepr::Memory { sized: false },
+                    fields: ExportedFieldsShape::Array { stride: 4, count: 0 },
+                    variants: ExportedVariants::Single { index: 0 },
+                    largest_niche: None,
+                },
+            },
+        ];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "fat_reborrow".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Uint(UintTy::Usize), layout: Some(4) },    // _0: return usize
+                    Local { ty: arr_ty.clone(), layout: Some(1) },              // _1: arr
+                    Local { ty: arr_ref_ty.clone(), layout: Some(2) },          // _2: &[i32; 3]
+                    Local { ty: slice_ref_ty.clone(), layout: Some(3) },        // _3: &[i32]
+                    Local { ty: slice_ref_ty.clone(), layout: Some(3) },        // _4: &[i32] (reborrowed)
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        // _1 = [10, 20, 30]
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Aggregate(
+                                ra_mir_types::AggregateKind::Array(Ty::Int(IntTy::I32)),
+                                vec![
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(10, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(20, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(30, 4) }),
+                                ],
+                            ),
+                        ),
+                        // _2 = &_1
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::Ref(BorrowKind::Shared, Place { local: 1, projections: vec![] }),
+                        ),
+                        // _3 = _2 as &[i32] (Unsize)
+                        Statement::Assign(
+                            Place { local: 3, projections: vec![] },
+                            Rvalue::Cast(
+                                CastKind::PointerCoercion(PointerCoercion::Unsize),
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                slice_ref_ty.clone(),
+                            ),
+                        ),
+                        // _4 = &*_3  (reborrow — Ref of Deref)
+                        Statement::Assign(
+                            Place { local: 4, projections: vec![] },
+                            Rvalue::Ref(BorrowKind::Shared, Place {
+                                local: 3,
+                                projections: vec![Projection::Deref],
+                            }),
+                        ),
+                        // _0 = PtrMetadata(_4) → should still be 3
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::UnaryOp(
+                                ra_mir_types::UnOp::PtrMetadata,
+                                Operand::Copy(Place { local: 4, projections: vec![] }),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let result: usize = mirdata_jit_run(&fn_body, &layout_entries);
+        assert_eq!(result, 3);
     }
 }
