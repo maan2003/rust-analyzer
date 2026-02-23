@@ -247,6 +247,53 @@ fn codegen_cast(
         return codegen_unsize_coercion(fx, body, operand, target_ty, result_layout);
     }
 
+    // Handle ReifyFnPointer: FnDef (ZST) → fn pointer.
+    // Must be before the generic scalar path because FnDef is ZST and has no scalar value.
+    if let CastKind::PointerCoercion(PointerCast::ReifyFnPointer) = kind {
+        let from_ty = operand_ty(fx.db, body, &operand.kind);
+        let TyKind::FnDef(def, generic_args) = from_ty.as_ref().kind() else {
+            panic!("ReifyFnPointer on non-FnDef type: {:?}", from_ty);
+        };
+        let CallableDefId::FunctionId(callee_func_id) = def.0 else {
+            panic!("ReifyFnPointer on non-function: {:?}", def);
+        };
+        // Declare the function in the module and get its address
+        let is_extern = matches!(
+            callee_func_id.loc(fx.db).container,
+            ItemContainerId::ExternBlockId(_)
+        );
+        let is_cross_crate = callee_func_id.krate(fx.db) != fx.local_crate;
+        let (callee_sig, callee_name) = if is_extern {
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+                .expect("extern fn sig");
+            let name = fx.db.function_signature(callee_func_id).name.as_str().to_owned();
+            (sig, name)
+        } else if is_cross_crate {
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db, fx.dl, &fx.env, callee_func_id)
+                .expect("cross-crate fn sig");
+            let name = symbol_mangling::mangle_function(
+                fx.db, callee_func_id, generic_args, fx.ext_crate_disambiguators,
+            );
+            (sig, name)
+        } else {
+            let callee_body = fx.db
+                .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
+                .expect("failed to get callee MIR for ReifyFnPointer");
+            let sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body, &[])
+                .expect("callee sig");
+            let name = symbol_mangling::mangle_function(
+                fx.db, callee_func_id, generic_args, fx.ext_crate_disambiguators,
+            );
+            (sig, name)
+        };
+        let callee_id = fx.module
+            .declare_function(&callee_name, Linkage::Import, &callee_sig)
+            .expect("declare callee for ReifyFnPointer");
+        let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, callee_ref);
+        return CValue::by_val(func_addr, result_layout.clone());
+    }
+
     let from_ty = operand_ty(fx.db, body, &operand.kind);
     let from_cval = codegen_operand(fx, body, &operand.kind);
     let from_val = from_cval.load_scalar(fx);
@@ -288,7 +335,7 @@ fn codegen_cast(
         | CastKind::PointerExposeProvenance
         | CastKind::PointerWithExposedProvenance
         | CastKind::PointerCoercion(_) => {
-            // All remaining PointerCoercion variants (MutToConstPointer, ReifyFnPointer, etc.)
+            // Remaining PointerCoercion variants (MutToConstPointer, UnsafeFnPointer, etc.)
             // are thin ptr → thin ptr, handled as intcast.
             let from_signed = ty_is_signed_int(from_ty);
             codegen_intcast(fx, from_val, target_clif_ty, from_signed)
@@ -1522,13 +1569,10 @@ fn codegen_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
-    // Extract the function type from the func operand
-    let fn_ty = match &func.kind {
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        _ => todo!("indirect/fn-pointer calls"),
-    };
+    // Extract the function type from any operand (constant or non-constant)
+    let fn_ty_stored = operand_ty(fx.db, body, &func.kind);
 
-    match fn_ty.kind() {
+    match fn_ty_stored.as_ref().kind() {
         TyKind::FnDef(def, generic_args) => {
             let callable_def: CallableDefId = def.0;
             match callable_def {
@@ -1557,7 +1601,10 @@ fn codegen_call(
                 }
             }
         }
-        _ => todo!("non-FnDef call (fn pointers, closures)"),
+        TyKind::FnPtr(sig_tys, _header) => {
+            codegen_fn_ptr_call(fx, body, func, &sig_tys, args, destination, target);
+        }
+        _ => todo!("non-FnDef/FnPtr call: {:?}", fn_ty_stored),
     }
 }
 
@@ -1655,6 +1702,139 @@ fn codegen_adt_constructor_call(
     if let Some(target) = target {
         let block = fx.clif_block(*target);
         fx.bcx.ins().jump(block, &[]);
+    }
+}
+
+/// Indirect call through a fn pointer (`TyKind::FnPtr`).
+/// Loads the fn pointer value, builds a signature from the FnPtr type,
+/// and emits `call_indirect`.
+fn codegen_fn_ptr_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    func_operand: &Operand,
+    sig_tys: &rustc_type_ir::Binder<DbInterner, rustc_type_ir::FnSigTys<DbInterner>>,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    // Load the fn pointer value
+    let fn_ptr_cval = codegen_operand(fx, body, &func_operand.kind);
+    let fn_ptr = fn_ptr_cval.load_scalar(fx);
+
+    // Build signature from FnPtr type info
+    let sig_tys_inner = sig_tys.clone().skip_binder();
+    let mut sig = Signature::new(fx.isa.default_call_conv());
+
+    // Return type
+    let output = sig_tys_inner.output();
+    let dest = codegen_place(fx, body, destination);
+    let is_sret_return = if output.is_never() || dest.layout.is_zst() {
+        false
+    } else {
+        match dest.layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
+                false
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
+                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
+                false
+            }
+            _ => {
+                sig.params.push(AbiParam::special(fx.pointer_type, ArgumentPurpose::StructReturn));
+                true
+            }
+        }
+    };
+
+    // Parameter types in signature
+    for &param_ty in sig_tys_inner.inputs() {
+        let param_layout = fx.db.layout_of_ty(param_ty.store(), fx.env.clone())
+            .expect("fn ptr param layout");
+        match param_layout.backend_repr {
+            BackendRepr::Scalar(scalar) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
+            }
+            BackendRepr::ScalarPair(a, b) => {
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
+                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
+            }
+            _ if param_layout.is_zst() => {}
+            _ => {
+                sig.params.push(AbiParam::new(fx.pointer_type));
+            }
+        }
+    }
+
+    let sig_ref = fx.bcx.import_signature(sig);
+
+    // Build argument values
+    let mut call_args: Vec<Value> = Vec::new();
+
+    let sret_slot = if is_sret_return {
+        let slot = CPlace::new_stack_slot(fx, dest.layout.clone());
+        let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+        call_args.push(ptr);
+        Some(slot)
+    } else {
+        None
+    };
+
+    for arg in args {
+        let cval = codegen_operand(fx, body, &arg.kind);
+        if cval.layout.is_zst() {
+            continue;
+        }
+        match cval.layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = cval.load_scalar_pair(fx);
+                call_args.push(a);
+                call_args.push(b);
+            }
+            BackendRepr::Scalar(_) => {
+                call_args.push(cval.load_scalar(fx));
+            }
+            _ => {
+                let ptr = cval.force_stack(fx);
+                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+            }
+        }
+    }
+
+    // Emit indirect call
+    let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
+
+    // Store return value
+    if let Some(sret_slot) = sret_slot {
+        let cval = sret_slot.to_cvalue(fx);
+        dest.write_cvalue(fx, cval);
+    } else {
+        let results = fx.bcx.inst_results(call);
+        if !dest.layout.is_zst() {
+            match dest.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    let val = results.first().copied()
+                        .expect("call_indirect returns no values but destination expects Scalar");
+                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+                }
+                BackendRepr::ScalarPair(_, _) => {
+                    assert!(results.len() >= 2);
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                    );
+                }
+                _ => unreachable!("non-sret memory return from call_indirect"),
+            }
+        }
+    }
+
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
+    } else {
+        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
     }
 }
 
@@ -2896,13 +3076,28 @@ fn collect_reachable_fns(
         };
 
         for (_, bb) in body.basic_blocks.iter() {
-            // Scan statements for unsizing coercions → discover vtable impl methods
+            // Scan statements for coercions that discover new function targets
             for stmt in &bb.statements {
-                if let StatementKind::Assign(_, Rvalue::Cast(CastKind::PointerCoercion(PointerCast::Unsize), operand, target_ty)) = &stmt.kind {
-                    collect_vtable_methods(
-                        db, env, &body, operand, target_ty, local_crate,
-                        &empty_args_stored, &mut queue,
-                    );
+                if let StatementKind::Assign(_, Rvalue::Cast(cast_kind, operand, target_ty)) = &stmt.kind {
+                    match cast_kind {
+                        // Unsizing coercions → discover vtable impl methods
+                        CastKind::PointerCoercion(PointerCast::Unsize) => {
+                            collect_vtable_methods(
+                                db, env, &body, operand, target_ty, local_crate,
+                                &empty_args_stored, &mut queue,
+                            );
+                        }
+                        // ReifyFnPointer: fn item → fn pointer. The target fn needs compilation.
+                        CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
+                            let from_ty = operand_ty(db, &body, &operand.kind);
+                            if let TyKind::FnDef(def, callee_args) = from_ty.as_ref().kind() {
+                                if let CallableDefId::FunctionId(callee_id) = def.0 {
+                                    queue.push_back((callee_id, callee_args.store()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 

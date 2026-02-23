@@ -1523,6 +1523,48 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Fn pointer / indirect call tests (M11e)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_fn_pointer_call() {
+    let result: i32 = jit_run(
+        r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+fn foo() -> i32 {
+    let f: fn(i32, i32) -> i32 = add;
+    f(3, 4)
+}
+"#,
+        &["add", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn jit_fn_pointer_higher_order() {
+    let result: i32 = jit_run(
+        r#"
+fn double(x: i32) -> i32 {
+    x * 2
+}
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+fn foo() -> i32 {
+    apply(double, 21)
+}
+"#,
+        &["double", "apply", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+// ---------------------------------------------------------------------------
 // Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
 // ---------------------------------------------------------------------------
 
