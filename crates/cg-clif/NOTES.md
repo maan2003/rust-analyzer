@@ -157,6 +157,13 @@ Known bugs (divergence from upstream cg_clif):
   remain unresolved at runtime (`can't resolve symbol ...`). This especially
   affects source-level minicore method calls (e.g. raw-pointer inherent methods)
   unless tests use direct intrinsic calls or object-only compile checks.
+- **Array index tests require explicit `usize` index** — `arr[1]` fails MIR
+  lowering with `UnresolvedMethod("[overloaded index]")`. The MIR lowerer only
+  emits `ProjectionElem::Index` when the index is already `usize`; otherwise it
+  falls through to `Index` trait dispatch. Even with minicore `index` feature,
+  r-a's method resolution can't resolve `Index<I> for [T; N] where I:
+  SliceIndex<[T]>` (the `SliceIndex` bound chain fails). Using `arr[1usize]`
+  sidesteps both issues. Real code with full std would work via trait resolution.
 
 What's missing:
 - Closure field type resolution
