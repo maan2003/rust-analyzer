@@ -35,6 +35,7 @@ use ra_mir_types::{CrateInfo, FnBody, MirData, TypeLayoutEntry};
 
 struct ExportCallbacks {
     result: RefCell<Option<MirData>>,
+    output_path: PathBuf,
 }
 
 impl rustc_driver::Callbacks for ExportCallbacks {
@@ -45,7 +46,15 @@ impl rustc_driver::Callbacks for ExportCallbacks {
     ) -> Compilation {
         let crates = extract_crate_ids(tcx);
         let (bodies, layouts) = extract_mir_bodies(tcx);
-        *self.result.borrow_mut() = Some(MirData { crates, bodies, layouts });
+        let mir_data = MirData { crates, bodies, layouts };
+
+        // Write the mirdata file *inside* the callback, before rustc's delayed
+        // ICE handler can kill the process.
+        let data = postcard::to_allocvec(&mir_data).expect("postcard serialize");
+        std::fs::write(&self.output_path, &data)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", self.output_path.display()));
+
+        *self.result.borrow_mut() = Some(mir_data);
         Compilation::Stop
     }
 }
@@ -291,11 +300,16 @@ fn main() {
 
     let mut callbacks = ExportCallbacks {
         result: RefCell::new(None),
+        output_path: output_path.clone(),
     };
 
-    rustc_driver::run_compiler(&filtered_args, &mut callbacks);
+    // run_compiler may panic due to delayed ICEs in rustc, but our data is
+    // already serialized & written inside the after_analysis callback.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustc_driver::run_compiler(&filtered_args, &mut callbacks);
+    }));
 
-    // Write output
+    // Write output (may have already been written in the callback)
     let mir_data = callbacks.result.into_inner().unwrap_or_else(|| {
         eprintln!("error: no data extracted from compilation");
         std::process::exit(1);

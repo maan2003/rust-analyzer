@@ -461,4 +461,13 @@ impl CPlace {
     ) -> CPlace {
         CPlace { inner: self.inner, layout: variant_layout }
     }
+
+    /// Reinterpret the place with a different layout of the same size.
+    /// Used for `ProjectionElem::OpaqueCast` and similar no-op type changes.
+    pub(crate) fn transmute_type(
+        &self,
+        new_layout: Arc<Layout>,
+    ) -> CPlace {
+        CPlace { inner: self.inner, layout: new_layout }
+    }
 }
