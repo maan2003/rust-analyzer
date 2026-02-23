@@ -428,6 +428,10 @@ Doesn't need to be perfect — just structurally valid.
 
 ---
 
+## Phase 4.5
+
+Optimize for salsa, rework reachability analysis, maybe use a backchannel during mir lowering to tell us about reachable functions. this is somewhat similar to how salsa handles diagnostics for example. to be explored
+
 ## Phase 5: Expanding coverage
 
 ### M15: A real crate
