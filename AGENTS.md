@@ -4,6 +4,7 @@ plan.md contains the high level plan
 milestones.md contains the current status
 
 cg_clif/ is the original rustc cranelift backend (git subtree). Read-only reference.
+Always reference the upstream cg_clif/ when working on our codegen.
 
 crates/cg-clif/ is our MIR->Cranelift codegen crate using r-a types. This is where active development happens. See crates/cg-clif/NOTES.md for architecture notes and porting status.
 
