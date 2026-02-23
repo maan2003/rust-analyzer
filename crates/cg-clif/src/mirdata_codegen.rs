@@ -3805,4 +3805,211 @@ mod tests {
             assert_eq!(f_none(), -1); // None → extract → -1
         }
     }
+
+    // -- Assert terminator: panics on false condition ---------------------------
+
+    #[test]
+    fn mirdata_assert_pass() {
+        // fn foo(x: i32) -> i32 {
+        //     assert!(x > 0);  // Assert { cond: x > 0, expected: true }
+        //     x + 1
+        // }
+        let layout_entries = vec![i32_layout_entry(), bool_layout_entry()];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "assert_pass".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _1: x (arg)
+                    Local { ty: Ty::Bool, layout: Some(1) },             // _2: cond
+                ],
+                arg_count: 1,
+                blocks: vec![
+                    // bb0: _2 = _1 > 0; assert(_2, expected=true) → bb1
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Gt,
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                                Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(0, 4),
+                                }),
+                            ),
+                        )],
+                        terminator: Terminator::Assert {
+                            cond: Operand::Copy(Place { local: 2, projections: vec![] }),
+                            expected: true,
+                            target: 1,
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    // bb1: _0 = _1 + 1; return
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                                Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(1, 4),
+                                }),
+                            ),
+                        )],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let result: i32 = mirdata_jit_run_with_arg(&fn_body, &layout_entries, 5);
+        assert_eq!(result, 6); // 5 + 1 = 6
+    }
+
+    // -- Simple loop: sum 1..=N ------------------------------------------------
+
+    #[test]
+    fn mirdata_loop_sum() {
+        // fn sum_to(n: i32) -> i32 {
+        //     let mut acc = 0;
+        //     let mut i = 1;
+        //     while i <= n {
+        //         acc += i;
+        //         i += 1;
+        //     }
+        //     acc
+        // }
+        //
+        // MIR:
+        //   _0 = 0      (acc)
+        //   _2 = 1      (i)
+        // bb1: _3 = _2 <= _1; SwitchInt(_3, [0 → bb3, otherwise → bb2])
+        // bb2: _0 = _0 + _2; _2 = _2 + 1; goto bb1
+        // bb3: return
+        let layout_entries = vec![i32_layout_entry(), bool_layout_entry()];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "sum_to".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: acc/return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _1: n (arg)
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _2: i
+                    Local { ty: Ty::Bool, layout: Some(1) },             // _3: cond
+                ],
+                arg_count: 1,
+                blocks: vec![
+                    // bb0: init acc=0, i=1, goto bb1
+                    BasicBlock {
+                        stmts: vec![
+                            Statement::Assign(
+                                Place { local: 0, projections: vec![] },
+                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(0, 4),
+                                })),
+                            ),
+                            Statement::Assign(
+                                Place { local: 2, projections: vec![] },
+                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(1, 4),
+                                })),
+                            ),
+                        ],
+                        terminator: Terminator::Goto(1),
+                        is_cleanup: false,
+                    },
+                    // bb1: check i <= n
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 3, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Le,
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                            ),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place { local: 3, projections: vec![] }),
+                            targets: SwitchTargets {
+                                values: vec![0],      // false → exit
+                                targets: vec![3, 2],  // [false→bb3, otherwise(true)→bb2]
+                            },
+                        },
+                        is_cleanup: false,
+                    },
+                    // bb2: acc += i; i += 1; goto bb1
+                    BasicBlock {
+                        stmts: vec![
+                            Statement::Assign(
+                                Place { local: 0, projections: vec![] },
+                                Rvalue::BinaryOp(
+                                    BinOp::Add,
+                                    Operand::Copy(Place { local: 0, projections: vec![] }),
+                                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                                ),
+                            ),
+                            Statement::Assign(
+                                Place { local: 2, projections: vec![] },
+                                Rvalue::BinaryOp(
+                                    BinOp::Add,
+                                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                                    Operand::Constant(ConstOperand {
+                                        ty: Ty::Int(IntTy::I32),
+                                        kind: ConstKind::Scalar(1, 4),
+                                    }),
+                                ),
+                            ),
+                        ],
+                        terminator: Terminator::Goto(1),
+                        is_cleanup: false,
+                    },
+                    // bb3: return
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let result: i32 = mirdata_jit_run_with_arg(&fn_body, &layout_entries, 10);
+        assert_eq!(result, 55); // 1+2+...+10 = 55
+    }
+
+    /// Helper to run a mirdata function with a single i32 argument
+    fn mirdata_jit_run_with_arg(fn_body: &FnBody, layout_entries: &[TypeLayoutEntry], arg: i32) -> i32 {
+        let layouts = convert_mirdata_layouts(layout_entries);
+        let ty_layouts = build_ty_layout_map(layout_entries, &layouts);
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            fn_body,
+            &layouts,
+            &fn_body.name,
+            Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
+        )
+        .expect("compile_mirdata_fn failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32) -> i32 = std::mem::transmute(code);
+            f(arg)
+        }
+    }
 }
