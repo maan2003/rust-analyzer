@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ra_mir_types::{CrateInfo, MirData};
+use ra_mir_types::MirData;
+
+use crate::LayoutArc;
 
 /// Get the target library directory from the host `rustc`.
 pub fn find_target_libdir() -> Result<PathBuf, String> {
@@ -106,6 +108,21 @@ pub fn load_crate_disambiguators(mirdata_path: &Path) -> Result<HashMap<String, 
     Ok(map)
 }
 
+/// Load and deserialize a `.mirdata` file, returning the full `MirData`.
+pub fn load_mirdata(mirdata_path: &Path) -> Result<MirData, String> {
+    let data = std::fs::read(mirdata_path)
+        .map_err(|e| format!("failed to read {}: {e}", mirdata_path.display()))?;
+    postcard::from_bytes(&data)
+        .map_err(|e| format!("failed to deserialize {}: {e}", mirdata_path.display()))
+}
+
+/// Load mirdata and convert its layout table to `Vec<LayoutArc>`.
+pub fn load_mirdata_layouts(mirdata_path: &Path) -> Result<(MirData, Vec<LayoutArc>), String> {
+    let mir_data = load_mirdata(mirdata_path)?;
+    let layouts = crate::layout::convert_mirdata_layouts(&mir_data.layouts);
+    Ok((mir_data, layouts))
+}
+
 /// Find the `.mirdata` file path.
 ///
 /// Uses `RA_MIRDATA` environment variable, or looks for `sysroot.mirdata`
@@ -146,6 +163,7 @@ pub fn extract_crate_disambiguators() -> Result<HashMap<String, u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ra_mir_types::CrateInfo;
 
     #[test]
     fn find_libstd_so_in_sysroot() {

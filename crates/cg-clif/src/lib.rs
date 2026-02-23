@@ -32,6 +32,7 @@ use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 use triomphe::Arc as TArc;
 
+pub mod layout;
 pub mod link;
 mod pointer;
 pub mod symbol_mangling;
@@ -440,7 +441,7 @@ fn get_or_create_vtable(
                 fx.env.clone(),
             )
             .expect("failed to get impl method MIR for vtable");
-        let impl_sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &impl_body)
+        let impl_sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &impl_body, &[])
             .expect("impl method sig for vtable");
         let impl_fn_name = symbol_mangling::mangle_function(
             fx.db,
@@ -1672,7 +1673,7 @@ fn codegen_direct_call(
             .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env.clone())
             .expect("failed to get callee MIR");
         let sig =
-            build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body).expect("callee sig");
+            build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &callee_body, &[]).expect("callee sig");
         let name = symbol_mangling::mangle_function(
             fx.db,
             callee_func_id,
@@ -2043,12 +2044,17 @@ pub fn build_host_isa(is_pic: bool) -> Arc<dyn TargetIsa> {
 }
 
 /// Build a Cranelift signature from a MIR body's locals (return type + params).
-fn build_fn_sig(
+///
+/// `mirdata_layouts` is a pre-computed layout table from `.mirdata` files.
+/// Currently unused (r-a MIR locals don't carry layout indices), but threaded
+/// through for future mirdata body compilation.
+pub fn build_fn_sig(
     isa: &dyn TargetIsa,
     db: &dyn HirDatabase,
     dl: &TargetDataLayout,
     env: &StoredParamEnvAndCrate,
     body: &MirBody,
+    _mirdata_layouts: &[LayoutArc],
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
 
@@ -2164,6 +2170,9 @@ fn build_fn_sig_from_ty(
 }
 
 /// Compile a single MIR body to a named function in a Module (ObjectModule or JITModule).
+///
+/// `mirdata_layouts` is a pre-computed layout table from `.mirdata` files.
+/// Pass `&[]` when compiling r-a MIR bodies (all layouts come from `db.layout_of_ty()`).
 pub fn compile_fn(
     module: &mut impl Module,
     isa: &dyn TargetIsa,
@@ -2175,9 +2184,10 @@ pub fn compile_fn(
     linkage: Linkage,
     local_crate: base_db::Crate,
     ext_crate_disambiguators: &HashMap<String, u64>,
+    mirdata_layouts: &[LayoutArc],
 ) -> Result<FuncId, String> {
     let pointer_type = pointer_ty(dl);
-    let sig = build_fn_sig(isa, db, dl, env, body)?;
+    let sig = build_fn_sig(isa, db, dl, env, body, mirdata_layouts)?;
 
     // Declare function in module
     let func_id = module
@@ -2373,7 +2383,7 @@ pub fn compile_to_object(
 
     compile_fn(
         &mut module, &*isa, db, dl, env, body, fn_name, Linkage::Export,
-        local_crate, &empty_map,
+        local_crate, &empty_map, &[],
     )?;
 
     let product = module.finish();
@@ -2603,7 +2613,7 @@ pub fn compile_executable(
         );
         let func_clif_id = compile_fn(
             &mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export,
-            local_crate, ext_crate_disambiguators,
+            local_crate, ext_crate_disambiguators, &[],
         )?;
 
         if *func_id == main_func_id {

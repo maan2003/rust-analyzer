@@ -350,6 +350,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
                 cranelift_module::Linkage::Export,
                 local_crate,
                 &empty_map,
+                &[],
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
         }
@@ -361,7 +362,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         let entry_func_id = find_fn(&db, file_id, entry);
         let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
         let dl = get_target_data_layout(&db, entry_func_id);
-        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
         let entry_mangled = mangled_name(&db, entry_func_id);
 
         let entry_id = jit_module
@@ -417,6 +418,7 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
                 cranelift_module::Linkage::Export,
                 local_crate,
                 &empty_map,
+                &[],
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
             mangled_names.push(fn_name);
@@ -1518,4 +1520,76 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 20);
+}
+
+// ---------------------------------------------------------------------------
+// Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
+// ---------------------------------------------------------------------------
+
+/// Roundtrip test: compute real layouts via `db.layout_of_ty()`, export them
+/// using the same logic as ra-mir-export, convert back, and verify codegen-
+/// relevant fields match.
+#[test]
+fn layout_roundtrip_via_db() {
+    let (db, file_ids) = TestDB::with_many_files(
+        r#"
+//- /main.rs
+struct Pair { a: i32, b: i32 }
+struct Triple { x: i32, y: i32, z: i32 }
+enum AB { A(i32), B(i32) }
+fn foo(
+    _a: i32,
+    _b: bool,
+    _c: f64,
+    _d: (i32, i32),
+    _e: Pair,
+    _f: Triple,
+    _g: AB,
+    _h: *const i32,
+) {}
+"#,
+    );
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, "foo");
+        let (body, env) = get_mir_and_env(&db, func_id);
+
+        for (_, local) in body.locals.iter() {
+            let layout = db
+                .layout_of_ty(local.ty.clone(), env.clone())
+                .expect("layout_of_ty failed");
+            // Export → convert back
+            let exported = crate::layout::export_layout(&layout);
+            let converted =
+                crate::layout::convert_mirdata_layouts(&[ra_mir_types::TypeLayoutEntry {
+                    ty: ra_mir_types::Ty::Opaque("test".to_string()),
+                    layout: exported,
+                }]);
+            let converted = &converted[0];
+
+            // Compare codegen-relevant fields
+            assert_eq!(layout.size, converted.size, "size mismatch for local");
+            assert_eq!(layout.align, converted.align, "align mismatch for local");
+            assert_eq!(
+                layout.backend_repr, converted.backend_repr,
+                "backend_repr mismatch for local"
+            );
+            assert_eq!(
+                layout.largest_niche, converted.largest_niche,
+                "niche mismatch for local"
+            );
+            assert_eq!(
+                layout.fields.count(),
+                converted.fields.count(),
+                "field count mismatch for local"
+            );
+            for i in 0..layout.fields.count() {
+                assert_eq!(
+                    layout.fields.offset(i),
+                    converted.fields.offset(i),
+                    "field offset mismatch at {i}"
+                );
+            }
+        }
+    });
 }
