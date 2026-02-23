@@ -1200,7 +1200,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         return Ok(None);
                     };
                     let r_value = Rvalue::BinaryOp(
-                        op.into(),
+                        super::arith_op_to_binop(op),
                         Operand { kind: OperandKind::Copy(lhs_place), span: None },
                         rhs_op,
                     );
@@ -1253,8 +1253,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 hir_def::hir::LogicOp::And => BinOp::BitAnd, // FIXME: make these short circuit
                                 hir_def::hir::LogicOp::Or => BinOp::BitOr,
                             },
-                            hir_def::hir::BinaryOp::ArithOp(op) => BinOp::from(op),
-                            hir_def::hir::BinaryOp::CmpOp(op) => BinOp::from(op),
+                            hir_def::hir::BinaryOp::ArithOp(op) => super::arith_op_to_binop(op),
+                            hir_def::hir::BinaryOp::CmpOp(op) => super::cmp_op_to_binop(op),
                             hir_def::hir::BinaryOp::Assignment { .. } => unreachable!(), // handled above
                         },
                         lhs_op,

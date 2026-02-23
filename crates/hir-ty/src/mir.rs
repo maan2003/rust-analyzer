@@ -1,6 +1,6 @@
 //! MIR definitions and implementation
 
-use std::{collections::hash_map::Entry, fmt::Display, iter};
+use std::{collections::hash_map::Entry, iter};
 
 use base_db::Crate;
 use either::Either;
@@ -688,174 +688,31 @@ impl BorrowKind {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum UnOp {
-    /// The `!` operator for logical inversion
-    Not,
-    /// The `-` operator for negation
-    Neg,
-}
+pub use ra_mir_types::{BinOp, UnOp};
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum BinOp {
-    /// The `+` operator (addition)
-    Add,
-    /// The `-` operator (subtraction)
-    Sub,
-    /// The `*` operator (multiplication)
-    Mul,
-    /// The `/` operator (division)
-    ///
-    /// Division by zero is UB, because the compiler should have inserted checks
-    /// prior to this.
-    Div,
-    /// The `%` operator (modulus)
-    ///
-    /// Using zero as the modulus (second operand) is UB, because the compiler
-    /// should have inserted checks prior to this.
-    Rem,
-    /// The `^` operator (bitwise xor)
-    BitXor,
-    /// The `&` operator (bitwise and)
-    BitAnd,
-    /// The `|` operator (bitwise or)
-    BitOr,
-    /// The `<<` operator (shift left)
-    ///
-    /// The offset is truncated to the size of the first operand before shifting.
-    Shl,
-    /// The `>>` operator (shift right)
-    ///
-    /// The offset is truncated to the size of the first operand before shifting.
-    Shr,
-    /// The `==` operator (equality)
-    Eq,
-    /// The `<` operator (less than)
-    Lt,
-    /// The `<=` operator (less than or equal to)
-    Le,
-    /// The `!=` operator (not equal to)
-    Ne,
-    /// The `>=` operator (greater than or equal to)
-    Ge,
-    /// The `>` operator (greater than)
-    Gt,
-    /// The `ptr.offset` operator
-    Offset,
-    /// Like `Add`, but with overflow checking yielding `(T, bool)`.
-    AddWithOverflow,
-    /// Like `Sub`, but with overflow checking yielding `(T, bool)`.
-    SubWithOverflow,
-    /// Like `Mul`, but with overflow checking yielding `(T, bool)`.
-    MulWithOverflow,
-    /// Unchecked add — UB on overflow.
-    AddUnchecked,
-    /// Unchecked sub — UB on overflow.
-    SubUnchecked,
-    /// Unchecked mul — UB on overflow.
-    MulUnchecked,
-    /// Unchecked shift left — UB if rhs >= bit width.
-    ShlUnchecked,
-    /// Unchecked shift right — UB if rhs >= bit width.
-    ShrUnchecked,
-    /// Three-way comparison (returns `Ordering`).
-    Cmp,
-}
-
-impl BinOp {
-    fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
-        match self {
-            BinOp::Ge => l >= r,
-            BinOp::Gt => l > r,
-            BinOp::Le => l <= r,
-            BinOp::Lt => l < r,
-            BinOp::Eq => l == r,
-            BinOp::Ne => l != r,
-            x => panic!("`run_compare` called on operator {x:?}"),
-        }
-    }
-
-    /// Convert an overflowing variant to its wrapping equivalent.
-    pub fn overflowing_to_wrapping(self) -> Option<Self> {
-        Some(match self {
-            BinOp::AddWithOverflow => BinOp::Add,
-            BinOp::SubWithOverflow => BinOp::Sub,
-            BinOp::MulWithOverflow => BinOp::Mul,
-            _ => return None,
-        })
-    }
-
-    /// Convert a wrapping variant to its overflowing equivalent.
-    pub fn wrapping_to_overflowing(self) -> Option<Self> {
-        Some(match self {
-            BinOp::Add => BinOp::AddWithOverflow,
-            BinOp::Sub => BinOp::SubWithOverflow,
-            BinOp::Mul => BinOp::MulWithOverflow,
-            _ => return None,
-        })
+pub fn arith_op_to_binop(value: hir_def::hir::ArithOp) -> BinOp {
+    match value {
+        hir_def::hir::ArithOp::Add => BinOp::Add,
+        hir_def::hir::ArithOp::Mul => BinOp::Mul,
+        hir_def::hir::ArithOp::Sub => BinOp::Sub,
+        hir_def::hir::ArithOp::Div => BinOp::Div,
+        hir_def::hir::ArithOp::Rem => BinOp::Rem,
+        hir_def::hir::ArithOp::Shl => BinOp::Shl,
+        hir_def::hir::ArithOp::Shr => BinOp::Shr,
+        hir_def::hir::ArithOp::BitXor => BinOp::BitXor,
+        hir_def::hir::ArithOp::BitOr => BinOp::BitOr,
+        hir_def::hir::ArithOp::BitAnd => BinOp::BitAnd,
     }
 }
 
-impl Display for BinOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            BinOp::Add => "+",
-            BinOp::Sub => "-",
-            BinOp::Mul => "*",
-            BinOp::Div => "/",
-            BinOp::Rem => "%",
-            BinOp::BitXor => "^",
-            BinOp::BitAnd => "&",
-            BinOp::BitOr => "|",
-            BinOp::Shl => "<<",
-            BinOp::Shr => ">>",
-            BinOp::Eq => "==",
-            BinOp::Lt => "<",
-            BinOp::Le => "<=",
-            BinOp::Ne => "!=",
-            BinOp::Ge => ">=",
-            BinOp::Gt => ">",
-            BinOp::Offset => "`offset`",
-            BinOp::AddWithOverflow => "`add_with_overflow`",
-            BinOp::SubWithOverflow => "`sub_with_overflow`",
-            BinOp::MulWithOverflow => "`mul_with_overflow`",
-            BinOp::AddUnchecked => "`add_unchecked`",
-            BinOp::SubUnchecked => "`sub_unchecked`",
-            BinOp::MulUnchecked => "`mul_unchecked`",
-            BinOp::ShlUnchecked => "`shl_unchecked`",
-            BinOp::ShrUnchecked => "`shr_unchecked`",
-            BinOp::Cmp => "`cmp`",
-        })
-    }
-}
-
-impl From<hir_def::hir::ArithOp> for BinOp {
-    fn from(value: hir_def::hir::ArithOp) -> Self {
-        match value {
-            hir_def::hir::ArithOp::Add => BinOp::Add,
-            hir_def::hir::ArithOp::Mul => BinOp::Mul,
-            hir_def::hir::ArithOp::Sub => BinOp::Sub,
-            hir_def::hir::ArithOp::Div => BinOp::Div,
-            hir_def::hir::ArithOp::Rem => BinOp::Rem,
-            hir_def::hir::ArithOp::Shl => BinOp::Shl,
-            hir_def::hir::ArithOp::Shr => BinOp::Shr,
-            hir_def::hir::ArithOp::BitXor => BinOp::BitXor,
-            hir_def::hir::ArithOp::BitOr => BinOp::BitOr,
-            hir_def::hir::ArithOp::BitAnd => BinOp::BitAnd,
-        }
-    }
-}
-
-impl From<hir_def::hir::CmpOp> for BinOp {
-    fn from(value: hir_def::hir::CmpOp) -> Self {
-        match value {
-            hir_def::hir::CmpOp::Eq { negated: false } => BinOp::Eq,
-            hir_def::hir::CmpOp::Eq { negated: true } => BinOp::Ne,
-            hir_def::hir::CmpOp::Ord { ordering: Ordering::Greater, strict: false } => BinOp::Ge,
-            hir_def::hir::CmpOp::Ord { ordering: Ordering::Greater, strict: true } => BinOp::Gt,
-            hir_def::hir::CmpOp::Ord { ordering: Ordering::Less, strict: false } => BinOp::Le,
-            hir_def::hir::CmpOp::Ord { ordering: Ordering::Less, strict: true } => BinOp::Lt,
-        }
+pub fn cmp_op_to_binop(value: hir_def::hir::CmpOp) -> BinOp {
+    match value {
+        hir_def::hir::CmpOp::Eq { negated: false } => BinOp::Eq,
+        hir_def::hir::CmpOp::Eq { negated: true } => BinOp::Ne,
+        hir_def::hir::CmpOp::Ord { ordering: Ordering::Greater, strict: false } => BinOp::Ge,
+        hir_def::hir::CmpOp::Ord { ordering: Ordering::Greater, strict: true } => BinOp::Gt,
+        hir_def::hir::CmpOp::Ord { ordering: Ordering::Less, strict: false } => BinOp::Le,
+        hir_def::hir::CmpOp::Ord { ordering: Ordering::Less, strict: true } => BinOp::Lt,
     }
 }
 

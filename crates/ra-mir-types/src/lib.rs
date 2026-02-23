@@ -4,6 +4,8 @@
 //! serializable via serde/postcard. They are produced by `ra-mir-export`
 //! (rustc driver) and consumed by `cg-clif` (r-a codegen).
 
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 
 /// Stable identity for a DefId, using (StableCrateId, local_def_path_hash).
@@ -132,13 +134,13 @@ pub enum Operand {
     Constant(ConstOperand),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstOperand {
     pub ty: Ty,
     pub kind: ConstKind,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstKind {
     /// Evaluated scalar: raw bits + size in bytes.
     Scalar(u128, u8),
@@ -197,7 +199,7 @@ pub enum AggregateKind {
 // Operators
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Rem,
     BitXor, BitAnd, BitOr, Shl, Shr,
@@ -207,11 +209,78 @@ pub enum BinOp {
     ShlUnchecked, ShrUnchecked,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UnOp {
     Not,
     Neg,
     PtrMetadata,
+}
+
+impl BinOp {
+    pub fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
+        match self {
+            BinOp::Ge => l >= r,
+            BinOp::Gt => l > r,
+            BinOp::Le => l <= r,
+            BinOp::Lt => l < r,
+            BinOp::Eq => l == r,
+            BinOp::Ne => l != r,
+            x => panic!("`run_compare` called on operator {x:?}"),
+        }
+    }
+
+    /// Convert an overflowing variant to its wrapping equivalent.
+    pub fn overflowing_to_wrapping(self) -> Option<Self> {
+        Some(match self {
+            BinOp::AddWithOverflow => BinOp::Add,
+            BinOp::SubWithOverflow => BinOp::Sub,
+            BinOp::MulWithOverflow => BinOp::Mul,
+            _ => return None,
+        })
+    }
+
+    /// Convert a wrapping variant to its overflowing equivalent.
+    pub fn wrapping_to_overflowing(self) -> Option<Self> {
+        Some(match self {
+            BinOp::Add => BinOp::AddWithOverflow,
+            BinOp::Sub => BinOp::SubWithOverflow,
+            BinOp::Mul => BinOp::MulWithOverflow,
+            _ => return None,
+        })
+    }
+}
+
+impl Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::BitXor => "^",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Eq => "==",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Ne => "!=",
+            BinOp::Ge => ">=",
+            BinOp::Gt => ">",
+            BinOp::Offset => "`offset`",
+            BinOp::AddWithOverflow => "`add_with_overflow`",
+            BinOp::SubWithOverflow => "`sub_with_overflow`",
+            BinOp::MulWithOverflow => "`mul_with_overflow`",
+            BinOp::AddUnchecked => "`add_unchecked`",
+            BinOp::SubUnchecked => "`sub_unchecked`",
+            BinOp::MulUnchecked => "`mul_unchecked`",
+            BinOp::ShlUnchecked => "`shl_unchecked`",
+            BinOp::ShrUnchecked => "`shr_unchecked`",
+            BinOp::Cmp => "`cmp`",
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,14 +315,14 @@ pub enum PointerCoercion {
 // Misc enums
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BorrowKind {
     Shared,
     Mut,
     Shallow,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Mutability {
     Not,
     Mut,
@@ -263,7 +332,7 @@ pub enum Mutability {
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     Bool,
     Char,
@@ -288,22 +357,22 @@ pub enum Ty {
     Opaque(String),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IntTy {
     Isize, I8, I16, I32, I64, I128,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UintTy {
     Usize, U8, U16, U32, U64, U128,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FloatTy {
     F16, F32, F64, F128,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GenericArg {
     Ty(Ty),
     Const(ConstOperand),
@@ -311,7 +380,7 @@ pub enum GenericArg {
     Lifetime,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExistentialPredicate {
     pub trait_ref: Option<(DefPathHash, Vec<GenericArg>)>,
 }

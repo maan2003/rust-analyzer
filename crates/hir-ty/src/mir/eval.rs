@@ -1229,6 +1229,9 @@ impl<'db> Evaluator<'db> {
                                     }
                                 }
                             }
+                            UnOp::PtrMetadata => {
+                                not_supported!("PtrMetadata unary op in MIR eval")
+                            }
                         }
                     }
                     Owned(c)
