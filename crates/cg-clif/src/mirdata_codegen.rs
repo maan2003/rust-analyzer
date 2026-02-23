@@ -66,6 +66,35 @@ fn build_mirdata_fn_sig(
     Ok(sig)
 }
 
+/// Build a best-effort signature, using pointer_type for locals without layouts.
+/// This is used for declaring generic functions in fn_registry so that calls
+/// to them don't cause verifier errors (wrong param count).
+fn build_mirdata_fn_sig_fallback(
+    isa: &dyn TargetIsa,
+    dl: &TargetDataLayout,
+    body: &Body,
+    layouts: &[LayoutArc],
+) -> Signature {
+    let pointer_type = crate::pointer_ty(dl);
+    let mut sig = Signature::new(isa.default_call_conv());
+
+    // Return type: locals[0]
+    match local_layout(&body.locals[0], layouts) {
+        Ok(ret_layout) => { crate::append_ret_to_sig(&mut sig, dl, &ret_layout); }
+        Err(_) => { sig.returns.push(AbiParam::new(pointer_type)); }
+    }
+
+    // Parameters: locals[1..=arg_count]
+    for i in 1..=body.arg_count as usize {
+        match local_layout(&body.locals[i], layouts) {
+            Ok(param_layout) => { crate::append_param_to_sig(&mut sig, dl, &param_layout); }
+            Err(_) => { sig.params.push(AbiParam::new(pointer_type)); }
+        }
+    }
+
+    sig
+}
+
 // ---------------------------------------------------------------------------
 // Place codegen (projections)
 // ---------------------------------------------------------------------------
@@ -4141,7 +4170,9 @@ mod tests {
             let fn_name = format!("__mirdata_{}_{}", i, fb.name.replace(|c: char| !c.is_alphanumeric(), "_"));
             let sig = build_mirdata_fn_sig(&*isa, &dl, &fb.body, &layouts)
                 .unwrap_or_else(|_| {
-                    // Fallback: void→void for functions whose locals lack layouts
+                    // Fallback: void→void for functions whose locals lack layouts.
+                    // The call site may get verifier errors, but this is better than
+                    // using wrong-sized types that cause bitcast panics.
                     Signature::new(isa.default_call_conv())
                 });
             let func_id = module
