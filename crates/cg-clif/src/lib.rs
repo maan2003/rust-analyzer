@@ -12,7 +12,7 @@ use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Block, InstBuilder, MemFl
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{AssocItemId, CallableDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId};
@@ -114,6 +114,10 @@ pub(crate) struct FunctionCx<'a, M: Module> {
     pub(crate) block_map: Vec<Block>,
     /// MIR local → CPlace (indexed by raw local id)
     pub(crate) local_map: Vec<CPlace>,
+    /// Drop flags: local raw index → boolean Variable (i8: 0=dead, 1=live).
+    /// Only present for locals that have drop glue. Checked in codegen_drop
+    /// to skip drops on moved-out locals (r-a's MIR lacks drop elaboration).
+    pub(crate) drop_flags: HashMap<u32, Variable>,
 }
 
 impl<'a, M: Module> FunctionCx<'a, M> {
@@ -166,6 +170,24 @@ impl<'a, M: Module> FunctionCx<'a, M> {
 
     fn local_place_idx(&self, idx: usize) -> &CPlace {
         &self.local_map[idx]
+    }
+
+    /// Set the drop flag for a local to "live" (1). Called on assignment.
+    fn set_drop_flag(&mut self, local: LocalId) {
+        let idx = local.into_raw().into_u32();
+        if let Some(&var) = self.drop_flags.get(&idx) {
+            let one = self.bcx.ins().iconst(types::I8, 1);
+            self.bcx.def_var(var, one);
+        }
+    }
+
+    /// Clear the drop flag for a local to "dead" (0). Called on move.
+    fn clear_drop_flag(&mut self, local: LocalId) {
+        let idx = local.into_raw().into_u32();
+        if let Some(&var) = self.drop_flags.get(&idx) {
+            let zero = self.bcx.ins().iconst(types::I8, 0);
+            self.bcx.def_var(var, zero);
+        }
     }
 }
 
@@ -878,6 +900,10 @@ fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &StatementKind)
     match stmt {
         StatementKind::Assign(place, rvalue) => {
             codegen_assign(fx, place, rvalue);
+            // Mark the destination local as live for drop-flag tracking.
+            if place.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                fx.set_drop_flag(place.local);
+            }
         }
         StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
         StatementKind::Nop | StatementKind::FakeRead(_) => {}
@@ -1602,8 +1628,16 @@ fn codegen_operand(
                 }
             }
         }
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
+        OperandKind::Copy(place) => {
             codegen_place(fx, place).to_cvalue(fx)
+        }
+        OperandKind::Move(place) => {
+            let val = codegen_place(fx, place).to_cvalue(fx);
+            // Clear drop flag: the value has been moved out.
+            if place.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                fx.clear_drop_flag(place.local);
+            }
+            val
         }
         OperandKind::Static(_) => todo!("static operand"),
     }
@@ -1753,6 +1787,19 @@ fn codegen_drop(
     if !hir_ty::drop::has_drop_glue_mono(interner, ty.as_ref()) {
         fx.bcx.ins().jump(target_block, &[]);
         return;
+    }
+
+    // Check drop flag: skip if the local has been moved out.
+    // Only simple locals (no projections) have drop flags.
+    let projections = place.projection.lookup(&fx.ra_body().projection_store);
+    if projections.is_empty() {
+        let local_idx = place.local.into_raw().into_u32();
+        if let Some(&flag_var) = fx.drop_flags.get(&local_idx) {
+            let flag_val = fx.bcx.use_var(flag_var);
+            let do_drop_block = fx.bcx.create_block();
+            fx.bcx.ins().brif(flag_val, do_drop_block, &[], target_block, &[]);
+            fx.bcx.switch_to_block(do_drop_block);
+        }
     }
 
     // Get a pointer to the place (drop takes *mut T / &mut self).
@@ -3378,6 +3425,32 @@ pub fn compile_fn(
             }
         }
 
+        // Create drop flags for locals that have drop glue.
+        // r-a's MIR lacks drop elaboration, so Drop terminators fire even
+        // for locals that have been moved out. Drop flags (0=dead, 1=live)
+        // let codegen_drop skip drops on moved-out locals.
+        let mut drop_flags = HashMap::new();
+        {
+            let interner = DbInterner::new_with(db, local_crate);
+            for (local_id, local) in body.locals.iter() {
+                let local_ty = &local.ty;
+                if hir_ty::drop::has_drop_glue_mono(interner, local_ty.as_ref()) {
+                    let var = bcx.declare_var(types::I8);
+                    let zero = bcx.ins().iconst(types::I8, 0);
+                    bcx.def_var(var, zero);
+                    drop_flags.insert(local_id.into_raw().into_u32(), var);
+                }
+            }
+            // Parameters are live on entry.
+            for &param_local in &body.param_locals {
+                let idx = param_local.into_raw().into_u32();
+                if let Some(&var) = drop_flags.get(&idx) {
+                    let one = bcx.ins().iconst(types::I8, 1);
+                    bcx.def_var(var, one);
+                }
+            }
+        }
+
         let mut fx = FunctionCx {
             bcx,
             module,
@@ -3393,6 +3466,7 @@ pub fn compile_fn(
             },
             block_map,
             local_map,
+            drop_flags,
         };
 
         // Codegen each basic block

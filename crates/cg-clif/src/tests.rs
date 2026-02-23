@@ -1884,6 +1884,98 @@ fn foo() -> i32 {
     assert_eq!(result, 42);
 }
 
+#[test]
+fn jit_heap_alloc_basic() {
+    // Simulate Vec-like heap allocation: malloc, write through pointer,
+    // read back, free. Exercises extern calls + raw pointer ops.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: sized, copy
+//- /main.rs
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+fn at(base: *mut i32, idx: usize) -> *mut i32 {
+    (base as usize + idx * 4) as *mut i32
+}
+
+fn foo() -> i32 {
+    unsafe {
+        let ptr = malloc(12) as *mut i32; // room for 3 i32s
+        *at(ptr, 0) = 10;
+        *at(ptr, 1) = 20;
+        *at(ptr, 2) = 30;
+        let val = *at(ptr, 1); // read second element
+        free(ptr as *mut u8);
+        val
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 20);
+}
+
+#[test]
+fn jit_heap_vec_like() {
+    // A manual Vec-like struct: heap-allocate, write elements, read back,
+    // auto-drop deallocates. Exercises: extern calls, raw ptr ops, struct
+    // with Drop, field access, and drop_in_place glue.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+struct IntBuf {
+    ptr: *mut i32,
+    len: usize,
+}
+
+impl IntBuf {
+    fn new(cap: usize) -> IntBuf {
+        IntBuf {
+            ptr: unsafe { malloc(cap * 4) } as *mut i32,
+            len: 0,
+        }
+    }
+    fn push(&mut self, val: i32) {
+        let dest = (self.ptr as usize + self.len * 4) as *mut i32;
+        unsafe { *dest = val; }
+        self.len = self.len + 1;
+    }
+    fn get(&self, idx: usize) -> i32 {
+        let src = (self.ptr as usize + idx * 4) as *const i32;
+        unsafe { *src }
+    }
+}
+
+impl Drop for IntBuf {
+    fn drop(&mut self) {
+        unsafe { free(self.ptr as *mut u8); }
+    }
+}
+
+fn foo() -> i32 {
+    let mut buf = IntBuf::new(4);
+    buf.push(10);
+    buf.push(20);
+    buf.push(30);
+    let val = buf.get(1);
+    // buf is dropped here, calling free()
+    val
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 20);
+}
+
 // ---------------------------------------------------------------------------
 // Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
 // ---------------------------------------------------------------------------

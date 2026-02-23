@@ -284,6 +284,7 @@ pub fn compile_mirdata_fn(
             mir: MirSource::Mirdata { body, layouts },
             block_map,
             local_map,
+            drop_flags: std::collections::HashMap::new(),
         };
 
         // Codegen blocks
