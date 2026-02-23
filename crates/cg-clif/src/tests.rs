@@ -1774,6 +1774,51 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn jit_str_constant() {
+    // Verify that &str constants work: the data pointer points to a valid
+    // data section and the length is correct. We use transmute to extract
+    // the (pointer, length) pair from the fat pointer.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: sized, copy
+//- /main.rs
+#[rustc_intrinsic]
+unsafe fn transmute<Src, Dst>(src: Src) -> Dst { loop {} }
+
+fn foo() -> i32 {
+    let s: &str = "hello";
+    let pair: (usize, usize) = unsafe { transmute(s) };
+    pair.1 as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 5);
+}
+
+#[test]
+fn jit_str_constant_read_byte() {
+    // Verify that the data pointer in a &str constant points to the actual
+    // string bytes by reading the first byte through a raw pointer.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: sized, copy
+//- /main.rs
+#[rustc_intrinsic]
+unsafe fn transmute<Src, Dst>(src: Src) -> Dst { loop {} }
+
+fn foo() -> i32 {
+    let s: &str = "hello";
+    let (ptr, _len): (*const u8, usize) = unsafe { transmute(s) };
+    unsafe { *ptr as i32 }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 104); // 'h' = 104
+}
+
+#[test]
 fn jit_drop_field_recursive() {
     // Verify that dropping a struct without a Drop impl still drops its fields.
     // Outer has no Drop impl, but contains Inner which does.

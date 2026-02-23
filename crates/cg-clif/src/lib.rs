@@ -352,6 +352,12 @@ fn codegen_cast(
 
     let from_ty = operand_ty(fx.db(), body, &operand.kind);
     let from_cval = codegen_operand(fx, &operand.kind);
+
+    // Handle Transmute: reinterpret the bits with a different layout.
+    if let CastKind::Transmute = kind {
+        return codegen_transmute(fx, from_cval, result_layout);
+    }
+
     let from_val = from_cval.load_scalar(fx);
     let from_clif_ty = fx.bcx.func.dfg.value_type(from_val);
 
@@ -396,24 +402,62 @@ fn codegen_cast(
             let from_signed = ty_is_signed_int(from_ty);
             codegen_intcast(fx, from_val, target_clif_ty, from_signed)
         }
-        CastKind::Transmute => {
-            assert_eq!(
-                from_cval.layout.size, result_layout.size,
-                "transmute between differently-sized types"
-            );
-            if from_clif_ty == target_clif_ty {
-                from_val
-            } else if from_clif_ty.bits() == target_clif_ty.bits() {
-                fx.bcx.ins().bitcast(target_clif_ty, MemFlags::new(), from_val)
-            } else {
-                unreachable!(
-                    "transmute between mismatched clif types: {from_clif_ty:?} -> {target_clif_ty:?}"
-                );
-            }
-        }
+        CastKind::Transmute => unreachable!("handled above"),
         CastKind::DynStar => todo!("dyn* cast"),
     };
     CValue::by_val(val, result_layout.clone())
+}
+
+/// Handle `CastKind::Transmute`: reinterpret bits with a different layout.
+/// Reference: cg_clif/src/value_and_place.rs `write_cvalue_transmute`
+fn codegen_transmute(
+    fx: &mut FunctionCx<'_, impl Module>,
+    from: CValue,
+    target_layout: &LayoutArc,
+) -> CValue {
+    assert_eq!(
+        from.layout.size, target_layout.size,
+        "transmute between differently-sized types: {:?} vs {:?}",
+        from.layout.size, target_layout.size,
+    );
+
+    match (&from.layout.backend_repr, &target_layout.backend_repr) {
+        (BackendRepr::ScalarPair(_, _), BackendRepr::ScalarPair(b_a, b_b)) => {
+            // ScalarPair→ScalarPair: load both halves, bitcast each if types differ.
+            let (val_a, val_b) = from.load_scalar_pair(fx);
+            let dst_a = scalar_to_clif_type(fx.dl, b_a);
+            let dst_b = scalar_to_clif_type(fx.dl, b_b);
+            let a = clif_bitcast(fx, val_a, dst_a);
+            let b = clif_bitcast(fx, val_b, dst_b);
+            CValue::by_val_pair(a, b, target_layout.clone())
+        }
+        (BackendRepr::Scalar(_), BackendRepr::Scalar(dst_scalar)) => {
+            let val = from.load_scalar(fx);
+            let dst_ty = scalar_to_clif_type(fx.dl, dst_scalar);
+            let val = clif_bitcast(fx, val, dst_ty);
+            CValue::by_val(val, target_layout.clone())
+        }
+        _ => {
+            // Different representations: spill to stack, reload with new layout.
+            let ptr = from.force_stack(fx);
+            CValue::by_ref(ptr, target_layout.clone())
+        }
+    }
+}
+
+/// Bitcast a Cranelift value to a different type of the same size.
+/// Returns unchanged if types already match.
+fn clif_bitcast(
+    fx: &mut FunctionCx<'_, impl Module>,
+    val: Value,
+    dst_ty: Type,
+) -> Value {
+    let src_ty = fx.bcx.func.dfg.value_type(val);
+    if src_ty == dst_ty {
+        val
+    } else {
+        fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val)
+    }
 }
 
 /// Handle `PointerCoercion(Unsize)`: `&T → &dyn Trait`.
@@ -1508,7 +1552,8 @@ fn codegen_operand(
                     let ConstKind::Value(val) = konst.as_ref().kind() else {
                         panic!("non-value const in ScalarPair constant");
                     };
-                    let bytes = &val.value.inner().memory;
+                    let const_bytes = val.value.inner();
+                    let bytes = &const_bytes.memory;
                     let a_size = a_scalar.size(fx.dl).bytes() as usize;
                     let b_offset = a_scalar.size(fx.dl).align_to(b_scalar.align(fx.dl).abi).bytes() as usize;
                     let b_size = b_scalar.size(fx.dl).bytes() as usize;
@@ -1526,10 +1571,18 @@ fn codegen_operand(
                         i64::from_le_bytes(buf)
                     };
 
-                    let a_clif = scalar_to_clif_type(fx.dl, &a_scalar);
-                    let b_clif = scalar_to_clif_type(fx.dl, &b_scalar);
-                    let a_val = fx.bcx.ins().iconst(a_clif, a_raw);
-                    let b_val = fx.bcx.ins().iconst(b_clif, b_raw);
+                    // Create data sections for allocations in the memory_map,
+                    // building a mapping of old addresses → GlobalValues.
+                    let addr_to_gv = create_const_data_sections(
+                        fx, &const_bytes.memory_map,
+                    );
+
+                    let a_val = codegen_scalar_const(
+                        fx, &a_scalar, a_raw, &addr_to_gv,
+                    );
+                    let b_val = codegen_scalar_const(
+                        fx, &b_scalar, b_raw, &addr_to_gv,
+                    );
                     CValue::by_val_pair(a_val, b_val, layout)
                 }
                 _ => {
@@ -1553,6 +1606,72 @@ fn codegen_operand(
             codegen_place(fx, place).to_cvalue(fx)
         }
         OperandKind::Static(_) => todo!("static operand"),
+    }
+}
+
+/// Create anonymous data sections for each allocation in a `MemoryMap`,
+/// returning a mapping from virtual address → Cranelift GlobalValue.
+fn create_const_data_sections(
+    fx: &mut FunctionCx<'_, impl Module>,
+    memory_map: &hir_ty::MemoryMap<'_>,
+) -> HashMap<usize, cranelift_codegen::ir::GlobalValue> {
+    use hir_ty::MemoryMap;
+    let mut map = HashMap::new();
+    match memory_map {
+        MemoryMap::Empty => {}
+        MemoryMap::Simple(data) => {
+            let mut data_desc = DataDescription::new();
+            data_desc.define(data.to_vec().into_boxed_slice());
+            let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+            fx.module.define_data(data_id, &data_desc).unwrap();
+            let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+            map.insert(0usize, gv);
+        }
+        MemoryMap::Complex(cm) => {
+            for (addr, data) in cm.memory_iter() {
+                let mut data_desc = DataDescription::new();
+                data_desc.define(data.to_vec().into_boxed_slice());
+                let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+                fx.module.define_data(data_id, &data_desc).unwrap();
+                let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+                map.insert(*addr, gv);
+            }
+        }
+    }
+    map
+}
+
+/// Emit a Cranelift Value for a single scalar constant.
+/// If the scalar is a pointer and the address matches an entry in `addr_to_gv`,
+/// emits a `symbol_value` (relocation). Otherwise, emits an `iconst` or float const.
+fn codegen_scalar_const(
+    fx: &mut FunctionCx<'_, impl Module>,
+    scalar: &Scalar,
+    raw: i64,
+    addr_to_gv: &HashMap<usize, cranelift_codegen::ir::GlobalValue>,
+) -> Value {
+    match scalar.primitive() {
+        Primitive::Pointer(_) => {
+            let addr = raw as usize;
+            if let Some(&gv) = addr_to_gv.get(&addr) {
+                fx.bcx.ins().symbol_value(fx.pointer_type, gv)
+            } else if addr == 0 {
+                fx.bcx.ins().iconst(fx.pointer_type, 0)
+            } else {
+                // Unknown address — treat as raw integer (shouldn't normally happen)
+                fx.bcx.ins().iconst(fx.pointer_type, raw)
+            }
+        }
+        Primitive::Float(rustc_abi::Float::F32) => {
+            fx.bcx.ins().f32const(f32::from_bits(raw as u32))
+        }
+        Primitive::Float(rustc_abi::Float::F64) => {
+            fx.bcx.ins().f64const(f64::from_bits(raw as u64))
+        }
+        _ => {
+            let clif_ty = scalar_to_clif_type(fx.dl, scalar);
+            fx.bcx.ins().iconst(clif_ty, raw)
+        }
     }
 }
 

@@ -128,6 +128,11 @@ pub struct ComplexMemoryMap<'db> {
 }
 
 impl ComplexMemoryMap<'_> {
+    /// Iterate over memory allocations as `(address, data)` pairs.
+    pub fn memory_iter(&self) -> impl Iterator<Item = (&usize, &[u8])> {
+        self.memory.iter().map(|(addr, data)| (addr, data.as_ref()))
+    }
+
     fn insert(&mut self, addr: usize, val: Box<[u8]>) {
         match self.memory.entry(addr) {
             Entry::Occupied(mut e) => {
