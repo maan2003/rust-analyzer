@@ -132,7 +132,7 @@ pub(crate) struct CPlace {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum CPlaceInner {
+enum CPlaceInner {
     Var(Variable),
     VarPair(Variable, Variable),
     Addr(Pointer, Option<Value>),
