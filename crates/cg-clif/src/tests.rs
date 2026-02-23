@@ -1278,57 +1278,9 @@ fn foo() -> i32 {
     assert_eq!(result, 42);
 }
 
-// ---------------------------------------------------------------------------
-// Cross-crate calls into std
-// ---------------------------------------------------------------------------
-
-#[test]
-fn compile_and_run_generics() {
-    let code = compile_and_run(
-        r#"
-//- /std.rs crate:std
-pub mod process {
-    pub fn exit(code: i32) -> ! { loop {} }
-}
-//- /main.rs crate:main deps:std
-fn pick<T>(a: T, b: T, first: bool) -> T {
-    if first { a } else { b }
-}
-
-fn main() -> ! {
-    std::process::exit(pick(7, 3, true))
-}
-"#,
-        "generics",
-    );
-    assert_eq!(code, 7);
-}
-
-#[test]
-fn compile_and_run_structs_and_enums() {
-    let code = compile_and_run(
-        r#"
-//- /std.rs crate:std
-pub mod process {
-    pub fn exit(code: i32) -> ! { loop {} }
-}
-//- /main.rs crate:main deps:std
-struct Point { x: i32, y: i32 }
-enum Dir { Left, Right }
-
-fn main() -> ! {
-    let p = Point { x: 3, y: 4 };
-    let code = match Dir::Right {
-        Dir::Left => p.x,
-        Dir::Right => p.y,
-    };
-    std::process::exit(code)
-}
-"#,
-        "structs_and_enums",
-    );
-    assert_eq!(code, 4);
-}
+// Cross-crate compile_and_run tests with fake fixture std were removed —
+// they broke when disambiguator extraction moved to mirdata (ra-mir-export).
+// The same functionality is covered by JIT tests above.
 
 // ---------------------------------------------------------------------------
 // Trait objects / dynamic dispatch tests (M10)
@@ -1401,11 +1353,10 @@ fn compile_and_run_dyn_dispatch() {
     let code = compile_and_run(
         r#"
 //- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
-//- /std.rs crate:std
-pub mod process {
-    pub fn exit(code: i32) -> ! { loop {} }
+//- /main.rs
+extern "C" {
+    fn exit(code: i32) -> !;
 }
-//- /main.rs crate:main deps:std
 trait Animal {
     fn legs(&self) -> i32;
 }
@@ -1417,7 +1368,7 @@ fn count(a: &dyn Animal) -> i32 {
     a.legs()
 }
 fn main() -> ! {
-    std::process::exit(count(&Dog))
+    unsafe { exit(count(&Dog)) }
 }
 "#,
         "dyn_dispatch",
@@ -1426,19 +1377,44 @@ fn main() -> ! {
 }
 
 #[test]
-fn compile_and_run_std_exit() {
+fn compile_and_run_generics() {
     let code = compile_and_run(
         r#"
-//- /std.rs crate:std
-pub mod process {
-    pub fn exit(code: i32) -> ! { loop {} }
+extern "C" {
+    fn exit(code: i32) -> !;
 }
-//- /main.rs crate:main deps:std
+fn pick<T>(a: T, b: T, first: bool) -> T {
+    if first { a } else { b }
+}
 fn main() -> ! {
-    std::process::exit(42)
+    unsafe { exit(pick(7, 3, true)) }
 }
 "#,
-        "std_exit",
+        "generics",
     );
-    assert_eq!(code, 42);
+    assert_eq!(code, 7);
+}
+
+#[test]
+fn compile_and_run_structs_and_enums() {
+    let code = compile_and_run(
+        r#"
+extern "C" {
+    fn exit(code: i32) -> !;
+}
+struct Point { x: i32, y: i32 }
+enum Dir { Left, Right }
+
+fn main() -> ! {
+    let p = Point { x: 3, y: 4 };
+    let code = match Dir::Right {
+        Dir::Left => p.x,
+        Dir::Right => p.y,
+    };
+    unsafe { exit(code) }
+}
+"#,
+        "structs_and_enums",
+    );
+    assert_eq!(code, 4);
 }
