@@ -872,7 +872,38 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 );
                 cur_ty = elem_ty;
             }
-            ProjectionElem::ConstantIndex { .. } => todo!("ConstantIndex projection"),
+            ProjectionElem::ConstantIndex { offset, from_end } => {
+                let elem_ty = match cur_ty.as_ref().kind() {
+                    TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
+                    _ => panic!("ConstantIndex on non-array/slice type"),
+                };
+                let elem_layout = fx.db()
+                    .layout_of_ty(elem_ty.clone(), fx.env().clone())
+                    .expect("elem layout");
+                let index = if !*from_end {
+                    fx.bcx.ins().iconst(fx.pointer_type, *offset as i64)
+                } else {
+                    // from_end: get array length from layout
+                    let arr_len = match &cplace.layout.fields {
+                        rustc_abi::FieldsShape::Array { count, .. } => {
+                            fx.bcx.ins().iconst(fx.pointer_type, *count as i64)
+                        }
+                        _ => panic!("ConstantIndex from_end on non-array layout"),
+                    };
+                    fx.bcx.ins().iadd_imm(arr_len, -(*offset as i64))
+                };
+                if cplace.is_register() {
+                    let cval = cplace.to_cvalue(fx);
+                    let ptr = cval.force_stack(fx);
+                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                }
+                let byte_offset = fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64);
+                cplace = CPlace::for_ptr(
+                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, byte_offset),
+                    elem_layout,
+                );
+                cur_ty = elem_ty;
+            }
             ProjectionElem::Subslice { .. } => todo!("Subslice projection"),
             ProjectionElem::OpaqueCast(_) => todo!("OpaqueCast projection"),
         }
@@ -1212,7 +1243,16 @@ fn codegen_aggregate(
             todo!("Union aggregate")
         }
         AggregateKind::RawPtr(_, _) => {
-            todo!("RawPtr aggregate")
+            // RawPtr aggregate: (data_ptr, metadata) → thin or fat pointer
+            assert_eq!(operands.len(), 2, "RawPtr aggregate must have 2 operands");
+            let data = codegen_operand(fx, &operands[0].kind);
+            let meta = codegen_operand(fx, &operands[1].kind);
+            let result = if meta.layout.is_zst() {
+                CValue::by_val(data.load_scalar(fx), dest.layout.clone())
+            } else {
+                CValue::by_val_pair(data.load_scalar(fx), meta.load_scalar(fx), dest.layout.clone())
+            };
+            dest.write_cvalue(fx, result);
         }
     }
 }
@@ -1626,6 +1666,18 @@ fn codegen_unop(
 ) -> CValue {
     let body = fx.ra_body();
     let cval = codegen_operand(fx, &operand.kind);
+
+    // PtrMetadata operates on ScalarPair, handle before load_scalar
+    if matches!(op, UnOp::PtrMetadata) {
+        return match cval.layout.backend_repr {
+            BackendRepr::Scalar(_) => CValue::zst(result_layout.clone()),
+            BackendRepr::ScalarPair(_, _) => {
+                CValue::by_val(cval.load_scalar_pair(fx).1, result_layout.clone())
+            }
+            _ => panic!("PtrMetadata on unexpected repr"),
+        };
+    }
+
     let val = cval.load_scalar(fx);
     let result = match op {
         UnOp::Not => {
@@ -1646,7 +1698,7 @@ fn codegen_unop(
                 Primitive::Pointer(_) => unreachable!("neg on pointer"),
             }
         }
-        UnOp::PtrMetadata => todo!("PtrMetadata in codegen"),
+        UnOp::PtrMetadata => unreachable!("handled above"),
     };
     CValue::by_val(result, result_layout.clone())
 }
