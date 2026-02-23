@@ -162,3 +162,94 @@ These are intentional gaps — uncommon or unstable features.
 3. `UnwindAction` enum -- rustc uses this instead of `Option<BasicBlockId>` for unwind. Only matters for panic=unwind.
 4. Lower more intrinsics to MIR constructs (e.g. `offset` → `BinOp::Offset`) as needed by codegen.
 5. Keep using explicit `minicore: ptr_offset` in fixtures that need source-level raw-pointer methods; bare fixtures intentionally stay minimal.
+
+## Sysroot MIR export quality (ra-mir-export)
+
+`ra-mir-export` exports optimized MIR from sysroot crates to `.mirdata` files.
+8111 function bodies from 20 crates, 0 translation failures.
+
+### Construct coverage (from /tmp/sysroot.mirdata analysis)
+
+**Statements (79217 total):**
+
+| Kind | Count | Notes |
+|------|-------|-------|
+| StorageDead | 29465 | |
+| StorageLive | 26279 | |
+| Assign | 23473 | |
+
+Skipped (not needed for codegen): `FakeRead`, `PlaceMention`, `AscribeUserType`,
+`Coverage`, `ConstEvalCounter`, `Retag`, `Intrinsic`, `BackwardIncompatibleDropHint`.
+
+**Terminators (39224 total):**
+
+| Kind | Count | Notes |
+|------|-------|-------|
+| Call | 22957 | |
+| Return | 7803 | |
+| Goto | 4129 | |
+| SwitchInt | 2711 | |
+| Unreachable | 651 | Includes fallback from TailCall/Yield/CoroutineDrop/InlineAsm |
+| Drop | 565 | |
+| Assert | 226 | |
+| UnwindResume | 182 | |
+
+**Rvalues (23473 assigns):**
+
+| Kind | Count | Notes |
+|------|-------|-------|
+| Cast | 6857 | |
+| Use | 6274 | |
+| BinaryOp | 3979 | |
+| Aggregate | 3318 | |
+| Ref | 1058 | |
+| Discriminant | 1028 | |
+| UnaryOp | 471 | |
+| RawPtr | 461 | |
+| Repeat | 22 | |
+| ThreadLocalRef | 5 | |
+
+### Constant quality (35392 total)
+
+| ConstKind | Count | % | Notes |
+|-----------|-------|---|-------|
+| ZeroSized | 23169 | 65.5% | FnDef types, unit values |
+| Scalar | 5407 | 15.3% | Integer/float/bool literals |
+| Unevaluated | 4746 | 13.4% | DefPathHash + generic args preserved |
+| Todo | 1831 | 5.2% | Fallback (see below) |
+| Slice | 239 | 0.7% | String literals, byte slices |
+
+**ConstKind::Todo breakdown (1831):**
+
+| Category | Count | Notes |
+|----------|-------|-------|
+| SIMD const generics (`IMM8`, `ROUNDING`, `SAE`, `SCALE`, etc.) | ~1500 | From `core::arch` / `compiler_builtins`. Not needed for core/alloc/std. |
+| `indirect_const` | 204 | Constants stored in allocations (large arrays, struct literals). |
+| `ptr:allocNN` | ~20 | Pointer constants to static data. |
+| Other const params | ~100 | Various const generic params without scalar leaves. |
+
+### Type quality (172536 total)
+
+| Category | Count | % |
+|----------|-------|---|
+| Concrete types | 168453 | 97.6% |
+| `Ty::Opaque` fallback | 4083 | 2.4% |
+
+**All 4083 opaque types are `Alias(Projection, ...)`** -- associated type projections
+like `<F as FnOnce>::Output`, `<Self as Iterator>::Item`. Concentrated in:
+- `compiler_builtins` (~1900) -- SIMD trait impls
+- `gimli` / `object` (~900) -- debug info/unwinding libraries
+- `core` (~250) -- generic trait impls
+
+These are expected for generic function bodies and resolve during monomorphization.
+
+### Assessment for M11 (Vec, heap allocation)
+
+The export quality is sufficient for consuming MIR bodies for core/alloc/std:
+- Todo/Opaque fallbacks are concentrated in SIMD intrinsics (`compiler_builtins`,
+  `core::arch`) and debug info libraries (`gimli`, `object`), not in
+  core/alloc/std functions needed for Vec and heap allocation.
+- 94.8% of constants are fully resolved (ZeroSized + Scalar + Unevaluated + Slice).
+- 97.6% of types are fully resolved.
+- Associated type projections (`Alias(Projection, ...)`) in generic bodies
+  resolve to concrete types during monomorphization.

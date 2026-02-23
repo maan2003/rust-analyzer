@@ -277,6 +277,7 @@ dependencies = [
  "postcard",
  "ra-ap-rustc_abi",
  "ra-ap-rustc_type_ir",
+ "ra-mir-types",
  "rac-abi",
  "salsa",
  "salsa-macros",
@@ -2434,6 +2435,14 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
+]
+
+[[package]]
+name = "ra-mir-types"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]

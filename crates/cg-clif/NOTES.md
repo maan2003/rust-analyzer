@@ -160,11 +160,41 @@ What's missing:
 - Remaining casts (`DynStar`, wide-pointer coercions)
 - Intrinsics beyond pointer offset/distance
 - Drop glue
+- Cross-crate generic function codegen (MIR bodies now available via .mirdata)
+
+## MIR export from sysroot (M13/M14)
+
+`ra-mir-export` (rustc driver) now exports optimized MIR for sysroot functions
+to `.mirdata` files. Shared types live in `crates/ra-mir-types/`.
+
+- **8111 function bodies** exported (2382 generic, 5729 monomorphic/#[inline])
+- Covers all 20 sysroot crates (core, alloc, std, etc.)
+- Translation handles: all statement/terminator/rvalue/operand/type variants
+  that appear in optimized MIR. Unsupported constructs fall back to
+  `Ty::Opaque` / `ConstKind::Todo` with debug strings.
+- `cg-clif` deserializes `MirData` for crate disambiguators; body consumption
+  comes in a later milestone.
+
+### .mirdata format
+
+`postcard(MirData { crates: Vec<CrateInfo>, bodies: Vec<FnBody> })`
+
+Each `FnBody` carries a `DefPathHash` (StableCrateId + local hash) for
+stable cross-crate identity, the human-readable path, generic param count,
+and a full `Body` (locals, arg_count, basic blocks with statements and
+terminators).
+
+### Regenerating
+
+```
+cd ra-mir-export && cargo run --release -- -o /tmp/sysroot.mirdata
+```
 
 Next steps (easiest to port):
 1. Explicit discriminant values via `db.const_eval_discriminant()`
 2. Closure field type resolution
 3. Remaining cast/intrinsic/drop-glue coverage
+4. Cross-crate generic monomorphization using exported MIR bodies
 
 ## Original cg_clif architecture
 

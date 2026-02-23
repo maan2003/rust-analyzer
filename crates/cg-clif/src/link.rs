@@ -13,14 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::{Deserialize, Serialize};
-
-/// Crate name + StableCrateId, matching the format produced by `ra-mir-export`.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CrateInfo {
-    pub name: String,
-    pub stable_crate_id: u64,
-}
+use ra_mir_types::{CrateInfo, MirData};
 
 /// Get the target library directory from the host `rustc`.
 pub fn find_target_libdir() -> Result<PathBuf, String> {
@@ -103,11 +96,11 @@ pub fn load_crate_disambiguators(mirdata_path: &Path) -> Result<HashMap<String, 
     let data = std::fs::read(mirdata_path)
         .map_err(|e| format!("failed to read {}: {e}", mirdata_path.display()))?;
 
-    let infos: Vec<CrateInfo> = postcard::from_bytes(&data)
+    let mir_data: MirData = postcard::from_bytes(&data)
         .map_err(|e| format!("failed to deserialize {}: {e}", mirdata_path.display()))?;
 
     let mut map = HashMap::new();
-    for info in infos {
+    for info in mir_data.crates {
         map.insert(info.name, info.stable_crate_id);
     }
     Ok(map)
@@ -163,16 +156,19 @@ mod tests {
 
     #[test]
     fn mirdata_roundtrip() {
-        let infos = vec![
-            CrateInfo { name: "std".to_string(), stable_crate_id: 0x1234 },
-            CrateInfo { name: "core".to_string(), stable_crate_id: 0x5678 },
-        ];
-        let data = postcard::to_allocvec(&infos).expect("serialize");
-        let decoded: Vec<CrateInfo> = postcard::from_bytes(&data).expect("deserialize");
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].name, "std");
-        assert_eq!(decoded[0].stable_crate_id, 0x1234);
-        assert_eq!(decoded[1].name, "core");
-        assert_eq!(decoded[1].stable_crate_id, 0x5678);
+        let mir_data = MirData {
+            crates: vec![
+                CrateInfo { name: "std".to_string(), stable_crate_id: 0x1234 },
+                CrateInfo { name: "core".to_string(), stable_crate_id: 0x5678 },
+            ],
+            bodies: vec![],
+        };
+        let data = postcard::to_allocvec(&mir_data).expect("serialize");
+        let decoded: MirData = postcard::from_bytes(&data).expect("deserialize");
+        assert_eq!(decoded.crates.len(), 2);
+        assert_eq!(decoded.crates[0].name, "std");
+        assert_eq!(decoded.crates[0].stable_crate_id, 0x1234);
+        assert_eq!(decoded.crates[1].name, "core");
+        assert_eq!(decoded.crates[1].stable_crate_id, 0x5678);
     }
 }
