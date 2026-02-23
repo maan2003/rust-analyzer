@@ -925,6 +925,11 @@ fn codegen_md_call(
 }
 
 /// Emit a direct call (func_ref already resolved) with memory-repr support.
+///
+/// If the callee's declared signature doesn't match the actual arguments
+/// (e.g. it was declared as void→void because it's a generic stub), we
+/// convert to `call_indirect` with a signature derived from the actual
+/// arguments and destination type. This avoids Cranelift verifier errors.
 fn emit_md_call_direct(
     fx: &mut FunctionCx<'_, impl Module>,
     func_ref: cranelift_codegen::ir::FuncRef,
@@ -947,8 +952,51 @@ fn emit_md_call_direct(
 
     push_md_call_args(fx, args, &mut call_args);
 
-    let call = fx.bcx.ins().call(func_ref, &call_args);
-    store_md_call_result(fx, call, dest_place, sret_slot);
+    // Check if the declared signature matches the actual call arguments.
+    let sig_ref = fx.bcx.func.dfg.ext_funcs[func_ref].signature;
+    let declared_sig = &fx.bcx.func.dfg.signatures[sig_ref];
+    let declared_params = declared_sig.params.len();
+    let declared_returns = declared_sig.returns.len();
+
+    let expected_returns = if dest_place.layout.is_zst() || is_sret {
+        0
+    } else {
+        match dest_place.layout.backend_repr {
+            BackendRepr::Scalar(_) => 1,
+            BackendRepr::ScalarPair(_, _) => 2,
+            _ => 0,
+        }
+    };
+
+    if declared_params == call_args.len() && declared_returns == expected_returns {
+        // Signature matches — use efficient direct call.
+        let call = fx.bcx.ins().call(func_ref, &call_args);
+        store_md_call_result(fx, call, dest_place, sret_slot);
+    } else {
+        // Signature mismatch (e.g. callee declared as void→void stub).
+        // Build expected signature from actual values and use call_indirect.
+        let mut expected_sig = Signature::new(fx.isa.default_call_conv());
+        for &arg in &call_args {
+            let ty = fx.bcx.func.dfg.value_type(arg);
+            expected_sig.params.push(AbiParam::new(ty));
+        }
+        if !is_sret && !dest_place.layout.is_zst() {
+            match dest_place.layout.backend_repr {
+                BackendRepr::Scalar(ref s) => {
+                    expected_sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, s)));
+                }
+                BackendRepr::ScalarPair(ref a, ref b) => {
+                    expected_sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, a)));
+                    expected_sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, b)));
+                }
+                _ => {}
+            }
+        }
+        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, func_ref);
+        let expected_sig_ref = fx.bcx.import_signature(expected_sig);
+        let call = fx.bcx.ins().call_indirect(expected_sig_ref, func_addr, &call_args);
+        store_md_call_result(fx, call, dest_place, sret_slot);
+    }
 }
 
 /// Push argument values onto `call_args`, handling all backend reprs.
