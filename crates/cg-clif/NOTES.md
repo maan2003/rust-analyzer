@@ -176,11 +176,14 @@ Still diverges from upstream:
   variant index directly, so `A = 100` would incorrectly write 0.
   Needs `db.const_eval_discriminant()`.
 Known bugs (divergence from upstream cg_clif):
-- **Constants only handle small scalars** — `const_to_i64` extracts raw bytes
-  into i64. Missing: pointer constants (references to allocations/statics),
-  slice constants (fat pointers), i128 (upstream uses `iconcat(lsb, msb)`),
-  indirect constants (stored in allocations). String literals, `const &[T]`,
-  etc. won't work.
+- **Constants lack relocation/pointer support** — Scalar, ScalarPair, and
+  memory-repr constants all work for plain values (integers, floats, arrays of
+  scalars). Missing: pointer constants (references to allocations/statics),
+  slice constants (`&str`, `&[T]`), i128. The memory-repr path creates a data
+  section from raw bytes but writes no relocations (`MemoryMap::Empty` only).
+  ScalarPair path uses `iconst` for both halves — wrong for float pairs.
+  Upstream dispatches on `ConstValue::Scalar`/`Indirect`/`Slice` and handles
+  pointer relocations via `define_all_allocs` + `data.write_data_addr()`.
 - **No `PassMode::Uniform` / `PassMode::Cast`** — we handle Scalar,
   ScalarPair (direct), and Memory-repr (indirect/sret), but not the
   `Uniform` or `Cast` pass modes used on some targets for small aggregates.

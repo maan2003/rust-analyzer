@@ -1382,24 +1382,67 @@ fn codegen_operand(
             if layout.is_zst() {
                 return CValue::zst(layout);
             }
-            if let BackendRepr::Scalar(scalar) = layout.backend_repr {
-                let raw = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
-                let val = match scalar.primitive() {
-                    Primitive::Float(rustc_abi::Float::F32) => {
-                        fx.bcx.ins().f32const(f32::from_bits(raw as u32))
-                    }
-                    Primitive::Float(rustc_abi::Float::F64) => {
-                        fx.bcx.ins().f64const(f64::from_bits(raw as u64))
-                    }
-                    Primitive::Float(_) => todo!("f16/f128 constants"),
-                    _ => {
-                        let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
-                        fx.bcx.ins().iconst(clif_ty, raw)
-                    }
-                };
-                CValue::by_val(val, layout)
-            } else {
-                todo!("non-scalar constant")
+            match layout.backend_repr {
+                BackendRepr::Scalar(scalar) => {
+                    let raw = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
+                    let val = match scalar.primitive() {
+                        Primitive::Float(rustc_abi::Float::F32) => {
+                            fx.bcx.ins().f32const(f32::from_bits(raw as u32))
+                        }
+                        Primitive::Float(rustc_abi::Float::F64) => {
+                            fx.bcx.ins().f64const(f64::from_bits(raw as u64))
+                        }
+                        Primitive::Float(_) => todo!("f16/f128 constants"),
+                        _ => {
+                            let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
+                            fx.bcx.ins().iconst(clif_ty, raw)
+                        }
+                    };
+                    CValue::by_val(val, layout)
+                }
+                BackendRepr::ScalarPair(a_scalar, b_scalar) => {
+                    let ConstKind::Value(val) = konst.as_ref().kind() else {
+                        panic!("non-value const in ScalarPair constant");
+                    };
+                    let bytes = &val.value.inner().memory;
+                    let a_size = a_scalar.size(fx.dl).bytes() as usize;
+                    let b_offset = a_scalar.size(fx.dl).align_to(b_scalar.align(fx.dl).abi).bytes() as usize;
+                    let b_size = b_scalar.size(fx.dl).bytes() as usize;
+
+                    let a_raw = {
+                        let mut buf = [0u8; 8];
+                        let len = a_size.min(8);
+                        buf[..len].copy_from_slice(&bytes[..len]);
+                        i64::from_le_bytes(buf)
+                    };
+                    let b_raw = {
+                        let mut buf = [0u8; 8];
+                        let len = b_size.min(8);
+                        buf[..len].copy_from_slice(&bytes[b_offset..b_offset + len]);
+                        i64::from_le_bytes(buf)
+                    };
+
+                    let a_clif = scalar_to_clif_type(fx.dl, &a_scalar);
+                    let b_clif = scalar_to_clif_type(fx.dl, &b_scalar);
+                    let a_val = fx.bcx.ins().iconst(a_clif, a_raw);
+                    let b_val = fx.bcx.ins().iconst(b_clif, b_raw);
+                    CValue::by_val_pair(a_val, b_val, layout)
+                }
+                _ => {
+                    // Memory-repr constant: store raw bytes in a data section
+                    let ConstKind::Value(val) = konst.as_ref().kind() else {
+                        panic!("non-value const in memory-repr constant");
+                    };
+                    let bytes = &val.value.inner().memory;
+                    let mut data_desc = DataDescription::new();
+                    data_desc.define(bytes.to_vec().into_boxed_slice());
+                    data_desc.set_align(layout.align.abi.bytes());
+                    let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+                    fx.module.define_data(data_id, &data_desc).unwrap();
+                    let local_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+                    let ptr = fx.bcx.ins().symbol_value(fx.pointer_type, local_id);
+                    CValue::by_ref(pointer::Pointer::new(ptr), layout)
+                }
             }
         }
         OperandKind::Copy(place) | OperandKind::Move(place) => {

@@ -1659,3 +1659,23 @@ fn foo() -> i32 {
     );
     assert_eq!(result, 7);
 }
+
+// ---------------------------------------------------------------------------
+// Non-scalar constants tests (M11d)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_const_array_index() {
+    // Tests memory-repr constant (array stored in data section) + indexing
+    let result: i32 = jit_run(
+        r#"
+fn foo() -> i32 {
+    let arr = [10i32, 20, 30];
+    arr[0usize] + arr[2usize]
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 40); // 10 + 30
+}
