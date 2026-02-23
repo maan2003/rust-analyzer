@@ -322,7 +322,7 @@ pub enum BorrowKind {
     Shallow,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mutability {
     Not,
     Mut,
@@ -383,6 +383,237 @@ pub enum GenericArg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExistentialPredicate {
     pub trait_ref: Option<(DefPathHash, Vec<GenericArg>)>,
+}
+
+// ---------------------------------------------------------------------------
+// Type substitution (monomorphization)
+// ---------------------------------------------------------------------------
+
+impl Ty {
+    /// Substitute `Param(idx, _)` with the concrete type from `substs[idx]`.
+    /// Returns the type unchanged if it contains no Param references.
+    pub fn subst(&self, substs: &[GenericArg]) -> Ty {
+        match self {
+            // Leaf types — no substitution needed
+            Ty::Bool | Ty::Char | Ty::Str | Ty::Never
+            | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_)
+            | Ty::Foreign(_) | Ty::Opaque(_) => self.clone(),
+
+            // The key case: substitute type parameters
+            Ty::Param(idx, _name) => {
+                match substs.get(*idx as usize) {
+                    Some(GenericArg::Ty(concrete)) => concrete.clone(),
+                    _ => self.clone(), // keep as-is if no substitution available
+                }
+            }
+
+            // Recursive cases
+            Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| t.subst(substs)).collect()),
+            Ty::Array(elem, len) => Ty::Array(Box::new(elem.subst(substs)), *len),
+            Ty::Slice(elem) => Ty::Slice(Box::new(elem.subst(substs))),
+            Ty::Ref(m, pointee) => Ty::Ref(*m, Box::new(pointee.subst(substs))),
+            Ty::RawPtr(m, pointee) => Ty::RawPtr(*m, Box::new(pointee.subst(substs))),
+            Ty::Adt(hash, name, args) => {
+                Ty::Adt(*hash, name.clone(), subst_generic_args(args, substs))
+            }
+            Ty::FnDef(hash, args) => {
+                Ty::FnDef(*hash, subst_generic_args(args, substs))
+            }
+            Ty::FnPtr(params, ret) => Ty::FnPtr(
+                params.iter().map(|t| t.subst(substs)).collect(),
+                Box::new(ret.subst(substs)),
+            ),
+            Ty::Closure(hash, args) => {
+                Ty::Closure(*hash, subst_generic_args(args, substs))
+            }
+            Ty::Dynamic(preds) => Ty::Dynamic(
+                preds.iter().map(|p| ExistentialPredicate {
+                    trait_ref: p.trait_ref.as_ref().map(|(hash, args)| {
+                        (*hash, subst_generic_args(args, substs))
+                    }),
+                }).collect(),
+            ),
+        }
+    }
+
+    /// Returns true if this type contains any `Param` references.
+    pub fn has_param(&self) -> bool {
+        match self {
+            Ty::Param(_, _) => true,
+            Ty::Bool | Ty::Char | Ty::Str | Ty::Never
+            | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_)
+            | Ty::Foreign(_) | Ty::Opaque(_) => false,
+            Ty::Tuple(tys) => tys.iter().any(|t| t.has_param()),
+            Ty::Array(elem, _) | Ty::Slice(elem)
+            | Ty::Ref(_, elem) | Ty::RawPtr(_, elem) => elem.has_param(),
+            Ty::Adt(_, _, args) | Ty::FnDef(_, args) | Ty::Closure(_, args) => {
+                args.iter().any(|a| matches!(a, GenericArg::Ty(t) if t.has_param()))
+            }
+            Ty::FnPtr(params, ret) => {
+                params.iter().any(|t| t.has_param()) || ret.has_param()
+            }
+            Ty::Dynamic(preds) => preds.iter().any(|p| {
+                p.trait_ref.as_ref().is_some_and(|(_, args)| {
+                    args.iter().any(|a| matches!(a, GenericArg::Ty(t) if t.has_param()))
+                })
+            }),
+        }
+    }
+}
+
+/// Substitute generic args, recursing into Ty args.
+fn subst_generic_args(args: &[GenericArg], substs: &[GenericArg]) -> Vec<GenericArg> {
+    args.iter().map(|arg| match arg {
+        GenericArg::Ty(ty) => GenericArg::Ty(ty.subst(substs)),
+        other => other.clone(),
+    }).collect()
+}
+
+impl Body {
+    /// Create a monomorphized copy of this body by substituting all `Ty::Param`
+    /// references with concrete types from `substs`.
+    pub fn subst(&self, substs: &[GenericArg]) -> Body {
+        Body {
+            locals: self.locals.iter().map(|l| Local {
+                ty: l.ty.subst(substs),
+                layout: l.layout, // layout indices are preserved; caller must remap
+            }).collect(),
+            arg_count: self.arg_count,
+            blocks: self.blocks.iter().map(|bb| BasicBlock {
+                stmts: bb.stmts.iter().map(|s| s.subst(substs)).collect(),
+                terminator: bb.terminator.subst(substs),
+                is_cleanup: bb.is_cleanup,
+            }).collect(),
+        }
+    }
+}
+
+impl Statement {
+    fn subst(&self, substs: &[GenericArg]) -> Statement {
+        match self {
+            Statement::Assign(place, rvalue) => {
+                Statement::Assign(place.subst(substs), rvalue.subst(substs))
+            }
+            Statement::SetDiscriminant { place, variant_index } => {
+                Statement::SetDiscriminant { place: place.subst(substs), variant_index: *variant_index }
+            }
+            Statement::Deinit(place) => Statement::Deinit(place.subst(substs)),
+            Statement::StorageLive(l) => Statement::StorageLive(*l),
+            Statement::StorageDead(l) => Statement::StorageDead(*l),
+            Statement::Nop => Statement::Nop,
+        }
+    }
+}
+
+impl Terminator {
+    fn subst(&self, substs: &[GenericArg]) -> Terminator {
+        match self {
+            Terminator::Call { func, args, dest, target, unwind } => Terminator::Call {
+                func: func.subst(substs),
+                args: args.iter().map(|a| a.subst(substs)).collect(),
+                dest: dest.subst(substs),
+                target: *target,
+                unwind: unwind.clone(),
+            },
+            Terminator::SwitchInt { discr, targets } => Terminator::SwitchInt {
+                discr: discr.subst(substs),
+                targets: targets.clone(),
+            },
+            Terminator::Drop { place, target, unwind } => Terminator::Drop {
+                place: place.subst(substs),
+                target: *target,
+                unwind: unwind.clone(),
+            },
+            Terminator::Assert { cond, expected, target, unwind } => Terminator::Assert {
+                cond: cond.subst(substs),
+                expected: *expected,
+                target: *target,
+                unwind: unwind.clone(),
+            },
+            Terminator::Goto(t) => Terminator::Goto(*t),
+            Terminator::Return => Terminator::Return,
+            Terminator::Unreachable => Terminator::Unreachable,
+            Terminator::UnwindResume => Terminator::UnwindResume,
+        }
+    }
+}
+
+impl Operand {
+    fn subst(&self, substs: &[GenericArg]) -> Operand {
+        match self {
+            Operand::Copy(p) => Operand::Copy(p.subst(substs)),
+            Operand::Move(p) => Operand::Move(p.subst(substs)),
+            Operand::Constant(c) => Operand::Constant(ConstOperand {
+                ty: c.ty.subst(substs),
+                kind: c.kind.subst(substs),
+            }),
+        }
+    }
+}
+
+impl ConstKind {
+    fn subst(&self, substs: &[GenericArg]) -> ConstKind {
+        match self {
+            ConstKind::Unevaluated(hash, args) => {
+                ConstKind::Unevaluated(*hash, subst_generic_args(args, substs))
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+impl Place {
+    fn subst(&self, substs: &[GenericArg]) -> Place {
+        Place {
+            local: self.local,
+            projections: self.projections.iter().map(|p| p.subst(substs)).collect(),
+        }
+    }
+}
+
+impl Projection {
+    fn subst(&self, substs: &[GenericArg]) -> Projection {
+        match self {
+            Projection::Field(idx, ty) => Projection::Field(*idx, ty.subst(substs)),
+            Projection::OpaqueCast(ty) => Projection::OpaqueCast(ty.subst(substs)),
+            other => other.clone(),
+        }
+    }
+}
+
+impl Rvalue {
+    fn subst(&self, substs: &[GenericArg]) -> Rvalue {
+        match self {
+            Rvalue::Use(op) => Rvalue::Use(op.subst(substs)),
+            Rvalue::Repeat(op, count) => Rvalue::Repeat(op.subst(substs), *count),
+            Rvalue::Ref(bk, place) => Rvalue::Ref(bk.clone(), place.subst(substs)),
+            Rvalue::RawPtr(m, place) => Rvalue::RawPtr(*m, place.subst(substs)),
+            Rvalue::Cast(kind, op, ty) => {
+                Rvalue::Cast(kind.clone(), op.subst(substs), ty.subst(substs))
+            }
+            Rvalue::BinaryOp(op, lhs, rhs) => {
+                Rvalue::BinaryOp(*op, lhs.subst(substs), rhs.subst(substs))
+            }
+            Rvalue::UnaryOp(op, operand) => Rvalue::UnaryOp(*op, operand.subst(substs)),
+            Rvalue::Discriminant(place) => Rvalue::Discriminant(place.subst(substs)),
+            Rvalue::Aggregate(kind, ops) => {
+                let kind = match kind {
+                    AggregateKind::Array(ty) => AggregateKind::Array(ty.subst(substs)),
+                    AggregateKind::Adt(hash, variant, args) => {
+                        AggregateKind::Adt(*hash, *variant, subst_generic_args(args, substs))
+                    }
+                    AggregateKind::Closure(hash, args) => {
+                        AggregateKind::Closure(*hash, subst_generic_args(args, substs))
+                    }
+                    AggregateKind::RawPtr(ty, m) => AggregateKind::RawPtr(ty.subst(substs), *m),
+                    AggregateKind::Tuple => AggregateKind::Tuple,
+                };
+                Rvalue::Aggregate(kind, ops.iter().map(|o| o.subst(substs)).collect())
+            }
+            Rvalue::CopyForDeref(place) => Rvalue::CopyForDeref(place.subst(substs)),
+            Rvalue::ThreadLocalRef(hash) => Rvalue::ThreadLocalRef(*hash),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

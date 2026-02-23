@@ -41,6 +41,26 @@ fn local_layout(
         .ok_or_else(|| format!("layout index {} out of bounds (len={})", idx, layouts.len()))
 }
 
+/// Resolve a local's layout: try the layout index table first, then fall back
+/// to ty_layouts lookup (for monomorphized locals without layout indices).
+fn resolve_local_layout(
+    local: &ra_mir_types::Local,
+    layouts: &[LayoutArc],
+    ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
+) -> Result<LayoutArc, String> {
+    // Try layout index first
+    if let Some(idx) = local.layout {
+        if let Some(layout) = layouts.get(idx as usize) {
+            return Ok(layout.clone());
+        }
+    }
+    // Fall back to ty_layouts lookup
+    if let Some(layout) = ty_layouts.get(&local.ty) {
+        return Ok(layout.clone());
+    }
+    Err(format!("no layout for type: {:?}", local.ty))
+}
+
 // ---------------------------------------------------------------------------
 // Signature building
 // ---------------------------------------------------------------------------
@@ -60,6 +80,31 @@ fn build_mirdata_fn_sig(
     // Parameters: locals[1..=arg_count]
     for i in 1..=body.arg_count as usize {
         let param_layout = local_layout(&body.locals[i], layouts)?;
+        crate::append_param_to_sig(&mut sig, dl, &param_layout);
+    }
+
+    Ok(sig)
+}
+
+/// Build a function signature using `resolve_local_layout` (which falls back
+/// to ty_layouts for locals without layout indices). Needed for monomorphized
+/// generic functions.
+fn build_mirdata_fn_sig_resolved(
+    isa: &dyn TargetIsa,
+    dl: &TargetDataLayout,
+    body: &Body,
+    layouts: &[LayoutArc],
+    ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
+) -> Result<Signature, String> {
+    let mut sig = Signature::new(isa.default_call_conv());
+
+    // Return type: locals[0]
+    let ret_layout = resolve_local_layout(&body.locals[0], layouts, ty_layouts)?;
+    crate::append_ret_to_sig(&mut sig, dl, &ret_layout);
+
+    // Parameters: locals[1..=arg_count]
+    for i in 1..=body.arg_count as usize {
+        let param_layout = resolve_local_layout(&body.locals[i], layouts, ty_layouts)?;
         crate::append_param_to_sig(&mut sig, dl, &param_layout);
     }
 
@@ -308,7 +353,9 @@ fn codegen_md_operand(
                     let data_id = fx.module
                         .declare_data(&name, Linkage::Local, false, false)
                         .expect("declare slice data");
-                    fx.module.define_data(data_id, &desc).expect("define slice data");
+                    // Ignore DuplicateDefinition — the same slice constant may
+                    // appear in multiple functions compiled into the same module.
+                    let _ = fx.module.define_data(data_id, &desc);
                     data_id
                 };
                 let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
@@ -464,13 +511,22 @@ fn codegen_md_cast(
         let ra_mir_types::Operand::Constant(c) = operand else {
             panic!("ReifyFnPointer on non-constant operand");
         };
-        let ra_mir_types::Ty::FnDef(hash, _) = &c.ty else {
+        let ra_mir_types::Ty::FnDef(hash, generic_args) = &c.ty else {
             panic!("ReifyFnPointer on non-FnDef type: {:?}", c.ty);
         };
         let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
             unreachable!()
         };
-        let func_id = *fn_registry.get(hash).expect("ReifyFnPointer: function not in fn_registry");
+        // Try mono instance key first, then fall back to plain hash
+        let mono_key = if generic_args.iter().any(|a| matches!(a, ra_mir_types::GenericArg::Ty(_))) {
+            let inst = MonoInstance { def_path_hash: *hash, args: generic_args.clone() };
+            Some(inst.registry_key())
+        } else {
+            None
+        };
+        let func_id = mono_key.and_then(|k| fn_registry.get(&k).copied())
+            .or_else(|| fn_registry.get(hash).copied())
+            .expect("ReifyFnPointer: function not in fn_registry");
         let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
         let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, func_ref);
         return CValue::by_val(func_addr, dest_layout.clone());
@@ -840,12 +896,21 @@ fn codegen_md_call(
 
     match func {
         Operand::Constant(c) => match &c.ty {
-            ra_mir_types::Ty::FnDef(hash, _) => {
+            ra_mir_types::Ty::FnDef(hash, generic_args) => {
                 let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
                     unreachable!()
                 };
-                match fn_registry.get(hash) {
-                    Some(&func_id) => {
+                // For monomorphized calls, try the mono instance key first.
+                let mono_key = if generic_args.iter().any(|a| matches!(a, ra_mir_types::GenericArg::Ty(_))) {
+                    let inst = MonoInstance { def_path_hash: *hash, args: generic_args.clone() };
+                    Some(inst.registry_key())
+                } else {
+                    None
+                };
+                let func_id = mono_key.and_then(|k| fn_registry.get(&k).copied())
+                    .or_else(|| fn_registry.get(hash).copied());
+                match func_id {
+                    Some(func_id) => {
                         let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
                         emit_md_call_direct(fx, func_ref, args, &dest_place);
                     }
@@ -1154,6 +1219,95 @@ fn codegen_md_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &Terminator
 }
 
 // ---------------------------------------------------------------------------
+// Monomorphization
+// ---------------------------------------------------------------------------
+
+/// A monomorphization instance: a generic function + concrete type args.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct MonoInstance {
+    pub def_path_hash: ra_mir_types::DefPathHash,
+    pub args: Vec<ra_mir_types::GenericArg>,
+}
+
+impl MonoInstance {
+    /// Compute a stable hash to use as a synthetic DefPathHash in fn_registry.
+    pub fn registry_key(&self) -> (u64, u64) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.def_path_hash.hash(&mut hasher);
+        self.args.hash(&mut hasher);
+        let h1 = hasher.finish();
+        // Second hash for uniqueness
+        h1.hash(&mut hasher);
+        let h2 = hasher.finish();
+        (h1, h2)
+    }
+}
+
+/// Collect all monomorphization instances needed by a set of function bodies.
+///
+/// Scans call sites in **monomorphic** functions for `FnDef(hash, args)` where:
+/// - `args` contains at least one `GenericArg::Ty` that is fully concrete (no Param)
+/// - `hash` refers to a generic function in `body_map`
+///
+/// Returns deduplicated instances.
+pub fn collect_mono_instances(
+    bodies: &[ra_mir_types::FnBody],
+    body_map: &HashMap<ra_mir_types::DefPathHash, usize>,
+) -> Vec<MonoInstance> {
+    let mut seen = std::collections::HashSet::new();
+    let mut instances = Vec::new();
+
+    // Only scan monomorphic functions — generic functions have unresolved Params
+    for fb in bodies {
+        if fb.num_generic_params > 0 {
+            continue;
+        }
+        collect_from_body(&fb.body, body_map, &mut seen, &mut instances);
+    }
+
+    instances
+}
+
+fn collect_from_body(
+    body: &ra_mir_types::Body,
+    body_map: &HashMap<ra_mir_types::DefPathHash, usize>,
+    seen: &mut std::collections::HashSet<MonoInstance>,
+    instances: &mut Vec<MonoInstance>,
+) {
+    for bb in &body.blocks {
+        if let ra_mir_types::Terminator::Call { func, .. } = &bb.terminator {
+            if let Operand::Constant(c) = func {
+                if let ra_mir_types::Ty::FnDef(hash, args) = &c.ty {
+                    let has_ty_args = args.iter().any(|a| matches!(a, ra_mir_types::GenericArg::Ty(_)));
+                    if !has_ty_args {
+                        continue;
+                    }
+                    // Skip if any type arg still contains Param (means caller is generic)
+                    let all_concrete = args.iter().all(|a| match a {
+                        ra_mir_types::GenericArg::Ty(ty) => !ty.has_param(),
+                        _ => true,
+                    });
+                    if !all_concrete {
+                        continue;
+                    }
+                    // Check if the target is a generic function in our body map
+                    if body_map.contains_key(hash) {
+                        let inst = MonoInstance {
+                            def_path_hash: *hash,
+                            args: args.clone(),
+                        };
+                        if seen.insert(inst.clone()) {
+                            instances.push(inst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -1182,9 +1336,29 @@ pub fn compile_mirdata_fn(
     fn_registry: &HashMap<(u64, u64), FuncId>,
     ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
 ) -> Result<FuncId, String> {
-    let body = &fn_body.body;
+    compile_mirdata_body(module, isa, dl, &fn_body.body, layouts, fn_name, linkage, fn_registry, ty_layouts)
+}
+
+/// Compile a mirdata Body (possibly monomorphized) into a Cranelift function.
+///
+/// Unlike `compile_mirdata_fn`, this takes a `Body` directly (not `FnBody`),
+/// enabling compilation of monomorphized bodies that were created by type
+/// substitution.
+pub fn compile_mirdata_body(
+    module: &mut impl Module,
+    isa: &dyn TargetIsa,
+    dl: &TargetDataLayout,
+    body: &ra_mir_types::Body,
+    layouts: &[LayoutArc],
+    fn_name: &str,
+    linkage: Linkage,
+    fn_registry: &HashMap<(u64, u64), FuncId>,
+    ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
+) -> Result<FuncId, String> {
     let pointer_type = pointer_ty(dl);
-    let sig = build_mirdata_fn_sig(isa, dl, body, layouts)?;
+    // Use resolve_local_layout which falls back to ty_layouts for locals
+    // without layout indices (e.g. monomorphized generic functions).
+    let sig = build_mirdata_fn_sig_resolved(isa, dl, body, layouts, ty_layouts)?;
 
     let func_id = module
         .declare_function(fn_name, linkage, &sig)
@@ -1210,7 +1384,7 @@ pub fn compile_mirdata_fn(
         // Create locals
         let mut local_map = Vec::with_capacity(body.locals.len());
         for local in &body.locals {
-            let layout = local_layout(local, layouts)?;
+            let layout = resolve_local_layout(local, layouts, ty_layouts)?;
             let place = match layout.backend_repr {
                 BackendRepr::Scalar(scalar) => {
                     let clif_ty = scalar_to_clif_type(dl, &scalar);
@@ -4211,6 +4385,12 @@ mod tests {
         let ty_layouts = build_ty_layout_map(&mirdata.layouts, &layouts);
         let (mut module, isa, dl) = make_jit_module();
 
+        // Build body_map for looking up generic function bodies by hash
+        let mut body_map: HashMap<(u64, u64), usize> = HashMap::new();
+        for (i, fb) in mirdata.bodies.iter().enumerate() {
+            body_map.insert(fb.def_path_hash, i);
+        }
+
         // Build fn_registry: declare ALL functions so cross-references work.
         // Even generic functions need entries so Call terminators can resolve them.
         let mut fn_registry: HashMap<(u64, u64), FuncId> = HashMap::new();
@@ -4227,6 +4407,63 @@ mod tests {
                 .declare_function(&fn_name, Linkage::Local, &sig)
                 .expect("declare_function");
             fn_registry.insert(fb.def_path_hash, func_id);
+        }
+
+        // Monomorphization pass: collect instances, compile them, add to fn_registry
+        let mono_instances = collect_mono_instances(&mirdata.bodies, &body_map);
+        eprintln!("Collected {} monomorphization instances", mono_instances.len());
+        let mut mono_compiled = 0usize;
+        let mut mono_failed = 0usize;
+        let mut mono_errors: HashMap<String, Vec<String>> = HashMap::new();
+        for inst in &mono_instances {
+            let body_idx = body_map[&inst.def_path_hash];
+            let generic_body = &mirdata.bodies[body_idx];
+            let mono_body = generic_body.body.subst(&inst.args);
+
+            // Build a unique name for this instance
+            let mono_name = format!("__mono_{}_{:x}_{:x}",
+                generic_body.name.replace(|c: char| !c.is_alphanumeric(), "_"),
+                inst.registry_key().0, inst.registry_key().1);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compile_mirdata_body(
+                    &mut module, &*isa, &dl, &mono_body, &layouts,
+                    &mono_name, Linkage::Local, &fn_registry, &ty_layouts,
+                )
+            }));
+
+            match result {
+                Ok(Ok(func_id)) => {
+                    fn_registry.insert(inst.registry_key(), func_id);
+                    mono_compiled += 1;
+                }
+                Ok(Err(e)) => {
+                    mono_failed += 1;
+                    let key = if e.len() > 120 { e[..120].to_string() } else { e };
+                    mono_errors.entry(key).or_default().push(generic_body.name.clone());
+                }
+                Err(panic_info) => {
+                    mono_failed += 1;
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    let key = if msg.len() > 120 { msg[..120].to_string() } else { msg };
+                    mono_errors.entry(key).or_default().push(generic_body.name.clone());
+                }
+            }
+        }
+        eprintln!("Mono compiled: {mono_compiled}, failed: {mono_failed}");
+        if !mono_errors.is_empty() {
+            eprintln!("\n--- Mono error categories ---");
+            let mut sorted: Vec<_> = mono_errors.iter().collect();
+            sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            for (msg, fns) in sorted.iter().take(10) {
+                eprintln!("[{} instances] {}", fns.len(), msg);
+            }
         }
 
         let mut compiled = 0usize;
