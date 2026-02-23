@@ -50,7 +50,7 @@ Full scalar codegen working:
 - `UnaryOp`: `Neg` (int/float), `Not` (bnot for ints, icmp_imm for bool).
 - Scalar locals as Cranelift variables, ZST locals, scalar params/returns.
 - `SwitchInt` multi-way branching, direct function calls (call chains,
-  calls combined with branches), `Drop` as no-op jump.
+  calls combined with branches), `Drop` (see M11f for full drop glue).
 
 See `crates/cg-clif/NOTES.md` for known bugs and upstream divergences.
 
@@ -340,22 +340,34 @@ sections via `DataDescription` with raw bytes. `MemoryMap::Empty` only
 constants). `collect_reachable_fns` scans for `ReifyFnPointer` casts.
 JIT tests: `jit_fn_pointer_call`, `jit_fn_pointer_higher_order`.
 
-### M11f: Drop glue
+### M11f: Drop glue ✅
 
-```rust
-struct Guard { val: i32 }
-impl Drop for Guard {
-    fn drop(&mut self) { /* side effect */ }
-}
-fn foo() -> i32 {
-    let g = Guard { val: 42 };
-    g.val
-}  // drop called on scope exit
-```
+`TerminatorKind::Drop` now resolves and calls the `Drop::drop` impl
+method for types that have one, instead of being a no-op jump.
 
-Needs: `TerminatorKind::Drop` to call drop functions instead of being a
-no-op jump. Requires generating drop glue shims or resolving `Drop::drop`
-impl methods.
+- **`codegen_drop`**: looks up `Drop` trait via lang items, resolves the
+  impl's `drop` method via `TraitImpls::for_crate` + `simplify_type`,
+  builds `fn(&mut self)` signature (one pointer param, void return),
+  emits a direct call. Falls through to a plain jump for types without
+  `Drop` impls.
+- **`resolve_drop_impl`**: reusable helper that finds the `Drop::drop`
+  impl method for an ADT type by searching both the local crate and the
+  type's defining crate.
+- **`needs_drop` intrinsic**: now uses `resolve_drop_impl` instead of
+  always returning false.
+- **Reachability**: `scan_body_for_callees` scans `Drop` terminators
+  to discover drop impl methods as reachable functions.
+- **Address-taken analysis** (`address_taken_locals`): scans MIR for
+  `Rvalue::Ref` / `Rvalue::AddressOf` and forces those locals to stack
+  allocation (matching upstream cg_clif's `analyze.rs` SSA analysis).
+  Fixes raw pointer writes through borrowed locals. Parameter wiring
+  updated to store into stack slots when needed.
+- **`CPlace::to_ptr_maybe_spill`**: new helper that returns a pointer
+  to a place, spilling register-stored values to the stack if needed.
+
+JIT tests: `jit_drop_basic` (drop compiles+runs), `jit_drop_side_effect`
+(drop writes through raw pointer, proving it's called),
+`jit_drop_no_drop_impl` (types without Drop are fine). 92 total tests.
 
 ### M11g: Closures ✅
 

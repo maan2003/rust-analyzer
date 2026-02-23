@@ -1558,14 +1558,128 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
         TerminatorKind::Call { func, args, destination, target, .. } => {
             codegen_call(fx, body, func, args, destination, target);
         }
-        TerminatorKind::Drop { target, .. } => {
-            // For scalar types, drop is a no-op — just jump to target.
-            // TODO: call drop glue for types that need it.
-            let block = fx.clif_block(*target);
-            fx.bcx.ins().jump(block, &[]);
+        TerminatorKind::Drop { place, target, .. } => {
+            codegen_drop(fx, body, place, *target);
         }
         _ => todo!("terminator: {:?}", term),
     }
+}
+
+/// Codegen for `TerminatorKind::Drop`.
+///
+/// If the type of the dropped place has a `Drop` impl, resolves the impl's
+/// `drop(&mut self)` method and emits a call to it. Otherwise, this is a
+/// no-op jump to the target block.
+///
+/// Reference: cg_clif/src/abi/mod.rs `codegen_drop`
+fn codegen_drop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    place: &Place,
+    target: BasicBlockId,
+) {
+    let target_block = fx.clif_block(target);
+    let ty = place_ty(fx.db, body, place);
+
+    // Find the Drop trait
+    let lang_items = hir_def::lang_item::lang_items(fx.db, fx.local_crate);
+    let Some(drop_trait) = lang_items.Drop else {
+        // No Drop trait available (e.g. minicore without drop feature)
+        fx.bcx.ins().jump(target_block, &[]);
+        return;
+    };
+
+    // Check if the type has a Drop impl
+    let Some(drop_func_id) = resolve_drop_impl(fx.db, fx.local_crate, drop_trait, &ty) else {
+        // No Drop impl — just jump to target (no-op drop)
+        fx.bcx.ins().jump(target_block, &[]);
+        return;
+    };
+
+    // The drop method signature is `fn drop(&mut self)` — takes one pointer arg, returns void.
+    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+    drop_sig.params.push(AbiParam::new(fx.pointer_type));
+
+    // Get a pointer to the place (drop takes &mut self).
+    // Spills register-stored places to the stack if necessary.
+    let drop_place = codegen_place(fx, body, place);
+    let ptr = drop_place.to_ptr_maybe_spill(fx).get_addr(&mut fx.bcx, fx.pointer_type);
+
+    // Mangle the drop function name
+    let interner = DbInterner::new_no_crate(fx.db);
+    let fn_name = symbol_mangling::mangle_function(
+        fx.db, drop_func_id,
+        GenericArgs::empty(interner),
+        fx.ext_crate_disambiguators,
+    );
+
+    let callee_id = fx.module
+        .declare_function(&fn_name, Linkage::Import, &drop_sig)
+        .expect("declare drop fn");
+    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+
+    // Call drop(&mut self) with pointer to the place
+    fx.bcx.ins().call(callee_ref, &[ptr]);
+
+    fx.bcx.ins().jump(target_block, &[]);
+}
+
+/// Resolve the `Drop::drop` impl method for a given type, if any.
+///
+/// Returns `Some(FunctionId)` for the impl's `drop` method if the type
+/// directly implements the `Drop` trait. Returns `None` if the type does
+/// not have a `Drop` impl.
+fn resolve_drop_impl(
+    db: &dyn HirDatabase,
+    krate: base_db::Crate,
+    drop_trait: TraitId,
+    ty: &StoredTy,
+) -> Option<hir_def::FunctionId> {
+    use hir_expand::name::Name;
+    use intern::sym;
+
+    // Only ADTs can have Drop impls
+    let TyKind::Adt(adt_def, _) = ty.as_ref().kind() else {
+        return None;
+    };
+
+    let interner = DbInterner::new_no_crate(db);
+
+    // Check if the ADT has a Drop impl
+    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
+    let simplified = simplify_type(interner, ty.as_ref(), TreatParams::InstantiateWithInfer)?;
+
+    // Search in the krate where the type is defined and our local crate
+    let adt_id = adt_def.inner().id;
+    let type_krate = match adt_id {
+        hir_def::AdtId::StructId(id) => id.krate(db),
+        hir_def::AdtId::EnumId(id) => id.krate(db),
+        hir_def::AdtId::UnionId(id) => id.krate(db),
+    };
+
+    for search_krate in [krate, type_krate] {
+        let trait_impls = TraitImpls::for_crate(db, search_krate);
+        let (impl_ids, _) = trait_impls.for_trait_and_self_ty(drop_trait, &simplified);
+        if let Some(&impl_id) = impl_ids.first() {
+            // Found the Drop impl — look up the `drop` method
+            let impl_items = impl_id.impl_items(db);
+            let drop_method = impl_items.items.iter().find_map(|(name, item)| {
+                if *name == Name::new_symbol_root(sym::drop) {
+                    match item {
+                        AssocItemId::FunctionId(fid) => Some(*fid),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            if let Some(func_id) = drop_method {
+                return Some(func_id);
+            }
+        }
+    }
+
+    None
 }
 
 fn codegen_call(
@@ -2298,13 +2412,14 @@ fn codegen_intrinsic_call(
     let sig = fx.db.function_signature(callee_func_id);
     let name = sig.name.as_str();
 
-    // Pre-compute layout of the first generic type argument (e.g. size_of::<T>)
+    // Pre-compute the first generic type argument and its layout (e.g. size_of::<T>)
     // Done eagerly to avoid borrow conflicts with fx inside match arms.
-    let generic_ty_layout = if generic_args.len() > 0 {
+    let (generic_ty, generic_ty_layout) = if generic_args.len() > 0 {
         let ty = generic_args.type_at(0);
-        fx.db.layout_of_ty(ty.store(), fx.env.clone()).ok()
+        let layout = fx.db.layout_of_ty(ty.store(), fx.env.clone()).ok();
+        (Some(ty.store()), layout)
     } else {
-        None
+        (None, None)
     };
 
     let result = match name {
@@ -2391,8 +2506,10 @@ fn codegen_intrinsic_call(
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
         }
         "needs_drop" => {
-            // TODO: actually check if the type needs drop; for now always return false
-            Some(fx.bcx.ins().iconst(types::I8, 0))
+            let generic_ty = generic_ty.as_ref().expect("needs_drop requires a generic arg");
+            let interner = DbInterner::new_with(fx.db, fx.local_crate);
+            let result = hir_ty::drop::has_drop_glue_mono(interner, generic_ty.as_ref());
+            Some(fx.bcx.ins().iconst(types::I8, i64::from(result)))
         }
         "type_id" | "type_name" => {
             // These are complex; fall through to let them be unresolved
@@ -2824,6 +2941,25 @@ fn build_fn_sig_from_ty(
     Ok(sig)
 }
 
+/// Scan a MIR body and return the set of locals whose address is taken
+/// (via `Rvalue::Ref` or `Rvalue::AddressOf`). These locals must be
+/// stack-allocated so that writes through pointers to them are observable.
+fn address_taken_locals(body: &MirBody) -> std::collections::HashSet<LocalId> {
+    let mut result = std::collections::HashSet::new();
+    for (_, bb) in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                StatementKind::Assign(_, Rvalue::Ref(_, place))
+                | StatementKind::Assign(_, Rvalue::AddressOf(_, place)) => {
+                    result.insert(place.local);
+                }
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
 /// Compile a single MIR body to a named function in a Module (ObjectModule or JITModule).
 ///
 /// `mirdata_layouts` is a pre-computed layout table from `.mirdata` files.
@@ -2870,6 +3006,11 @@ pub fn compile_fn(
         bcx.switch_to_block(entry_block);
         bcx.append_block_params_for_function_params(entry_block);
 
+        // Compute which locals have their address taken (via Ref/AddressOf).
+        // These must be stack-allocated even if they're Scalar, because code
+        // may write through the pointer.
+        let addr_taken = address_taken_locals(body);
+
         // Build a temporary FunctionCx for local setup (needed by CPlace constructors)
         let mut local_map = ArenaMap::new();
 
@@ -2880,7 +3021,29 @@ pub fn compile_fn(
                 .layout_of_ty(local.ty.clone(), env.clone())
                 .map_err(|e| format!("local layout error: {:?}", e))?;
 
+            // Force stack allocation for locals whose address is taken,
+            // since writing through the pointer must update the actual local.
+            let force_stack = addr_taken.contains(&local_id);
+
             let place = match local_layout.backend_repr {
+                BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _) if force_stack => {
+                    // Address-taken scalar: allocate as stack slot
+                    let size = u32::try_from(local_layout.size.bytes())
+                        .expect("stack slot too large");
+                    let align_shift = {
+                        let a = local_layout.align.abi.bytes();
+                        assert!(a.is_power_of_two());
+                        a.trailing_zeros() as u8
+                    };
+                    let slot = bcx.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            size,
+                            align_shift,
+                        ),
+                    );
+                    CPlace::for_ptr(pointer::Pointer::stack_slot(slot), local_layout)
+                }
                 BackendRepr::Scalar(scalar) => {
                     let clif_ty = scalar_to_clif_type(dl, &scalar);
                     let var = bcx.declare_var(clif_ty);
@@ -2953,12 +3116,32 @@ pub fn compile_fn(
             }
             match place.layout.backend_repr {
                 BackendRepr::Scalar(_) => {
-                    place.def_var(0, block_params[param_idx], &mut bcx);
+                    if place.is_register() {
+                        place.def_var(0, block_params[param_idx], &mut bcx);
+                    } else {
+                        // Address-taken scalar: store param into stack slot
+                        let mut flags = MemFlags::new();
+                        flags.set_notrap();
+                        place.to_ptr().store(&mut bcx, block_params[param_idx], flags);
+                    }
                     param_idx += 1;
                 }
                 BackendRepr::ScalarPair(_, _) => {
-                    place.def_var(0, block_params[param_idx], &mut bcx);
-                    place.def_var(1, block_params[param_idx + 1], &mut bcx);
+                    if place.is_register() {
+                        place.def_var(0, block_params[param_idx], &mut bcx);
+                        place.def_var(1, block_params[param_idx + 1], &mut bcx);
+                    } else {
+                        // Address-taken scalar pair: store both parts into stack slot
+                        let mut flags = MemFlags::new();
+                        flags.set_notrap();
+                        let ptr = place.to_ptr();
+                        ptr.store(&mut bcx, block_params[param_idx], flags);
+                        let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr
+                        else { unreachable!() };
+                        let b_off = value_and_place::scalar_pair_b_offset(dl, *a, *b);
+                        ptr.offset_i64(&mut bcx, pointer_type, b_off)
+                            .store(&mut bcx, block_params[param_idx + 1], flags);
+                    }
                     param_idx += 2;
                 }
                 _ => {
@@ -3316,23 +3499,37 @@ fn scan_body_for_callees(
         }
 
         let Some(term) = &bb.terminator else { continue };
-        let TerminatorKind::Call { func, .. } = &term.kind else { continue };
-        let OperandKind::Constant { ty, .. } = &func.kind else { continue };
-        let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
-        if let CallableDefId::FunctionId(callee_id) = def.0 {
-            // Skip virtual calls — trait methods on dyn types are dispatched
-            // through vtables, not compiled as standalone functions.
-            if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
-                if hir_ty::method_resolution::is_dyn_method(
-                    interner,
-                    env.param_env(),
-                    callee_id,
-                    callee_args,
-                ).is_some() {
-                    continue;
+        match &term.kind {
+            TerminatorKind::Call { func, .. } => {
+                let OperandKind::Constant { ty, .. } = &func.kind else { continue };
+                let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
+                if let CallableDefId::FunctionId(callee_id) = def.0 {
+                    // Skip virtual calls — trait methods on dyn types are dispatched
+                    // through vtables, not compiled as standalone functions.
+                    if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                        if hir_ty::method_resolution::is_dyn_method(
+                            interner,
+                            env.param_env(),
+                            callee_id,
+                            callee_args,
+                        ).is_some() {
+                            continue;
+                        }
+                    }
+                    queue.push_back((callee_id, callee_args.store()));
                 }
             }
-            queue.push_back((callee_id, callee_args.store()));
+            TerminatorKind::Drop { place, .. } => {
+                // Discover drop impl methods for types being dropped
+                let ty = place_ty(db, body, place);
+                let lang_items = hir_def::lang_item::lang_items(db, local_crate);
+                if let Some(drop_trait) = lang_items.Drop {
+                    if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, &ty) {
+                        queue.push_back((drop_func_id, empty_args_stored.clone()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

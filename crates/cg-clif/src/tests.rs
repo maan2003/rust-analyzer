@@ -1663,6 +1663,107 @@ fn foo() -> i32 {
     assert_eq!(result, 42);
 }
 
+#[test]
+fn jit_drop_basic() {
+    // Verify that Drop::drop is called on scope exit.
+    // The drop impl modifies a field; we verify the function compiles and runs correctly.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Guard {
+    val: i32,
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.val = 99;
+    }
+}
+fn foo() -> i32 {
+    let g = Guard { val: 42 };
+    g.val
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_drop_side_effect() {
+    // Verify Drop::drop is actually called by observing its side effect.
+    // The drop writes through a raw pointer to modify a caller's local.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Guard {
+    target: *mut i32,
+    val: i32,
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe { *(self.target) = self.val; }
+    }
+}
+fn write_via_drop(target: *mut i32) {
+    let _g = Guard { target, val: 42 };
+}
+fn foo() -> i32 {
+    let mut result: i32 = 0;
+    write_via_drop(&mut result as *mut i32);
+    result
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_drop_no_drop_impl() {
+    // Verify that types without Drop impls work fine (no-op drop).
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Pair { a: i32, b: i32 }
+fn foo() -> i32 {
+    let p = Pair { a: 10, b: 32 };
+    p.a + p.b
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_needs_drop_transitive() {
+    // needs_drop should return true for a struct that doesn't impl Drop
+    // itself but contains a field that does.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+#[rustc_intrinsic]
+const fn needs_drop<T>() -> bool { true }
+
+struct Inner;
+impl Drop for Inner {
+    fn drop(&mut self) {}
+}
+struct Outer { _inner: Inner }
+
+fn foo() -> i32 {
+    if needs_drop::<Outer>() { 1 } else { 0 }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
 // ---------------------------------------------------------------------------

@@ -50,6 +50,89 @@ pub fn has_drop_glue<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db
     has_drop_glue_impl(infcx, ty, env, &mut FxHashSet::default())
 }
 
+/// Simplified `has_drop_glue` for fully monomorphized types (no `InferCtxt` needed).
+/// Returns true if the type or any of its fields transitively need drop.
+/// Only valid for types with no type parameters or aliases remaining.
+pub fn has_drop_glue_mono<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> bool {
+    has_drop_glue_mono_impl(interner, ty, &mut FxHashSet::default())
+}
+
+fn has_drop_glue_mono_impl<'db>(
+    interner: DbInterner<'db>,
+    ty: Ty<'db>,
+    visited: &mut FxHashSet<Ty<'db>>,
+) -> bool {
+    if !visited.insert(ty) {
+        return false;
+    }
+
+    let db = interner.db;
+    match ty.kind() {
+        TyKind::Adt(adt_def, subst) => {
+            let adt_id = adt_def.def_id().0;
+            if has_destructor(interner, adt_id) {
+                return true;
+            }
+            match adt_id {
+                AdtId::StructId(id) => {
+                    if db
+                        .struct_signature(id)
+                        .flags
+                        .intersects(StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA)
+                    {
+                        return false;
+                    }
+                    db.field_types(id.into())
+                        .iter()
+                        .any(|(_, field_ty)| {
+                            has_drop_glue_mono_impl(
+                                interner,
+                                field_ty.get().instantiate(interner, subst),
+                                visited,
+                            )
+                        })
+                }
+                AdtId::UnionId(_) => false,
+                AdtId::EnumId(id) => id
+                    .enum_variants(db)
+                    .variants
+                    .iter()
+                    .any(|&(variant, _, _)| {
+                        db.field_types(variant.into())
+                            .iter()
+                            .any(|(_, field_ty)| {
+                                has_drop_glue_mono_impl(
+                                    interner,
+                                    field_ty.get().instantiate(interner, subst),
+                                    visited,
+                                )
+                            })
+                    }),
+            }
+        }
+        TyKind::Tuple(tys) => tys
+            .iter()
+            .any(|ty| has_drop_glue_mono_impl(interner, ty, visited)),
+        TyKind::Array(ty, len) => {
+            if consteval::try_const_usize(db, len) == Some(0) {
+                return false;
+            }
+            has_drop_glue_mono_impl(interner, ty, visited)
+        }
+        TyKind::Slice(ty) => has_drop_glue_mono_impl(interner, ty, visited),
+        TyKind::Closure(closure_id, subst) => {
+            let owner = db.lookup_intern_closure(closure_id.0).0;
+            let infer = InferenceResult::for_body(db, owner);
+            let (captures, _) = infer.closure_info(closure_id.0);
+            captures
+                .iter()
+                .any(|capture| has_drop_glue_mono_impl(interner, capture.ty(db, subst), visited))
+        }
+        TyKind::Dynamic(..) => true,
+        _ => false,
+    }
+}
+
 fn has_drop_glue_impl<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,

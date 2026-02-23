@@ -19,7 +19,7 @@ use crate::pointer::Pointer;
 use crate::{FunctionCx, scalar_to_clif_type};
 use hir_ty::layout::Layout;
 
-fn scalar_pair_b_offset(dl: &TargetDataLayout, a: Scalar, b: Scalar) -> i64 {
+pub(crate) fn scalar_pair_b_offset(dl: &TargetDataLayout, a: Scalar, b: Scalar) -> i64 {
     let b_offset = a.size(dl).align_to(b.align(dl).abi);
     i64::try_from(b_offset.bytes()).unwrap()
 }
@@ -243,6 +243,18 @@ impl CPlace {
             CPlaceInner::Addr(ptr, None) => ptr,
             CPlaceInner::Addr(_, Some(_)) => panic!("to_ptr on unsized CPlace; use to_ptr_unsized"),
             _ => panic!("to_ptr on non-Addr CPlace"),
+        }
+    }
+
+    /// Get a pointer to this place, spilling to the stack if necessary.
+    /// Used when we need the address of a place (e.g. for `drop(&mut self)`).
+    pub(crate) fn to_ptr_maybe_spill(&self, fx: &mut FunctionCx<'_, impl Module>) -> Pointer {
+        match self.inner {
+            CPlaceInner::Addr(ptr, _) => ptr,
+            CPlaceInner::Var(_) | CPlaceInner::VarPair(_, _) => {
+                let cval = self.to_cvalue(fx);
+                cval.force_stack(fx)
+            }
         }
     }
 
