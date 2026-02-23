@@ -1421,6 +1421,75 @@ fn main() -> ! {
     assert_eq!(code, 4);
 }
 
+#[test]
+fn compile_and_run_heap_alloc() {
+    // Manual heap allocation using the real allocator shims (__rust_alloc/dealloc).
+    // This exercises the same allocator path that Vec uses internally.
+    let code = compile_and_run(
+        r#"
+//- minicore: drop, sized, copy, size_of
+//- /main.rs
+unsafe extern "C" {
+    fn exit(code: i32) -> !;
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+struct Vec<T> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+impl<T> Vec<T> {
+    fn new() -> Vec<T> {
+        Vec { ptr: 0usize as *mut T, len: 0, cap: 0 }
+    }
+
+    fn push(&mut self, val: T) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        let dest = (self.ptr as usize + self.len * core::mem::size_of::<T>()) as *mut T;
+        unsafe { *dest = val; }
+        self.len = self.len + 1;
+    }
+
+    fn grow(&mut self) {
+        let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+        let new_size = new_cap * core::mem::size_of::<T>();
+        self.ptr = unsafe { malloc(new_size) } as *mut T;
+        self.cap = new_cap;
+    }
+
+    fn get(&self, idx: usize) -> &T {
+        let src = (self.ptr as usize + idx * core::mem::size_of::<T>()) as *const T;
+        unsafe { &*src }
+    }
+}
+
+impl<T> Drop for Vec<T> {
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            unsafe { free(self.ptr as *mut u8); }
+        }
+    }
+}
+
+fn main() -> ! {
+    let mut v = Vec::<i32>::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    let val = *v.get(1);
+    unsafe { exit(val) }
+}
+"#,
+        "heap_alloc",
+    );
+    assert_eq!(code, 20);
+}
+
 // ---------------------------------------------------------------------------
 // PassMode::Indirect tests (M11a) — memory-repr structs passed/returned by pointer
 // ---------------------------------------------------------------------------
@@ -1974,6 +2043,87 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 20);
+}
+
+#[test]
+fn jit_generic_vec() {
+    // A generic Vec<T> with heap allocation, push, index, and Drop.
+    // Exercises: generics + size_of intrinsic + raw pointer arithmetic +
+    // copy_nonoverlapping + generic drop glue + realloc.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy, size_of
+//- /main.rs
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+}
+
+struct Vec<T> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+impl<T> Vec<T> {
+    fn new() -> Vec<T> {
+        Vec { ptr: 0usize as *mut T, len: 0, cap: 0 }
+    }
+
+    fn push(&mut self, val: T) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        let dest = (self.ptr as usize + self.len * core::mem::size_of::<T>()) as *mut T;
+        unsafe { *dest = val; }
+        self.len = self.len + 1;
+    }
+
+    fn grow(&mut self) {
+        let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+        let new_size = new_cap * core::mem::size_of::<T>();
+        let new_ptr = if self.cap == 0 {
+            unsafe { malloc(new_size) }
+        } else {
+            unsafe { realloc(self.ptr as *mut u8, new_size) }
+        };
+        self.ptr = new_ptr as *mut T;
+        self.cap = new_cap;
+    }
+
+    fn get(&self, idx: usize) -> &T {
+        let src = (self.ptr as usize + idx * core::mem::size_of::<T>()) as *const T;
+        unsafe { &*src }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<T> Drop for Vec<T> {
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            unsafe { free(self.ptr as *mut u8); }
+        }
+    }
+}
+
+fn foo() -> i32 {
+    let mut v = Vec::<i32>::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    let val = *v.get(1);
+    let len = v.len() as i32;
+    // v is dropped here, calling free()
+    val + len  // 20 + 3 = 23
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 23);
 }
 
 // ---------------------------------------------------------------------------
