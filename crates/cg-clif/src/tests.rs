@@ -1418,3 +1418,85 @@ fn main() -> ! {
     );
     assert_eq!(code, 4);
 }
+
+// ---------------------------------------------------------------------------
+// PassMode::Indirect tests (M11a) — memory-repr structs passed/returned by pointer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_pass_and_return_big_struct() {
+    let result = jit_run::<i32>(
+        r#"
+struct Big {
+    a: i32,
+    b: i32,
+    c: i32,
+}
+fn make_big(x: i32) -> Big {
+    Big { a: x, b: x + 1, c: x + 2 }
+}
+fn sum_big(s: Big) -> i32 {
+    s.a + s.b + s.c
+}
+fn foo() -> i32 {
+    let b = make_big(10);
+    sum_big(b)
+}
+"#,
+        &["make_big", "sum_big", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 33); // 10 + 11 + 12
+}
+
+#[test]
+fn jit_pass_big_struct_and_modify() {
+    let result = jit_run::<i32>(
+        r#"
+struct Big {
+    a: i32,
+    b: i32,
+    c: i32,
+}
+fn double_fields(s: Big) -> Big {
+    Big { a: s.a * 2, b: s.b * 2, c: s.c * 2 }
+}
+fn foo() -> i32 {
+    let b = Big { a: 1, b: 2, c: 3 };
+    let d = double_fields(b);
+    d.a + d.b + d.c
+}
+"#,
+        &["double_fields", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 12); // 2 + 4 + 6
+}
+
+#[test]
+fn jit_big_struct_through_call_chain() {
+    let result = jit_run::<i32>(
+        r#"
+struct Triple {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+fn make(a: i32, b: i32, c: i32) -> Triple {
+    Triple { x: a, y: b, z: c }
+}
+fn add_triples(a: Triple, b: Triple) -> Triple {
+    make(a.x + b.x, a.y + b.y, a.z + b.z)
+}
+fn foo() -> i32 {
+    let t1 = make(1, 2, 3);
+    let t2 = make(10, 20, 30);
+    let t3 = add_triples(t1, t2);
+    t3.x + t3.y + t3.z
+}
+"#,
+        &["make", "add_triples", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 66); // 11 + 22 + 33
+}
