@@ -199,6 +199,24 @@ fn codegen_md_operand(
                 CValue::by_val(val, dest_layout.clone())
             }
             ConstKind::ZeroSized => CValue::zst(dest_layout.clone()),
+            ConstKind::Slice(bytes, meta) => {
+                // Slice constant (e.g. string literal): create a data section for the bytes,
+                // return a ScalarPair (data_ptr, len).
+                let data_id = {
+                    let mut desc = cranelift_module::DataDescription::new();
+                    desc.define(bytes.clone().into_boxed_slice());
+                    let name = format!("__const_slice_{}", bytes.len());
+                    let data_id = fx.module
+                        .declare_data(&name, Linkage::Local, false, false)
+                        .expect("declare slice data");
+                    fx.module.define_data(data_id, &desc).expect("define slice data");
+                    data_id
+                };
+                let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+                let data_ptr = fx.bcx.ins().global_value(fx.pointer_type, gv);
+                let len_val = fx.bcx.ins().iconst(fx.pointer_type, *meta as i64);
+                CValue::by_val_pair(data_ptr, len_val, dest_layout.clone())
+            }
             _ => panic!("unsupported constant kind: {:?}", c.kind),
         },
     }
@@ -227,18 +245,20 @@ fn codegen_md_cast(
         return CValue::by_val(func_addr, dest_layout.clone());
     }
 
-    // Load source operand as scalar
-    let src_layout = match operand {
-        Operand::Copy(p) | Operand::Move(p) => {
-            fx.local_place_idx(p.local as usize).layout.clone()
-        }
-        Operand::Constant(_) => dest_layout.clone(),
-    };
+    // Handle Transmute: supports Scalar, ScalarPair, and memory-repr
+    if let CastKind::Transmute = kind {
+        let src_layout = md_operand_layout(fx, operand);
+        let from_cval = codegen_md_operand(fx, operand, &src_layout);
+        return crate::codegen_transmute(fx, from_cval, dest_layout);
+    }
+
+    // All other casts operate on scalars
+    let src_layout = md_operand_layout(fx, operand);
     let from_cval = codegen_md_operand(fx, operand, &src_layout);
     let from_val = from_cval.load_scalar(fx);
 
     let BackendRepr::Scalar(target_scalar) = dest_layout.backend_repr else {
-        todo!("cast target must be scalar in mirdata");
+        todo!("non-scalar cast target in mirdata: {:?}", kind);
     };
 
     // Determine source signedness from source layout
@@ -262,7 +282,7 @@ fn codegen_md_cast(
             | PointerCoercion::ArrayToPointer
             | PointerCoercion::ClosureFnPointer,
         ) => crate::ScalarCastKind::PtrLike,
-        CastKind::Transmute => crate::ScalarCastKind::Transmute,
+        CastKind::Transmute => unreachable!("handled above"),
         CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer) => {
             unreachable!("handled above")
         }
@@ -282,38 +302,72 @@ fn codegen_md_rvalue(
         Rvalue::Use(operand) => codegen_md_operand(fx, operand, dest_layout),
         Rvalue::Cast(kind, operand, _ty) => codegen_md_cast(fx, kind, operand, dest_layout),
         Rvalue::BinaryOp(op, lhs, rhs) => {
-            // For Copy/Move, layout comes from the local. For constants,
-            // use dest_layout as fallback (correct for arithmetic; for
-            // comparisons, use locals instead of constants).
-            let op_layout = match lhs {
-                Operand::Copy(p) | Operand::Move(p) => {
-                    fx.local_place_idx(p.local as usize).layout.clone()
-                }
-                Operand::Constant(_) => dest_layout.clone(),
-            };
-            let lhs_cval = codegen_md_operand(fx, lhs, &op_layout);
-            let rhs_cval = codegen_md_operand(fx, rhs, &op_layout);
+            let lhs_layout = md_operand_layout(fx, lhs);
+            let rhs_layout = md_operand_layout(fx, rhs);
+            let lhs_cval = codegen_md_operand(fx, lhs, &lhs_layout);
+            let rhs_cval = codegen_md_operand(fx, rhs, &rhs_layout);
             let lhs_val = lhs_cval.load_scalar(fx);
             let rhs_val = rhs_cval.load_scalar(fx);
 
             let BackendRepr::Scalar(scalar) = lhs_cval.layout.backend_repr else {
                 panic!("expected scalar for binop operand");
             };
+            // Checked (overflow) binops return (result, bool) as ScalarPair
+            if op.overflowing_to_wrapping().is_some() {
+                let Primitive::Int(_, signed) = scalar.primitive() else {
+                    panic!("overflow binop on non-integer");
+                };
+                let (result, overflow) = crate::codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
+                return CValue::by_val_pair(result, overflow, dest_layout.clone());
+            }
             let val = match scalar.primitive() {
                 Primitive::Int(_, signed) => {
                     crate::codegen_int_binop(fx, op, lhs_val, rhs_val, signed)
                 }
                 Primitive::Float(_) => crate::codegen_float_binop(fx, op, lhs_val, rhs_val),
-                Primitive::Pointer(_) => todo!("pointer binop in mirdata"),
+                Primitive::Pointer(_) => match op {
+                    ra_mir_types::BinOp::Offset => {
+                        // Offset: ptr + (count * pointee_size)
+                        let lhs_ty = operand_ty(fx, lhs);
+                        let pointee_ty = match &lhs_ty {
+                            ra_mir_types::Ty::RawPtr(_, pointee) | ra_mir_types::Ty::Ref(_, pointee) => (**pointee).clone(),
+                            _ => panic!("Offset on non-pointer: {:?}", lhs_ty),
+                        };
+                        let pointee_layout = fx.md_layout(&pointee_ty);
+                        let byte_offset = fx.bcx.ins().imul_imm(rhs_val, pointee_layout.size.bytes() as i64);
+                        fx.bcx.ins().iadd(lhs_val, byte_offset)
+                    }
+                    ra_mir_types::BinOp::Eq | ra_mir_types::BinOp::Ne
+                    | ra_mir_types::BinOp::Lt | ra_mir_types::BinOp::Le
+                    | ra_mir_types::BinOp::Ge | ra_mir_types::BinOp::Gt => {
+                        let cc = crate::bin_op_to_intcc(op, false);
+                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                    }
+                    _ => todo!("pointer binop: {:?}", op),
+                }
             };
             CValue::by_val(val, dest_layout.clone())
         }
         Rvalue::UnaryOp(op, operand) => {
-            let val_cval = codegen_md_operand(fx, operand, dest_layout);
+            let op_layout = md_operand_layout(fx, operand);
+            let val_cval = codegen_md_operand(fx, operand, &op_layout);
             let val = val_cval.load_scalar(fx);
+            let BackendRepr::Scalar(scalar) = val_cval.layout.backend_repr else {
+                panic!("expected scalar for unary op");
+            };
             let res = match op {
-                ra_mir_types::UnOp::Neg => fx.bcx.ins().ineg(val),
-                ra_mir_types::UnOp::Not => fx.bcx.ins().bnot(val),
+                ra_mir_types::UnOp::Neg => match scalar.primitive() {
+                    Primitive::Float(_) => fx.bcx.ins().fneg(val),
+                    _ => fx.bcx.ins().ineg(val),
+                },
+                ra_mir_types::UnOp::Not => {
+                    // For booleans (valid_range 0..=1), use icmp_imm eq 0
+                    if scalar.is_bool() {
+                        fx.bcx.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, val, 0)
+                    } else {
+                        fx.bcx.ins().bnot(val)
+                    }
+                }
                 ra_mir_types::UnOp::PtrMetadata => todo!("PtrMetadata in mirdata"),
             };
             CValue::by_val(res, dest_layout.clone())
@@ -383,7 +437,20 @@ fn codegen_md_rvalue(
             }
             dest_place.to_cvalue(fx)
         }
-        _ => panic!("unsupported rvalue: {:?}", rvalue),
+        Rvalue::Repeat(operand, count) => {
+            let dest_place = CPlace::new_stack_slot(fx, dest_layout.clone());
+            let elem_layout = md_operand_layout(fx, operand);
+            let elem_cval = codegen_md_operand(fx, operand, &elem_layout);
+            let elem_size = elem_layout.size.bytes() as i64;
+            for i in 0..*count {
+                let offset = elem_size * i as i64;
+                let field_ptr = dest_place.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, offset);
+                let field_place = CPlace::for_ptr(field_ptr, elem_layout.clone());
+                field_place.write_cvalue(fx, elem_cval.clone());
+            }
+            dest_place.to_cvalue(fx)
+        }
+        Rvalue::ThreadLocalRef(_) => todo!("ThreadLocalRef in mirdata"),
     }
 }
 
@@ -421,6 +488,185 @@ fn operand_ty(
             }
         }
         Operand::Constant(c) => c.ty.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Call codegen
+// ---------------------------------------------------------------------------
+
+fn codegen_md_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    func: &Operand,
+    args: &[Operand],
+    dest: &ra_mir_types::Place,
+    target: &Option<u32>,
+) {
+    let dest_place = codegen_md_place(fx, dest);
+
+    match func {
+        Operand::Constant(c) => match &c.ty {
+            ra_mir_types::Ty::FnDef(hash, _) => {
+                let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
+                    unreachable!()
+                };
+                let func_id = *fn_registry.get(hash).expect("called function not in fn_registry");
+                let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
+                emit_md_call_direct(fx, func_ref, args, &dest_place);
+            }
+            _ => panic!("non-FnDef constant call: {:?}", c.ty),
+        },
+        Operand::Copy(p) | Operand::Move(p) => {
+            // Indirect call through a fn pointer
+            let fn_ptr_cval = codegen_md_place(fx, p).to_cvalue(fx);
+            let fn_ptr = fn_ptr_cval.load_scalar(fx);
+
+            // Build signature from the fn pointer type
+            let fn_ptr_ty = operand_ty(fx, func);
+            let (param_tys, _ret_ty) = match &fn_ptr_ty {
+                ra_mir_types::Ty::FnPtr(params, ret) => (params.clone(), (**ret).clone()),
+                _ => panic!("indirect call on non-FnPtr type: {:?}", fn_ptr_ty),
+            };
+
+            let mut sig = Signature::new(fx.isa.default_call_conv());
+
+            // Return type
+            let is_sret = if !dest_place.layout.is_zst() {
+                crate::append_ret_to_sig(&mut sig, fx.dl, &dest_place.layout)
+            } else {
+                false
+            };
+
+            // Parameter types
+            for param_ty in &param_tys {
+                let param_layout = fx.md_layout(param_ty);
+                crate::append_param_to_sig(&mut sig, fx.dl, &param_layout);
+            }
+
+            let sig_ref = fx.bcx.import_signature(sig);
+
+            // Build argument values
+            let mut call_args: Vec<Value> = Vec::new();
+            let sret_slot = if is_sret {
+                let slot = CPlace::new_stack_slot(fx, dest_place.layout.clone());
+                let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+                call_args.push(ptr);
+                Some(slot)
+            } else {
+                None
+            };
+
+            push_md_call_args(fx, args, &mut call_args);
+
+            let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
+            store_md_call_result(fx, call, &dest_place, sret_slot);
+        }
+    }
+
+    // Continue to target block
+    if let Some(target) = target {
+        let block = fx.clif_block_idx(*target as usize);
+        fx.bcx.ins().jump(block, &[]);
+    }
+}
+
+/// Emit a direct call (func_ref already resolved) with memory-repr support.
+fn emit_md_call_direct(
+    fx: &mut FunctionCx<'_, impl Module>,
+    func_ref: cranelift_codegen::ir::FuncRef,
+    args: &[Operand],
+    dest_place: &CPlace,
+) {
+    let mut call_args: Vec<Value> = Vec::new();
+
+    // If return is memory-repr, allocate sret slot and pass pointer as first arg
+    let is_sret = !dest_place.layout.is_zst()
+        && matches!(dest_place.layout.backend_repr, BackendRepr::Memory { .. });
+    let sret_slot = if is_sret {
+        let slot = CPlace::new_stack_slot(fx, dest_place.layout.clone());
+        let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+        call_args.push(ptr);
+        Some(slot)
+    } else {
+        None
+    };
+
+    push_md_call_args(fx, args, &mut call_args);
+
+    let call = fx.bcx.ins().call(func_ref, &call_args);
+    store_md_call_result(fx, call, dest_place, sret_slot);
+}
+
+/// Push argument values onto `call_args`, handling all backend reprs.
+fn push_md_call_args(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+    call_args: &mut Vec<Value>,
+) {
+    for arg in args {
+        let arg_layout = md_operand_layout(fx, arg);
+        let arg_cval = codegen_md_operand(fx, arg, &arg_layout);
+        if arg_cval.layout.is_zst() {
+            continue;
+        }
+        match arg_cval.layout.backend_repr {
+            BackendRepr::Scalar(_) => call_args.push(arg_cval.load_scalar(fx)),
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = arg_cval.load_scalar_pair(fx);
+                call_args.push(a);
+                call_args.push(b);
+            }
+            _ => {
+                // Memory-repr: pass as pointer
+                let ptr = arg_cval.force_stack(fx);
+                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+            }
+        }
+    }
+}
+
+/// Store the return value from a call into `dest_place`.
+fn store_md_call_result(
+    fx: &mut FunctionCx<'_, impl Module>,
+    call: cranelift_codegen::ir::Inst,
+    dest_place: &CPlace,
+    sret_slot: Option<CPlace>,
+) {
+    if let Some(sret_slot) = sret_slot {
+        let cval = sret_slot.to_cvalue(fx);
+        dest_place.write_cvalue(fx, cval);
+    } else if !dest_place.layout.is_zst() {
+        let results = fx.bcx.inst_results(call).to_vec();
+        match dest_place.layout.backend_repr {
+            BackendRepr::Scalar(_) => {
+                let cval = CValue::by_val(results[0], dest_place.layout.clone());
+                dest_place.write_cvalue(fx, cval);
+            }
+            BackendRepr::ScalarPair(_, _) => {
+                let cval = CValue::by_val_pair(results[0], results[1], dest_place.layout.clone());
+                dest_place.write_cvalue(fx, cval);
+            }
+            _ => unreachable!("non-sret memory return without sret slot"),
+        }
+    }
+}
+
+/// Get the layout for an operand (works for locals-with-projections and constants).
+fn md_operand_layout(
+    fx: &FunctionCx<'_, impl Module>,
+    operand: &Operand,
+) -> LayoutArc {
+    match operand {
+        Operand::Copy(p) | Operand::Move(p) => {
+            if p.projections.is_empty() {
+                fx.local_place_idx(p.local as usize).layout.clone()
+            } else {
+                // Walk projections to find the final type, then look up layout
+                let ty = operand_ty(fx, &Operand::Copy(p.clone()));
+                fx.md_layout(&ty)
+            }
+        }
+        Operand::Constant(c) => fx.md_layout(&c.ty),
     }
 }
 
@@ -473,73 +719,7 @@ fn codegen_md_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &Terminator
             switch.emit(&mut fx.bcx, discr_val, otherwise);
         }
         Terminator::Call { func, args, dest, target, unwind: _ } => {
-            // Resolve callee FuncId from fn_registry
-            let func_id = match func {
-                Operand::Constant(c) => {
-                    let ra_mir_types::Ty::FnDef(hash, _) = &c.ty else {
-                        panic!("non-FnDef call not yet supported in mirdata");
-                    };
-                    let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
-                        unreachable!()
-                    };
-                    *fn_registry.get(hash).expect("called function not found in fn_registry")
-                }
-                _ => panic!("indirect calls not yet supported in mirdata"),
-            };
-
-            let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
-
-            // Build call arguments (scalar-only for now)
-            let mut call_args = Vec::new();
-            for arg in args {
-                let arg_layout = match arg {
-                    Operand::Copy(p) | Operand::Move(p) => {
-                        fx.local_place_idx(p.local as usize).layout.clone()
-                    }
-                    Operand::Constant(_) => {
-                        // For constant args in calls, we need the callee's param layout.
-                        // For now, require using locals for call args.
-                        panic!("constant args in call not yet supported; assign to local first");
-                    }
-                };
-                let arg_cval = codegen_md_operand(fx, arg, &arg_layout);
-                match arg_cval.layout.backend_repr {
-                    BackendRepr::Scalar(_) => call_args.push(arg_cval.load_scalar(fx)),
-                    BackendRepr::ScalarPair(_, _) => {
-                        let (a, b) = arg_cval.load_scalar_pair(fx);
-                        call_args.push(a);
-                        call_args.push(b);
-                    }
-                    _ if arg_cval.layout.is_zst() => {}
-                    _ => panic!("memory-repr call args not yet supported in mirdata"),
-                }
-            }
-
-            let call = fx.bcx.ins().call(func_ref, &call_args);
-
-            // Store return value
-            let dest_place = codegen_md_place(fx, dest);
-            if !dest_place.layout.is_zst() {
-                let results = fx.bcx.inst_results(call).to_vec();
-                match dest_place.layout.backend_repr {
-                    BackendRepr::Scalar(_) => {
-                        let cval = CValue::by_val(results[0], dest_place.layout.clone());
-                        dest_place.write_cvalue(fx, cval);
-                    }
-                    BackendRepr::ScalarPair(_, _) => {
-                        let cval =
-                            CValue::by_val_pair(results[0], results[1], dest_place.layout.clone());
-                        dest_place.write_cvalue(fx, cval);
-                    }
-                    _ => panic!("non-scalar return not yet supported in mirdata call"),
-                }
-            }
-
-            // Continue to target block
-            if let Some(target) = target {
-                let block = fx.clif_block_idx(*target as usize);
-                fx.bcx.ins().jump(block, &[]);
-            }
+            codegen_md_call(fx, func, args, dest, target);
         }
         Terminator::Unreachable => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
@@ -1698,6 +1878,709 @@ mod tests {
             assert_eq!(f(-1), -1i64); // sign extension
             assert_eq!(f(i32::MAX), i32::MAX as i64);
             assert_eq!(f(i32::MIN), i32::MIN as i64);
+        }
+    }
+
+    // -- memory-repr struct (3 fields): sret return + pass by pointer ---------
+
+    fn triple_i32_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]),
+            layout: LayoutInfo {
+                size: 12,
+                align: 4,
+                backend_repr: ExportedBackendRepr::Memory { sized: true },
+                fields: ExportedFieldsShape::Arbitrary { offsets: vec![0, 4, 8] },
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mirdata_sret_return() {
+        // fn foo() -> (i32, i32, i32) { (10, 20, 30) }
+        // Then extract the first field to verify.
+        let triple_ty = Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]);
+        let layout_entries = vec![i32_layout_entry(), triple_i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        // Callee: fn make_triple() -> (i32, i32, i32) { (10, 20, 30) }
+        let callee_hash: (u64, u64) = (10, 10);
+        let callee = FnBody {
+            def_path_hash: callee_hash,
+            name: "make_triple".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: triple_ty.clone(), layout: Some(1) }, // _0: return
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::Aggregate(
+                            ra_mir_types::AggregateKind::Tuple,
+                            vec![
+                                Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(10, 4) }),
+                                Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(20, 4) }),
+                                Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(30, 4) }),
+                            ],
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        // Caller: fn test() -> i32 { make_triple().1 }
+        let caller = FnBody {
+            def_path_hash: (20, 20),
+            name: "test_sret".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: triple_ty.clone(), layout: Some(1) },     // _1: triple
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef(callee_hash, vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![],
+                            dest: Place { local: 1, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![Projection::Field(1, Ty::Int(IntTy::I32))],
+                            })),
+                        )],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let callee_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &callee, &layouts,
+            "make_triple", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile callee");
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(callee_hash, callee_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller, &layouts,
+            "test_sret", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile caller");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 20); // second field of (10, 20, 30)
+        }
+    }
+
+    // -- memory-repr pass by pointer ------------------------------------------
+
+    #[test]
+    fn mirdata_memory_repr_arg() {
+        // fn sum_triple(t: (i32, i32, i32)) -> i32 { t.0 + t.1 + t.2 }
+        let triple_ty = Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]);
+        let layout_entries = vec![i32_layout_entry(), triple_i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        // Callee: fn sum_triple(t: (i32, i32, i32)) -> i32 { t.0 + t.1 + t.2 }
+        let callee_hash: (u64, u64) = (11, 11);
+        let callee = FnBody {
+            def_path_hash: callee_hash,
+            name: "sum_triple".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: triple_ty.clone(), layout: Some(1) },     // _1: t (arg)
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _2: tmp
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        // _2 = t.0 + t.1
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place { local: 1, projections: vec![Projection::Field(0, Ty::Int(IntTy::I32))] }),
+                                Operand::Copy(Place { local: 1, projections: vec![Projection::Field(1, Ty::Int(IntTy::I32))] }),
+                            ),
+                        ),
+                        // _0 = _2 + t.2
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                Operand::Copy(Place { local: 1, projections: vec![Projection::Field(2, Ty::Int(IntTy::I32))] }),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        // Caller: fn test() -> i32 { sum_triple((3, 5, 7)) }
+        let caller = FnBody {
+            def_path_hash: (21, 21),
+            name: "test_mem_arg".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: triple_ty.clone(), layout: Some(1) },     // _1: triple
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Aggregate(
+                                ra_mir_types::AggregateKind::Tuple,
+                                vec![
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(3, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(5, 4) }),
+                                    Operand::Constant(ConstOperand { ty: Ty::Int(IntTy::I32), kind: ConstKind::Scalar(7, 4) }),
+                                ],
+                            ),
+                        )],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef(callee_hash, vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![Operand::Copy(Place { local: 1, projections: vec![] })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let callee_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &callee, &layouts,
+            "sum_triple", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile callee");
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(callee_hash, callee_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller, &layouts,
+            "test_mem_arg", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile caller");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 15); // 3 + 5 + 7
+        }
+    }
+
+    // -- indirect fn pointer call ---------------------------------------------
+
+    #[test]
+    fn mirdata_fn_ptr_call() {
+        // fn double(x: i32) -> i32 { x + x }
+        // fn test() -> i32 {
+        //     let fp: fn(i32) -> i32 = double;   // ReifyFnPointer
+        //     fp(21)                              // indirect call
+        // }
+        let fn_ptr_ty = Ty::FnPtr(vec![Ty::Int(IntTy::I32)], Box::new(Ty::Int(IntTy::I32)));
+        let layout_entries = vec![
+            i32_layout_entry(),
+            // fn pointer is just a scalar pointer
+            TypeLayoutEntry {
+                ty: fn_ptr_ty.clone(),
+                layout: LayoutInfo {
+                    size: 8,
+                    align: 8,
+                    backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                        primitive: ExportedPrimitive::Pointer,
+                        valid_range_start: 1,
+                        valid_range_end: u64::MAX as u128,
+                    }),
+                    fields: ExportedFieldsShape::Primitive,
+                    variants: ExportedVariants::Single { index: 0 },
+                    largest_niche: Some(ExportedNiche {
+                        offset: 0,
+                        scalar: ExportedScalar {
+                            primitive: ExportedPrimitive::Pointer,
+                            valid_range_start: 1,
+                            valid_range_end: u64::MAX as u128,
+                        },
+                    }),
+                },
+            },
+        ];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        let double_hash: (u64, u64) = (30, 30);
+        let double = FnBody {
+            def_path_hash: double_hash,
+            name: "double".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let caller = FnBody {
+            def_path_hash: (31, 31),
+            name: "test_fnptr".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },   // _0: return
+                    Local { ty: fn_ptr_ty.clone(), layout: Some(1) },     // _1: fn pointer
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },   // _2: arg
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![
+                            // _1 = double as fn(i32) -> i32  (ReifyFnPointer)
+                            Statement::Assign(
+                                Place { local: 1, projections: vec![] },
+                                Rvalue::Cast(
+                                    CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                                    Operand::Constant(ConstOperand {
+                                        ty: Ty::FnDef(double_hash, vec![]),
+                                        kind: ConstKind::ZeroSized,
+                                    }),
+                                    fn_ptr_ty.clone(),
+                                ),
+                            ),
+                            // _2 = 21
+                            Statement::Assign(
+                                Place { local: 2, projections: vec![] },
+                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(21, 4),
+                                })),
+                            ),
+                        ],
+                        // _0 = _1(_2)  indirect call
+                        terminator: Terminator::Call {
+                            func: Operand::Copy(Place { local: 1, projections: vec![] }),
+                            args: vec![Operand::Copy(Place { local: 2, projections: vec![] })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let double_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &double, &layouts,
+            "double", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile double");
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(double_hash, double_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller, &layouts,
+            "test_fnptr", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile caller");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 42); // double(21) via fn pointer
+        }
+    }
+
+    // -- Rvalue::Repeat: [val; N] array creation ------------------------------
+
+    #[test]
+    fn mirdata_repeat() {
+        // fn foo() -> i32 {
+        //   let arr: [i32; 3] = [7; 3];
+        //   arr[1]
+        // }
+        let arr_ty = Ty::Array(Box::new(Ty::Int(IntTy::I32)), 3);
+        let layout_entries = vec![
+            i32_layout_entry(),
+            TypeLayoutEntry {
+                ty: arr_ty.clone(),
+                layout: LayoutInfo {
+                    size: 12,
+                    align: 4,
+                    backend_repr: ExportedBackendRepr::Memory { sized: true },
+                    fields: ExportedFieldsShape::Array { stride: 4, count: 3 },
+                    variants: ExportedVariants::Single { index: 0 },
+                    largest_niche: None,
+                },
+            },
+            usize_layout_entry(),
+        ];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "repeat_test".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: arr_ty.clone(), layout: Some(1) },        // _1: arr
+                    Local { ty: Ty::Uint(UintTy::Usize), layout: Some(2) }, // _2: index
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Repeat(
+                                Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(7, 4),
+                                }),
+                                3,
+                            ),
+                        ),
+                        // _2 = 1usize
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: Ty::Uint(UintTy::Usize),
+                                kind: ConstKind::Scalar(1, 8),
+                            })),
+                        ),
+                        // _0 = arr[_2]
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![Projection::Index(2)],
+                            })),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &fn_body, &layouts,
+            "repeat_test", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 7);
+        }
+    }
+
+    // -- constant args in calls -----------------------------------------------
+
+    #[test]
+    fn mirdata_constant_call_arg() {
+        // fn double(x: i32) -> i32 { x + x }
+        // fn test() -> i32 { double(21) }  // 21 passed as constant operand
+        let layout_entries = vec![i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        let double_hash: (u64, u64) = (40, 40);
+        let double = FnBody {
+            def_path_hash: double_hash,
+            name: "double_const".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        // Caller passes constant directly (no intermediate local)
+        let caller = FnBody {
+            def_path_hash: (41, 41),
+            name: "test_const_arg".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef(double_hash, vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![Operand::Constant(ConstOperand {
+                                ty: Ty::Int(IntTy::I32),
+                                kind: ConstKind::Scalar(21, 4),
+                            })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let double_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &double, &layouts,
+            "double_const", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile double");
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(double_hash, double_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller, &layouts,
+            "test_const_arg", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile caller");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 42); // double(21) = 42
+        }
+    }
+
+    // -- checked overflow (AddWithOverflow) -----------------------------------
+
+    #[test]
+    fn mirdata_checked_add() {
+        // fn checked_add(a: i32, b: i32) -> (i32, bool) {
+        //     AddWithOverflow(a, b)
+        // }
+        let bool_ty = Ty::Bool;
+        let pair_ty = Ty::Tuple(vec![Ty::Int(IntTy::I32), bool_ty.clone()]);
+        let layout_entries = vec![
+            i32_layout_entry(),
+            bool_layout_entry(),
+            // (i32, bool) layout: ScalarPair(i32, i8) with size 8, align 4
+            TypeLayoutEntry {
+                ty: pair_ty.clone(),
+                layout: LayoutInfo {
+                    size: 8,
+                    align: 4,
+                    backend_repr: ExportedBackendRepr::ScalarPair(
+                        ExportedScalar {
+                            primitive: ExportedPrimitive::Int { size_bytes: 4, signed: true },
+                            valid_range_start: 0,
+                            valid_range_end: u32::MAX as u128,
+                        },
+                        ExportedScalar {
+                            primitive: ExportedPrimitive::Int { size_bytes: 1, signed: false },
+                            valid_range_start: 0,
+                            valid_range_end: 1,
+                        },
+                    ),
+                    fields: ExportedFieldsShape::Arbitrary { offsets: vec![0, 4] },
+                    variants: ExportedVariants::Single { index: 0 },
+                    largest_niche: None,
+                },
+            },
+        ];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "checked_add".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: pair_ty.clone(), layout: Some(2) }, // _0: return (i32, bool)
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: a
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _2: b
+                ],
+                arg_count: 2,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::AddWithOverflow,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Operand::Copy(Place { local: 2, projections: vec![] }),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &fn_body, &layouts,
+            "checked_add", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32, i32) -> (i32, bool) = std::mem::transmute(code);
+            assert_eq!(f(3, 4), (7, false));          // no overflow
+            assert_eq!(f(i32::MAX, 1), (i32::MIN, true)); // overflow!
+        }
+    }
+
+    // -- transmute (scalar → scalar) -----------------------------------------
+
+    #[test]
+    fn mirdata_transmute() {
+        // fn transmute_i32_to_u32(x: i32) -> u32 { transmute(x) }
+        let u32_layout_entry = TypeLayoutEntry {
+            ty: Ty::Uint(UintTy::U32),
+            layout: LayoutInfo {
+                size: 4,
+                align: 4,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Int { size_bytes: 4, signed: false },
+                    valid_range_start: 0,
+                    valid_range_end: u32::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        };
+        let layout_entries = vec![i32_layout_entry(), u32_layout_entry];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "transmute_test".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Uint(UintTy::U32), layout: Some(1) }, // _0: return u32
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },   // _1: x i32
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::Cast(
+                            CastKind::Transmute,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Ty::Uint(UintTy::U32),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &fn_body, &layouts,
+            "transmute_test", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32) -> u32 = std::mem::transmute(code);
+            assert_eq!(f(-1), u32::MAX);
+            assert_eq!(f(42), 42);
         }
     }
 }

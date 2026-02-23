@@ -547,7 +547,7 @@ fn codegen_cast(
 
 /// Handle `CastKind::Transmute`: reinterpret bits with a different layout.
 /// Reference: cg_clif/src/value_and_place.rs `write_cvalue_transmute`
-fn codegen_transmute(
+pub(crate) fn codegen_transmute(
     fx: &mut FunctionCx<'_, impl Module>,
     from: CValue,
     target_layout: &LayoutArc,
@@ -584,7 +584,7 @@ fn codegen_transmute(
 
 /// Bitcast a Cranelift value to a different type of the same size.
 /// Returns unchanged if types already match.
-fn clif_bitcast(
+pub(crate) fn clif_bitcast(
     fx: &mut FunctionCx<'_, impl Module>,
     val: Value,
     dst_ty: Type,
