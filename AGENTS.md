@@ -11,3 +11,5 @@ crates/cg-clif/ is our MIR->Cranelift codegen crate using r-a types. This is whe
 rustc/ is the rust tree, but not a subtree. it is read only.
 
 cargo .. -p .. is slow, avoid it.
+
+AVOID HACKS, just say it to the user
