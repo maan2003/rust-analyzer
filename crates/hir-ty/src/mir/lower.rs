@@ -8,8 +8,8 @@ use hir_def::{
     ItemContainerId, LocalFieldId, Lookup, TraitId, TupleId,
     expr_store::{Body, ExpressionStore, HygieneId, path::Path},
     hir::{
-        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ExprId, LabelId, Literal, MatchArm,
-        Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread,
+        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ClosureKind, ExprId, LabelId,
+        Literal, MatchArm, Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -912,7 +912,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(None)
             }
             Expr::Become { .. } => not_supported!("tail-calls"),
-            Expr::Yield { .. } => not_supported!("yield"),
+            Expr::Yield { expr } => {
+                let (value, current) = if let Some(expr) = expr {
+                    let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)? else {
+                        return Ok(None);
+                    };
+                    (op, c)
+                } else {
+                    let unit_ty = self.expr_ty_without_adjust(expr_id);
+                    (Operand::from_concrete_const(Box::default(), MemoryMap::default(), unit_ty), current)
+                };
+                let resume_arg = place;
+                let resume = self.new_basic_block();
+                self.set_terminator(
+                    current,
+                    TerminatorKind::Yield { value, resume, resume_arg, drop: None },
+                    expr_id.into(),
+                );
+                Ok(Some(resume))
+            }
             Expr::RecordLit { fields, path, spread, .. } => {
                 let spread_place = match *spread {
                     RecordSpread::Expr(it) => {
@@ -1001,7 +1019,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Await { .. } => not_supported!("await"),
             Expr::Yeet { .. } => not_supported!("yeet"),
-            Expr::Async { .. } => not_supported!("async block"),
+            Expr::Async { .. } => {
+                let ty = self.expr_ty_without_adjust(expr_id);
+                self.push_assignment(
+                    current,
+                    place,
+                    Rvalue::Aggregate(AggregateKind::Coroutine(ty.store()), Box::new([])),
+                    expr_id.into(),
+                );
+                Ok(Some(current))
+            }
             &Expr::Const(_) => {
                 // let subst = self.placeholder_subst();
                 // self.lower_const(
@@ -1299,64 +1326,86 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 );
                 Ok(Some(current))
             }
-            Expr::Closure { .. } => {
+            Expr::Closure { closure_kind, .. } => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let TyKind::Closure(id, _) = ty.kind() else {
-                    not_supported!("closure with non closure type");
-                };
-                self.result.closures.push(id.0);
-                let (captures, _) = self.infer.closure_info(id.0);
-                let mut operands = vec![];
-                for capture in captures.iter() {
-                    let p = Place {
-                        local: self.binding_local(capture.place.local)?,
-                        projection: self.result.projection_store.intern(
-                            capture
-                                .place
-                                .projections
-                                .clone()
-                                .into_iter()
-                                .map(|it| match it {
-                                    HirPlaceProjection::Deref => ProjectionElem::Deref,
-                                    HirPlaceProjection::Field(field_id) => {
-                                        ProjectionElem::Field(Either::Left(field_id))
-                                    }
-                                    HirPlaceProjection::TupleField(idx) => {
-                                        ProjectionElem::Field(Either::Right(TupleFieldId {
-                                            tuple: TupleId(!0), // Dummy as it's unused
-                                            index: idx,
-                                        }))
-                                    }
-                                })
-                                .collect(),
-                        ),
-                    };
-                    match &capture.kind {
-                        CaptureKind::ByRef(bk) => {
-                            let tmp_ty = capture.ty.get().instantiate_identity();
-                            // FIXME: Handle more than one span.
-                            let capture_spans = capture.spans();
-                            let tmp: Place = self.temp(tmp_ty, current, capture_spans[0])?.into();
-                            self.push_assignment(
-                                current,
-                                tmp,
-                                Rvalue::Ref(*bk, p),
-                                capture_spans[0],
-                            );
-                            operands.push(Operand { kind: OperandKind::Move(tmp), span: None });
+                match closure_kind {
+                    ClosureKind::Closure => {
+                        let TyKind::Closure(id, _) = ty.kind() else {
+                            not_supported!("closure with non closure type");
+                        };
+                        self.result.closures.push(id.0);
+                        let (captures, _) = self.infer.closure_info(id.0);
+                        let mut operands = vec![];
+                        for capture in captures.iter() {
+                            let p = Place {
+                                local: self.binding_local(capture.place.local)?,
+                                projection: self.result.projection_store.intern(
+                                    capture
+                                        .place
+                                        .projections
+                                        .clone()
+                                        .into_iter()
+                                        .map(|it| match it {
+                                            HirPlaceProjection::Deref => ProjectionElem::Deref,
+                                            HirPlaceProjection::Field(field_id) => {
+                                                ProjectionElem::Field(Either::Left(field_id))
+                                            }
+                                            HirPlaceProjection::TupleField(idx) => {
+                                                ProjectionElem::Field(Either::Right(TupleFieldId {
+                                                    tuple: TupleId(!0), // Dummy as it's unused
+                                                    index: idx,
+                                                }))
+                                            }
+                                        })
+                                        .collect(),
+                                ),
+                            };
+                            match &capture.kind {
+                                CaptureKind::ByRef(bk) => {
+                                    let tmp_ty = capture.ty.get().instantiate_identity();
+                                    // FIXME: Handle more than one span.
+                                    let capture_spans = capture.spans();
+                                    let tmp: Place = self.temp(tmp_ty, current, capture_spans[0])?.into();
+                                    self.push_assignment(
+                                        current,
+                                        tmp,
+                                        Rvalue::Ref(*bk, p),
+                                        capture_spans[0],
+                                    );
+                                    operands.push(Operand { kind: OperandKind::Move(tmp), span: None });
+                                }
+                                CaptureKind::ByValue => {
+                                    operands.push(Operand { kind: OperandKind::Move(p), span: None })
+                                }
+                            }
                         }
-                        CaptureKind::ByValue => {
-                            operands.push(Operand { kind: OperandKind::Move(p), span: None })
-                        }
+                        self.push_assignment(
+                            current,
+                            place,
+                            Rvalue::Aggregate(AggregateKind::Closure(ty.store()), operands.into()),
+                            expr_id.into(),
+                        );
+                        Ok(Some(current))
+                    }
+                    ClosureKind::Coroutine(_) => {
+                        self.push_assignment(
+                            current,
+                            place,
+                            Rvalue::Aggregate(AggregateKind::Coroutine(ty.store()), Box::new([])),
+                            expr_id.into(),
+                        );
+                        Ok(Some(current))
+                    }
+                    ClosureKind::Async => {
+                        self.push_assignment(
+                            current,
+                            place,
+                            Rvalue::Aggregate(AggregateKind::CoroutineClosure(ty.store()), Box::new([])),
+                            expr_id.into(),
+                        );
+                        Ok(Some(current))
                     }
                 }
-                self.push_assignment(
-                    current,
-                    place,
-                    Rvalue::Aggregate(AggregateKind::Closure(ty.store()), operands.into()),
-                    expr_id.into(),
-                );
-                Ok(Some(current))
             }
             Expr::Tuple { exprs } => {
                 let Some(values) = exprs

@@ -824,7 +824,7 @@ fn codegen_aggregate(
 ) {
     use hir_ty::mir::AggregateKind;
     match kind {
-        AggregateKind::Tuple(_) | AggregateKind::Array(_) | AggregateKind::Closure(_) => {
+        AggregateKind::Tuple(_) | AggregateKind::Array(_) | AggregateKind::Closure(_) | AggregateKind::Coroutine(_) | AggregateKind::CoroutineClosure(_) => {
             // For ScalarPair tuples, construct directly as a pair
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
                 assert_eq!(operands.len(), 2, "ScalarPair aggregate expects 2 operands");

@@ -361,7 +361,8 @@ pub enum AggregateKind {
     Adt(VariantId, StoredGenericArgs),
     Union(UnionId, FieldId),
     Closure(StoredTy),
-    //Coroutine(LocalDefId, SubstsRef, Movability),
+    Coroutine(StoredTy),
+    CoroutineClosure(StoredTy),
     /// Construct a raw pointer from data pointer and metadata.
     /// The `StoredTy` is the pointee type, `Mutability` indicates `*const` vs `*mut`.
     /// Operands: [data_ptr, metadata] (metadata is `()` for thin pointers).

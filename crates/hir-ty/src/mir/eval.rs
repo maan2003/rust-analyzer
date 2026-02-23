@@ -1585,6 +1585,12 @@ impl<'db> Evaluator<'db> {
                     AggregateKind::RawPtr(_, _) => {
                         not_supported!("raw pointer aggregate")
                     }
+                    AggregateKind::Coroutine(_) => {
+                        not_supported!("coroutine aggregate")
+                    }
+                    AggregateKind::CoroutineClosure(_) => {
+                        not_supported!("coroutine closure aggregate")
+                    }
                 }
             }
             Rvalue::Cast(kind, operand, target_ty) => match kind {

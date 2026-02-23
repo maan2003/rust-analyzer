@@ -435,6 +435,16 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.operand_list(it);
                 w!(self, ")");
             }
+            Rvalue::Aggregate(AggregateKind::Coroutine(_), it) => {
+                w!(self, "Coroutine(");
+                self.operand_list(it);
+                w!(self, ")");
+            }
+            Rvalue::Aggregate(AggregateKind::CoroutineClosure(_), it) => {
+                w!(self, "CoroutineClosure(");
+                self.operand_list(it);
+                w!(self, ")");
+            }
             Rvalue::Aggregate(AggregateKind::Union(_, _), it) => {
                 w!(self, "Union(");
                 self.operand_list(it);

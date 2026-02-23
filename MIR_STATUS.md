@@ -47,8 +47,8 @@ Tracks how r-a's MIR aligns with rustc's MIR, focused on codegen via cg_clif.
 | `Union` | aligned | |
 | `Closure` | aligned | |
 | `RawPtr(Ty, Mutability)` | type-aligned | Not emitted by lowering yet |
-| `Coroutine` | missing | Needed for async/await |
-| `CoroutineClosure` | missing | Needed for async closures |
+| `Coroutine` | type-aligned | Aggregate emitted; no capture analysis or body lowering yet |
+| `CoroutineClosure` | type-aligned | Aggregate emitted; no capture analysis or body lowering yet |
 
 ### Removed
 
@@ -146,7 +146,8 @@ All `Infallible` stubs have been removed from MIR types.
 
 ## Expressions not lowered (`not_supported!`)
 
-- async/await, async blocks, yield
+- await (needs desugar to poll/yield loop)
+- async block/coroutine bodies (aggregate constructed, but body not lowered separately yet)
 - inline assembly (`builtin#asm`)
 - const blocks
 - `builtin#offset_of`
@@ -157,7 +158,7 @@ These are intentional gaps — uncommon or unstable features.
 
 ## Remaining work (by priority for codegen)
 
-1. Coroutine/CoroutineClosure aggregates -- needed for async/await.
+1. Coroutine capture analysis and body lowering -- aggregates exist but have no captures; bodies not lowered separately.
 2. `Intrinsic` statement -- `assume`, `copy_nonoverlapping`.
 3. `UnwindAction` enum -- rustc uses this instead of `Option<BasicBlockId>` for unwind. Only matters for panic=unwind.
 4. Lower more intrinsics to MIR constructs (e.g. `offset` → `BinOp::Offset`) as needed by codegen.
