@@ -684,11 +684,18 @@ fn field_type(
 
 /// Get the type of a closure field (captured variable).
 fn closure_field_type(
-    _db: &dyn HirDatabase,
-    _closure_ty: &StoredTy,
-    _idx: usize,
+    db: &dyn HirDatabase,
+    closure_ty: &StoredTy,
+    idx: usize,
 ) -> StoredTy {
-    todo!("closure_field_type (coming in M3.3)")
+    let TyKind::Closure(closure_id, args) = closure_ty.as_ref().kind() else {
+        panic!("closure_field_type on non-closure: {:?}", closure_ty);
+    };
+    let interned = closure_id.0;
+    let def = db.lookup_intern_closure(interned);
+    let infer = hir_ty::InferenceResult::for_body(db, def.0);
+    let (captures, _) = infer.closure_info(interned);
+    captures[idx].ty(db, args).store()
 }
 
 /// Compute a variant layout for Downcast projection.
@@ -1838,6 +1845,112 @@ fn codegen_fn_ptr_call(
     }
 }
 
+/// Call a closure body directly.
+///
+/// When we detect a call to `Fn::call` / `FnMut::call_mut` / `FnOnce::call_once`
+/// where the self type is a concrete closure, we redirect to the closure's own
+/// MIR body instead of going through trait dispatch.
+fn codegen_closure_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    body: &MirBody,
+    closure_id: hir_ty::db::InternedClosureId,
+    closure_subst: StoredGenericArgs,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    // Get closure MIR body to build the signature
+    let closure_body = fx.db
+        .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env.clone())
+        .expect("closure MIR");
+    let sig = build_fn_sig(fx.isa, fx.db, fx.dl, &fx.env, &closure_body, &[])
+        .expect("closure sig");
+
+    // Generate mangled name
+    let closure_name = symbol_mangling::mangle_closure(
+        fx.db, closure_id, fx.ext_crate_disambiguators,
+    );
+
+    // Declare in module (Import linkage — defined elsewhere in same module)
+    let callee_id = fx.module
+        .declare_function(&closure_name, Linkage::Import, &sig)
+        .expect("declare closure");
+    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+
+    // Destination
+    let dest = codegen_place(fx, body, destination);
+    let is_sret_return = !dest.layout.is_zst()
+        && !matches!(
+            dest.layout.backend_repr,
+            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+        );
+
+    // Build argument values
+    let mut call_args: Vec<Value> = Vec::new();
+
+    let sret_slot = if is_sret_return {
+        let slot = CPlace::new_stack_slot(fx, dest.layout.clone());
+        let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+        call_args.push(ptr);
+        Some(slot)
+    } else {
+        None
+    };
+
+    for arg in args {
+        let cval = codegen_operand(fx, body, &arg.kind);
+        if cval.layout.is_zst() {
+            continue;
+        }
+        match cval.layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = cval.load_scalar_pair(fx);
+                call_args.push(a);
+                call_args.push(b);
+            }
+            BackendRepr::Scalar(_) => {
+                call_args.push(cval.load_scalar(fx));
+            }
+            _ => {
+                let ptr = cval.force_stack(fx);
+                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+            }
+        }
+    }
+
+    // Emit the call
+    let call = fx.bcx.ins().call(callee_ref, &call_args);
+
+    // Store return value
+    if let Some(sret_slot) = sret_slot {
+        let cval = sret_slot.to_cvalue(fx);
+        dest.write_cvalue(fx, cval);
+    } else {
+        let results = fx.bcx.inst_results(call);
+        if !dest.layout.is_zst() {
+            match dest.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    dest.write_cvalue(fx, CValue::by_val(results[0], dest.layout.clone()));
+                }
+                BackendRepr::ScalarPair(_, _) => {
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                    );
+                }
+                _ => unreachable!("non-sret memory return from closure call"),
+            }
+        }
+    }
+
+    if let Some(target) = target {
+        let block = fx.clif_block(*target);
+        fx.bcx.ins().jump(block, &[]);
+    } else {
+        fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+    }
+}
+
 fn codegen_direct_call(
     fx: &mut FunctionCx<'_, impl Module>,
     body: &MirBody,
@@ -1862,6 +1975,19 @@ fn codegen_direct_call(
         ).is_some() {
             codegen_virtual_call(fx, body, callee_func_id, trait_id, args, destination, target);
             return;
+        }
+
+        // Check for closure call: Fn::call / FnMut::call_mut / FnOnce::call_once
+        // where self type is a closure — redirect to the closure's MIR body.
+        if generic_args.len() > 0 {
+            let self_ty = generic_args.type_at(0);
+            if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
+                codegen_closure_call(
+                    fx, body, closure_id.0, closure_subst.store(),
+                    args, destination, target,
+                );
+                return;
+            }
         }
     }
 
@@ -3020,12 +3146,14 @@ fn collect_vtable_methods(
 /// reachable from `root` by walking MIR call terminators. Returns them in BFS
 /// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
 /// representing a specific monomorphization. Cross-crate functions are skipped.
+///
+/// Also returns any closures discovered via `AggregateKind::Closure` in statements.
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     root: hir_def::FunctionId,
     local_crate: base_db::Crate,
-) -> Vec<(hir_def::FunctionId, StoredGenericArgs)> {
+) -> (Vec<(hir_def::FunctionId, StoredGenericArgs)>, Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>) {
     use std::collections::{HashSet, VecDeque};
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
@@ -3035,6 +3163,9 @@ fn collect_reachable_fns(
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     let mut result = Vec::new();
+
+    let mut closure_visited = HashSet::new();
+    let mut closure_result = Vec::new();
 
     queue.push_back((root, empty_args));
 
@@ -3075,21 +3206,93 @@ fn collect_reachable_fns(
             continue;
         };
 
-        for (_, bb) in body.basic_blocks.iter() {
-            // Scan statements for coercions that discover new function targets
-            for stmt in &bb.statements {
-                if let StatementKind::Assign(_, Rvalue::Cast(cast_kind, operand, target_ty)) = &stmt.kind {
+        scan_body_for_callees(
+            db, env, &body, interner, local_crate,
+            &empty_args_stored, &mut queue,
+            &mut closure_visited, &mut closure_result,
+        );
+    }
+
+    // Also scan closure bodies for callees and nested closures
+    let mut i = 0;
+    while i < closure_result.len() {
+        let (closure_id, closure_subst) = closure_result[i].clone();
+        i += 1;
+        let Ok(closure_body) = db.monomorphized_mir_body_for_closure(
+            closure_id, closure_subst, env.clone(),
+        ) else {
+            continue;
+        };
+        scan_body_for_callees(
+            db, env, &closure_body, interner, local_crate,
+            &empty_args_stored, &mut queue,
+            &mut closure_visited, &mut closure_result,
+        );
+        // Process any newly discovered functions from closure bodies
+        while let Some((func_id, generic_args)) = queue.pop_front() {
+            if !visited.insert((func_id, generic_args.clone())) {
+                continue;
+            }
+            if matches!(func_id.loc(db).container, ItemContainerId::ExternBlockId(_)) {
+                continue;
+            }
+            if FunctionSignature::is_intrinsic(db, func_id) {
+                continue;
+            }
+            if func_id.krate(db) != local_crate {
+                continue;
+            }
+            if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
+                continue;
+            }
+            result.push((func_id, generic_args.clone()));
+            let Ok(body) = db.monomorphized_mir_body(
+                func_id.into(), generic_args, env.clone(),
+            ) else {
+                continue;
+            };
+            scan_body_for_callees(
+                db, env, &body, interner, local_crate,
+                &empty_args_stored, &mut queue,
+                &mut closure_visited, &mut closure_result,
+            );
+        }
+    }
+
+    (result, closure_result)
+}
+
+/// Scan a MIR body for callees (functions and closures) and push them onto
+/// the respective work queues.
+fn scan_body_for_callees(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    body: &MirBody,
+    interner: DbInterner,
+    local_crate: base_db::Crate,
+    empty_args_stored: &StoredGenericArgs,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+) {
+    use hir_ty::mir::AggregateKind;
+
+    for (_, bb) in body.basic_blocks.iter() {
+        // Scan statements for coercions and closure constructions
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                StatementKind::Assign(_, Rvalue::Cast(cast_kind, operand, target_ty)) => {
                     match cast_kind {
                         // Unsizing coercions → discover vtable impl methods
                         CastKind::PointerCoercion(PointerCast::Unsize) => {
                             collect_vtable_methods(
-                                db, env, &body, operand, target_ty, local_crate,
-                                &empty_args_stored, &mut queue,
+                                db, env, body, operand, target_ty, local_crate,
+                                empty_args_stored, queue,
                             );
                         }
                         // ReifyFnPointer: fn item → fn pointer. The target fn needs compilation.
                         CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
-                            let from_ty = operand_ty(db, &body, &operand.kind);
+                            let from_ty = operand_ty(db, body, &operand.kind);
                             if let TyKind::FnDef(def, callee_args) = from_ty.as_ref().kind() {
                                 if let CallableDefId::FunctionId(callee_id) = def.0 {
                                     queue.push_back((callee_id, callee_args.store()));
@@ -3099,31 +3302,39 @@ fn collect_reachable_fns(
                         _ => {}
                     }
                 }
-            }
-
-            let Some(term) = &bb.terminator else { continue };
-            let TerminatorKind::Call { func, .. } = &term.kind else { continue };
-            let OperandKind::Constant { ty, .. } = &func.kind else { continue };
-            let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
-            if let CallableDefId::FunctionId(callee_id) = def.0 {
-                // Skip virtual calls — trait methods on dyn types are dispatched
-                // through vtables, not compiled as standalone functions.
-                if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
-                    if hir_ty::method_resolution::is_dyn_method(
-                        interner,
-                        env.param_env(),
-                        callee_id,
-                        callee_args,
-                    ).is_some() {
-                        continue;
+                // Closure constructions: discover closure bodies
+                StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), _)) => {
+                    if let TyKind::Closure(closure_id, closure_subst) = ty.as_ref().kind() {
+                        let key = (closure_id.0, closure_subst.store());
+                        if closure_visited.insert(key.clone()) {
+                            closure_result.push(key);
+                        }
                     }
                 }
-                queue.push_back((callee_id, callee_args.store()));
+                _ => {}
             }
         }
-    }
 
-    result
+        let Some(term) = &bb.terminator else { continue };
+        let TerminatorKind::Call { func, .. } = &term.kind else { continue };
+        let OperandKind::Constant { ty, .. } = &func.kind else { continue };
+        let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
+        if let CallableDefId::FunctionId(callee_id) = def.0 {
+            // Skip virtual calls — trait methods on dyn types are dispatched
+            // through vtables, not compiled as standalone functions.
+            if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                if hir_ty::method_resolution::is_dyn_method(
+                    interner,
+                    env.param_env(),
+                    callee_id,
+                    callee_args,
+                ).is_some() {
+                    continue;
+                }
+            }
+            queue.push_back((callee_id, callee_args.store()));
+        }
+    }
 }
 
 /// Compile a crate to an executable: discover reachable functions from main,
@@ -3145,10 +3356,10 @@ pub fn compile_executable(
     let mut module = ObjectModule::new(builder);
 
     // Discover and compile all reachable local monomorphized function instances
-    let reachable = collect_reachable_fns(db, env, main_func_id, local_crate);
+    let (reachable_fns, reachable_closures) = collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 
-    for (func_id, generic_args) in &reachable {
+    for (func_id, generic_args) in &reachable_fns {
         let body = db
             .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
             .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
@@ -3163,6 +3374,18 @@ pub fn compile_executable(
         if *func_id == main_func_id {
             user_main_id = Some(func_clif_id);
         }
+    }
+
+    // Compile reachable closure bodies
+    for (closure_id, closure_subst) in &reachable_closures {
+        let body = db
+            .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
+            .map_err(|e| format!("MIR error for closure: {:?}", e))?;
+        let closure_name = symbol_mangling::mangle_closure(db, *closure_id, ext_crate_disambiguators);
+        compile_fn(
+            &mut module, &*isa, db, dl, env, &body, &closure_name, Linkage::Export,
+            local_crate, ext_crate_disambiguators, &[],
+        )?;
     }
 
     let user_main_id = user_main_id.expect("main not in reachable functions");

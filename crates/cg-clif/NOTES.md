@@ -84,6 +84,23 @@ What works:
   recovers it for re-borrows (matches upstream `place_deref`/`place_ref`).
   Reachability scans for unsizing casts to discover vtable impl methods;
   skips abstract trait defs.
+- **Fn pointers and indirect calls** — `ReifyFnPointer` cast converts
+  `FnDef` types to fn pointers via `func_addr`. `TyKind::FnPtr` calls
+  use `call_indirect` with signature built from the `FnPtr` type.
+  Reachability scans for `ReifyFnPointer` casts to discover fn targets.
+- **Closures** — Closure construction via `AggregateKind::Closure` (same
+  code path as tuples). `ClosureField` projection resolves capture types
+  via `InferenceResult::for_body` + `closure_info`. Closure calls detected
+  when `Fn::call`/`FnMut::call_mut`/`FnOnce::call_once` has a concrete
+  closure self type — redirects to the closure's own MIR body via
+  `monomorphized_mir_body_for_closure`. Simple mangling scheme
+  (`_Rclosure_{crate}_{disamb}_{id}`). `collect_reachable_fns` discovers
+  closures by scanning for `AggregateKind::Closure` in statements;
+  recursively scans closure bodies for nested callees/closures.
+- **Non-scalar constants** — ScalarPair constants (two-element tuples,
+  wide pointers). Memory-repr constants (arrays, large structs) stored
+  as anonymous data sections via `DataDescription`. `MemoryMap::Empty`
+  only (no embedded pointer relocations yet).
 
 ## Upstream comparison (`./cg_clif`)
 
@@ -128,8 +145,9 @@ Recently aligned with upstream:
 
 Still diverges from upstream:
 - **Pointer coercion casts partially handled** — `PointerCoercion::Unsize`
-  (`&T → &dyn Trait`) now produces fat pointers with vtable. Other coercions
-  (`ReifyFnPointer`, `UnsafeFnPointer`, `ClosureFnPointer`) still treated
+  (`&T → &dyn Trait`) now produces fat pointers with vtable.
+  `ReifyFnPointer` emits `func_addr` to convert fn items to fn pointers.
+  Other coercions (`UnsafeFnPointer`, `ClosureFnPointer`) still treated
   as scalar casts. `MutToConstPointer`/`ArrayToPointer` are no-ops (correct).
 - **Wide-pointer cast behavior is partial** — trait object fat pointers work.
   Upstream has additional wide<->wide and wide->thin cast paths for slices
@@ -191,11 +209,11 @@ Known bugs (divergence from upstream cg_clif):
   explicit discriminant values (e.g. `A = 100`) the codegen returns the
   variant index (0) instead of the discriminant value (100). Needs
   `db.const_eval_discriminant()` lookup.
-- **JIT helper compiles only explicitly listed roots** — calls from a tested
-  function into other local functions not listed in `jit_run(..., fn_names, ...)`
-  remain unresolved at runtime (`can't resolve symbol ...`). This especially
-  affects source-level minicore method calls (e.g. raw-pointer inherent methods)
-  unless tests use direct intrinsic calls or object-only compile checks.
+- **JIT helper `jit_run` compiles only explicitly listed roots** — calls from
+  a tested function into other local functions not listed in
+  `jit_run(..., fn_names, ...)` remain unresolved at runtime. The newer
+  `jit_run_reachable` helper uses `collect_reachable_fns` to automatically
+  discover and compile all reachable functions and closures.
 - **Array index tests require explicit `usize` index** — `arr[1]` fails MIR
   lowering with `UnresolvedMethod("[overloaded index]")`. The MIR lowerer only
   emits `ProjectionElem::Index` when the index is already `usize`; otherwise it
@@ -205,12 +223,9 @@ Known bugs (divergence from upstream cg_clif):
   sidesteps both issues. Real code with full std would work via trait resolution.
 
 What's missing:
-- Closure field type resolution
 - Explicit discriminant values (`A = 100`) — need `db.const_eval_discriminant()`
 - Union and RawPtr aggregates
-- Indirect calls (fn pointers, closures)
 - Remaining casts (`DynStar`, wide-pointer coercions)
-- Non-scalar constants (arrays, ScalarPair, memory-repr)
 - Drop glue
 - Cross-crate generic function codegen (MIR bodies now available via .mirdata)
 

@@ -300,16 +300,11 @@ by pointer, matching upstream's `PassMode::Indirect` pattern:
 3 JIT tests: `jit_pass_and_return_big_struct`, `jit_pass_big_struct_and_modify`,
 `jit_big_struct_through_call_chain`. 55 total tests pass.
 
-### M11b: Array indexing
+### M11b: Array indexing ✅
 
-```rust
-fn foo() -> i32 {
-    let arr = [10, 20, 30];
-    arr[1]
-}
-```
-
-Needs: `ProjectionElem::Index`, memory-repr array aggregates.
+`ProjectionElem::Index` with dynamic offset via `Pointer::offset_value`.
+Arrays spill to stack when in registers. `place_ty` updated for Index.
+JIT test: `arr[1usize]` returns 20.
 
 ### M11c: Essential intrinsics ✅
 
@@ -330,31 +325,20 @@ Implemented 30+ intrinsics in `codegen_intrinsic_call`:
 8 JIT tests verify `size_of`, `min_align_of`, `bswap`, `wrapping_add`,
 `transmute`, `ctlz`, `rotate_left`, `exact_div`. 67 total tests pass.
 
-### M11d: Non-scalar constants
+### M11d: Non-scalar constants ✅
 
-```rust
-fn foo() -> i32 {
-    let arr = [10i32, 20, 30];
-    let r: &i32 = &arr[1];
-    *r
-}
-```
+ScalarPair constants extract two scalar values at correct offsets.
+Memory-repr constants (arrays, large structs) stored as anonymous data
+sections via `DataDescription` with raw bytes. `MemoryMap::Empty` only
+(no embedded pointer relocations). JIT test: array constant with index.
 
-Needs: constant arrays, references to static/const data (allocations).
-Currently only scalar constants are supported.
+### M11e: Fn pointers and indirect calls ✅
 
-### M11e: Fn pointers and indirect calls
-
-```rust
-fn add(a: i32, b: i32) -> i32 { a + b }
-fn foo() -> i32 {
-    let f: fn(i32, i32) -> i32 = add;
-    f(3, 4)
-}
-```
-
-Needs: fn pointer coercion (`ReifyFnPointer`), `call_indirect` for
-`TyKind::FnPtr`. Required for drop glue dispatch and closures.
+`ReifyFnPointer` cast converts `FnDef` to fn pointer via `func_addr`.
+`TyKind::FnPtr` calls use `import_signature` + `call_indirect`.
+`codegen_call` now uses `operand_ty` to handle any fn operand (not just
+constants). `collect_reachable_fns` scans for `ReifyFnPointer` casts.
+JIT tests: `jit_fn_pointer_call`, `jit_fn_pointer_higher_order`.
 
 ### M11f: Drop glue
 
@@ -373,18 +357,33 @@ Needs: `TerminatorKind::Drop` to call drop functions instead of being a
 no-op jump. Requires generating drop glue shims or resolving `Drop::drop`
 impl methods.
 
-### M11g: Closures
+### M11g: Closures ✅
 
-```rust
-fn apply(f: impl Fn(i32) -> i32, x: i32) -> i32 { f(x) }
-fn foo() -> i32 {
-    let offset = 10;
-    apply(|x| x + offset, 32)
-}
-```
+Closure construction already handled via `AggregateKind::Closure` (same
+path as tuples). New pieces:
 
-Needs: closure field type resolution, closure call dispatch
-(`Fn`/`FnMut`/`FnOnce`), closure ABI.
+- **`closure_field_type`**: resolves capture types via
+  `InferenceResult::for_body` + `closure_info` + `CapturedItem::ty`.
+- **Closure call dispatch**: `codegen_direct_call` detects when
+  `Fn::call`/`FnMut::call_mut`/`FnOnce::call_once` has a concrete
+  closure self type, redirects to `codegen_closure_call` which gets
+  the closure's MIR body via `monomorphized_mir_body_for_closure`.
+- **Closure discovery**: `collect_reachable_fns` scans for
+  `AggregateKind::Closure` in statements, compiles closure bodies
+  alongside regular functions. Recursively scans closure bodies for
+  nested callees/closures.
+- **Symbol mangling**: `mangle_closure` uses simple scheme
+  `_Rclosure_{crate}_{disamb}_{id}`.
+- **`place_ref` fix**: register-stored places (Var/VarPair) now spill
+  to stack before taking address — needed for `&self` on closures.
+- **`jit_run_reachable`**: new test helper using `collect_reachable_fns`
+  for automatic function/closure discovery.
+
+No hacks — closure body params `[closure_self, arg0, arg1, ...]` match
+the Call terminator args directly, so no argument restructuring needed.
+
+JIT test: `jit_closure_basic` — `apply(|x| x + offset, 32)` returns 42.
+89 total tests pass.
 
 ### M11: Drop and heap allocation
 
