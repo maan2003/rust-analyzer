@@ -224,8 +224,11 @@ to `.mirdata` files. Shared types live in `crates/ra-mir-types/`.
 - Translation handles: all statement/terminator/rvalue/operand/type variants
   that appear in optimized MIR. Unsupported constructs fall back to
   `Ty::Opaque` / `ConstKind::Todo` with debug strings.
-- `cg-clif` deserializes `MirData` for crate disambiguators; body consumption
-  comes in a later milestone.
+- `cg-clif` deserializes `MirData` for crate disambiguators and converts
+  the layout table (`layout.rs`: `ExportedXxx` → `rustc_abi` types) so
+  pre-computed layouts can be used directly by codegen. `compile_fn` and
+  `build_fn_sig` accept a `mirdata_layouts` parameter (currently `&[]` for
+  r-a MIR; will be used when compiling mirdata bodies).
 
 ### .mirdata format
 

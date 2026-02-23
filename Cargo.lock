@@ -276,6 +276,8 @@ dependencies = [
  "object 0.37.3",
  "postcard",
  "ra-ap-rustc_abi",
+ "ra-ap-rustc_hashes",
+ "ra-ap-rustc_index",
  "ra-ap-rustc_type_ir",
  "ra-mir-types",
  "rac-abi",
