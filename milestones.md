@@ -281,6 +281,25 @@ unsizing coercion (`&T → &dyn Trait`). Key components:
 JIT tests (`jit_dyn_dispatch`, `jit_dyn_dispatch_multiple_methods`) and
 end-to-end test (`compile_and_run_dyn_dispatch`) all pass. 60 total tests.
 
+### M11a: PassMode::Indirect ✅
+
+Memory-repr types (structs with 3+ fields, etc.) now passed and returned
+by pointer, matching upstream's `PassMode::Indirect` pattern:
+
+- `build_fn_sig` / `build_fn_sig_from_ty`: Memory-repr returns add
+  `AbiParam::special(StructReturn)` as first param (no return values);
+  Memory-repr params add `AbiParam::new(pointer_ty)`.
+- `compile_fn`: detects sret, overrides return slot CPlace to point at
+  sret block param; indirect params get CPlace pointing at incoming ptr.
+- `codegen_direct_call` / `codegen_virtual_call`: Memory-repr args use
+  `force_stack()` + pass pointer; sret returns allocate a stack slot,
+  pass pointer as first arg, read result back after call.
+- Return terminator: Memory-repr returns emit `return_(&[])` since the
+  value is already written to the sret pointer.
+
+3 JIT tests: `jit_pass_and_return_big_struct`, `jit_pass_big_struct_and_modify`,
+`jit_big_struct_through_call_chain`. 55 total tests pass.
+
 ### M11: Drop and heap allocation
 
 ```rust

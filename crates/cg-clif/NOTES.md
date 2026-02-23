@@ -42,6 +42,13 @@ What works:
 - **ScalarPair locals** — tuples like `(i32, i32)` stored as VarPair,
   properly wired for function params and returns.
 - **Non-scalar locals** — Memory-repr types allocated as stack slots.
+- **PassMode::Indirect** — Memory-repr types (3+ field structs, etc.) passed
+  and returned by pointer. Return uses `AbiParam::special(StructReturn)` as
+  first param (sret); params use `AbiParam::new(pointer_ty)`. Callee's return
+  slot CPlace points at the sret pointer; callee writes result there and
+  returns void. Caller allocates stack slot, passes pointer, reads result
+  back after call. `force_stack()` used for indirect args. Works for direct
+  calls, virtual calls, and cross-function chains.
 - **Tuple aggregates** — `Rvalue::Aggregate(Tuple)` constructs tuples,
   with fast paths for Scalar and ScalarPair representations.
 - **ADT aggregates** — `Rvalue::Aggregate(Adt)` constructs structs and enums.
@@ -138,10 +145,9 @@ Known bugs (divergence from upstream cg_clif):
   slice constants (fat pointers), i128 (upstream uses `iconcat(lsb, msb)`),
   indirect constants (stored in allocations). String literals, `const &[T]`,
   etc. won't work.
-- **No `PassMode` / ABI handling in calls** — we pass Scalar and ScalarPair
-  args/returns directly and skip ZSTs, but have no `PassMode::Indirect`
-  (pass-by-pointer for large structs) or `PassMode::Uniform`. Struct
-  args/returns that aren't Scalar/ScalarPair will produce wrong ABI.
+- **No `PassMode::Uniform` / `PassMode::Cast`** — we handle Scalar,
+  ScalarPair (direct), and Memory-repr (indirect/sret), but not the
+  `Uniform` or `Cast` pass modes used on some targets for small aggregates.
 - **`Variants::Single` discriminant uses variant index** — for enums with
   explicit discriminant values (e.g. `A = 100`) the codegen returns the
   variant index (0) instead of the discriminant value (100). Needs

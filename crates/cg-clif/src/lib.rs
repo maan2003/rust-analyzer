@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, MemFlags, Signature, Type, Value, types};
+use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Block, InstBuilder, MemFlags, Signature, Type, Value, types};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
@@ -1392,17 +1392,21 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, body: &MirBody, term
             if ret_place.layout.is_zst() {
                 fx.bcx.ins().return_(&[]);
             } else {
-                let cval = ret_place.to_cvalue(fx);
                 match ret_place.layout.backend_repr {
                     BackendRepr::Scalar(_) => {
+                        let cval = ret_place.to_cvalue(fx);
                         let val = cval.load_scalar(fx);
                         fx.bcx.ins().return_(&[val]);
                     }
                     BackendRepr::ScalarPair(_, _) => {
+                        let cval = ret_place.to_cvalue(fx);
                         let (a, b) = cval.load_scalar_pair(fx);
                         fx.bcx.ins().return_(&[a, b]);
                     }
-                    _ => todo!("return non-scalar/pair type"),
+                    _ => {
+                        // Memory-repr return: value already written to sret pointer
+                        fx.bcx.ins().return_(&[]);
+                    }
                 }
             }
         }
@@ -1660,8 +1664,27 @@ fn codegen_direct_call(
     // Import into current function to get a FuncRef
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
+    // Determine destination layout to check for sret return
+    let dest = codegen_place(fx, body, destination);
+    let is_sret_return = !dest.layout.is_zst()
+        && !matches!(
+            dest.layout.backend_repr,
+            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+        );
+
     // Build argument values (skip ZST args that have no Cranelift representation)
     let mut call_args: Vec<Value> = Vec::new();
+
+    // If sret return: allocate stack slot for result, pass pointer as first arg
+    let sret_slot = if is_sret_return {
+        let slot = CPlace::new_stack_slot(fx, dest.layout.clone());
+        let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+        call_args.push(ptr);
+        Some(slot)
+    } else {
+        None
+    };
+
     for arg in args {
         let cval = codegen_operand(fx, body, &arg.kind);
         if cval.layout.is_zst() {
@@ -1673,8 +1696,13 @@ fn codegen_direct_call(
                 call_args.push(a);
                 call_args.push(b);
             }
-            _ => {
+            BackendRepr::Scalar(_) => {
                 call_args.push(cval.load_scalar(fx));
+            }
+            _ => {
+                // Memory-repr arg: force to stack and pass pointer
+                let ptr = cval.force_stack(fx);
+                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
             }
         }
     }
@@ -1683,27 +1711,27 @@ fn codegen_direct_call(
     let call = fx.bcx.ins().call(callee_ref, &call_args);
 
     // Store return value into destination place
-    let dest = codegen_place(fx, body, destination);
-    let results = fx.bcx.inst_results(call);
-    if !dest.layout.is_zst() {
-        match dest.layout.backend_repr {
-            BackendRepr::Scalar(_) => {
-                let val = results.first().copied()
-                    .expect("call returns no values but destination expects Scalar");
-                dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
-            }
-            BackendRepr::ScalarPair(_, _) => {
-                assert!(results.len() >= 2, "call returns fewer than 2 values but destination expects ScalarPair");
-                dest.write_cvalue(
-                    fx,
-                    CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                );
-            }
-            _ => {
-                // Memory return types: not yet handled
-                if !results.is_empty() {
-                    todo!("memory return types");
+    if let Some(sret_slot) = sret_slot {
+        // sret: result is in the stack slot, copy to destination
+        let cval = sret_slot.to_cvalue(fx);
+        dest.write_cvalue(fx, cval);
+    } else {
+        let results = fx.bcx.inst_results(call);
+        if !dest.layout.is_zst() {
+            match dest.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    let val = results.first().copied()
+                        .expect("call returns no values but destination expects Scalar");
+                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
                 }
+                BackendRepr::ScalarPair(_, _) => {
+                    assert!(results.len() >= 2, "call returns fewer than 2 values but destination expects ScalarPair");
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                    );
+                }
+                _ => unreachable!("non-sret memory return"),
             }
         }
     }
@@ -1774,6 +1802,11 @@ fn codegen_virtual_call(
 
     // Return type
     let dest = codegen_place(fx, body, destination);
+    let is_sret_return = !dest.layout.is_zst()
+        && !matches!(
+            dest.layout.backend_repr,
+            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+        );
     match dest.layout.backend_repr {
         BackendRepr::Scalar(scalar) => {
             sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
@@ -1783,14 +1816,30 @@ fn codegen_virtual_call(
             sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
         }
         _ if dest.layout.is_zst() => {}
-        _ => todo!("virtual call with non-scalar return"),
+        _ => {
+            // Memory-repr return: sret pointer as first param
+            sig.params.push(AbiParam::special(fx.pointer_type, ArgumentPurpose::StructReturn));
+        }
     }
 
     // Self param: thin pointer
     sig.params.push(AbiParam::new(fx.pointer_type));
 
-    // Build call args: data_ptr first (thin self), then remaining args
-    let mut call_args: Vec<Value> = vec![data_ptr];
+    // Build call args
+    let mut call_args: Vec<Value> = Vec::new();
+
+    // If sret return: allocate stack slot, pass pointer as first arg
+    let sret_slot = if is_sret_return {
+        let slot = CPlace::new_stack_slot(fx, dest.layout.clone());
+        let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+        call_args.push(ptr);
+        Some(slot)
+    } else {
+        None
+    };
+
+    // data_ptr (thin self)
+    call_args.push(data_ptr);
 
     // Remaining args (after self)
     for arg in &args[1..] {
@@ -1810,7 +1859,12 @@ fn codegen_virtual_call(
                 call_args.push(va);
                 call_args.push(vb);
             }
-            _ => todo!("virtual call with non-scalar arg"),
+            _ => {
+                // Memory-repr arg: force to stack and pass pointer
+                sig.params.push(AbiParam::new(fx.pointer_type));
+                let ptr = cval.force_stack(fx);
+                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+            }
         }
     }
 
@@ -1819,20 +1873,25 @@ fn codegen_virtual_call(
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
 
     // Store return value
-    let results = fx.bcx.inst_results(call);
-    if !dest.layout.is_zst() {
-        match dest.layout.backend_repr {
-            BackendRepr::Scalar(_) => {
-                let val = results[0];
-                dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+    if let Some(sret_slot) = sret_slot {
+        let cval = sret_slot.to_cvalue(fx);
+        dest.write_cvalue(fx, cval);
+    } else {
+        let results = fx.bcx.inst_results(call);
+        if !dest.layout.is_zst() {
+            match dest.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    let val = results[0];
+                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
+                }
+                BackendRepr::ScalarPair(_, _) => {
+                    dest.write_cvalue(
+                        fx,
+                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
+                    );
+                }
+                _ => {}
             }
-            BackendRepr::ScalarPair(_, _) => {
-                dest.write_cvalue(
-                    fx,
-                    CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                );
-            }
-            _ => {}
         }
     }
 
@@ -1966,6 +2025,8 @@ fn build_fn_sig(
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
 
+    let pointer_ty = pointer_ty(dl);
+
     // Return type
     let ret_local = &body.locals[hir_ty::mir::return_slot()];
     let ret_layout = db
@@ -1979,8 +2040,10 @@ fn build_fn_sig(
             sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
             sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
         }
+        _ if ret_layout.is_zst() => {}
         _ => {
-            // ZST or Memory — no return params
+            // Memory-repr return: pass as sret pointer (first param)
+            sig.params.push(AbiParam::special(pointer_ty, ArgumentPurpose::StructReturn));
         }
     }
 
@@ -2000,7 +2063,8 @@ fn build_fn_sig(
             }
             _ if param_layout.is_zst() => {}
             _ => {
-                return Err("unsupported param type: non-scalar, non-ZST, non-pair".into());
+                // Memory-repr param: pass by pointer
+                sig.params.push(AbiParam::new(pointer_ty));
             }
         }
     }
@@ -2018,6 +2082,8 @@ fn build_fn_sig_from_ty(
     func_id: hir_def::FunctionId,
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
+
+    let pointer_ty = pointer_ty(dl);
 
     let fn_sig = db
         .callable_item_signature(func_id.into())
@@ -2038,8 +2104,10 @@ fn build_fn_sig_from_ty(
                 sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
                 sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
             }
+            _ if ret_layout.is_zst() => {}
             _ => {
-                // ZST or Memory — no return params
+                // Memory-repr return: pass as sret pointer (first param)
+                sig.params.push(AbiParam::special(pointer_ty, ArgumentPurpose::StructReturn));
             }
         }
     }
@@ -2059,7 +2127,8 @@ fn build_fn_sig_from_ty(
             }
             _ if param_layout.is_zst() => {}
             _ => {
-                return Err("unsupported param type: non-scalar, non-ZST, non-pair".into());
+                // Memory-repr param: pass by pointer
+                sig.params.push(AbiParam::new(pointer_ty));
             }
         }
     }
@@ -2160,9 +2229,31 @@ pub fn compile_fn(
             local_map.insert(local_id, place);
         }
 
+        // Detect sret (indirect return): Memory-repr return type
+        let ret_local = &body.locals[hir_ty::mir::return_slot()];
+        let ret_layout = db
+            .layout_of_ty(ret_local.ty.clone(), env.clone())
+            .map_err(|e| format!("return type layout error: {:?}", e))?;
+        let is_sret = !ret_layout.is_zst()
+            && !matches!(
+                ret_layout.backend_repr,
+                BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+            );
+
         // Wire function parameters to their locals
         let block_params: Vec<Value> = bcx.block_params(entry_block).to_vec();
         let mut param_idx = 0;
+
+        // If sret, block param 0 is the sret pointer — override return slot
+        if is_sret {
+            let sret_ptr = block_params[param_idx];
+            param_idx += 1;
+            local_map.insert(
+                hir_ty::mir::return_slot(),
+                CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout),
+            );
+        }
+
         for &param_local in &body.param_locals {
             let place = &local_map[param_local];
             if place.layout.is_zst() {
@@ -2179,8 +2270,16 @@ pub fn compile_fn(
                     param_idx += 2;
                 }
                 _ => {
-                    // Stack slot params: not yet handled via ABI
-                    // For now, skip non-scalar/pair params
+                    // Memory-repr param: block param is a pointer to the data
+                    let ptr_val = block_params[param_idx];
+                    param_idx += 1;
+                    local_map.insert(
+                        param_local,
+                        CPlace::for_ptr(
+                            pointer::Pointer::new(ptr_val),
+                            place.layout.clone(),
+                        ),
+                    );
                 }
             }
         }
