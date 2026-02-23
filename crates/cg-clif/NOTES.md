@@ -183,24 +183,25 @@ to `.mirdata` files. Shared types live in `crates/ra-mir-types/`.
 
 ### .mirdata format
 
-`postcard(MirData { crates: Vec<CrateInfo>, bodies: Vec<FnBody> })`
+`postcard(MirData { crates, bodies, layouts })`
 
 Each `FnBody` carries a `DefPathHash` (StableCrateId + local hash) for
 stable cross-crate identity, the human-readable path, generic param count,
 and a full `Body` (locals, arg_count, basic blocks with statements and
 terminators).
 
+Each `Local` has an optional `layout: Option<u32>` index into
+`MirData.layouts`. The layout table (`Vec<TypeLayoutEntry>`) stores
+deduplicated `LayoutInfo` per concrete type: size, align, backend_repr
+(Scalar/ScalarPair/Memory), field offsets, variant info (enum tag encoding),
+and largest niche. Computed via `tcx.layout_of()` in ra-mir-export.
+Locals with generic type params get `layout: None`.
+
 ### Regenerating
 
 ```
 cd ra-mir-export && cargo run --release -- -o /tmp/sysroot.mirdata
 ```
-
-Next steps (easiest to port):
-1. Explicit discriminant values via `db.const_eval_discriminant()`
-2. Closure field type resolution
-3. Remaining cast/intrinsic/drop-glue coverage
-4. Cross-crate generic monomorphization using exported MIR bodies
 
 ## Original cg_clif architecture
 
