@@ -97,6 +97,20 @@ pub fn mangle_closure(
     format!("_Rclosure_{}_{:x}_{:?}", crate_name, disamb, closure_id)
 }
 
+/// Produce a symbol name for a `drop_in_place::<T>` glue function.
+///
+/// Uses a `_Rdrop_` prefix followed by the v0-encoded type to ensure
+/// uniqueness per monomorphized type.
+pub fn mangle_drop_in_place(
+    db: &dyn HirDatabase,
+    ty: Ty<'_>,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> String {
+    let mut m = SymbolMangler { db, out: String::from("_Rdrop_"), ext_crate_disambiguators };
+    m.print_type(ty);
+    m.out
+}
+
 // ---------------------------------------------------------------------------
 // SymbolMangler
 // ---------------------------------------------------------------------------

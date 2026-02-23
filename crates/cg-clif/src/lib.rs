@@ -1616,8 +1616,8 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKin
 
 /// Codegen for `TerminatorKind::Drop`.
 ///
-/// If the type of the dropped place has a `Drop` impl, resolves the impl's
-/// `drop(&mut self)` method and emits a call to it. Otherwise, this is a
+/// If the type has drop glue (direct Drop impl or fields that need dropping),
+/// calls the generated `drop_in_place::<T>` function. Otherwise, this is a
 /// no-op jump to the target block.
 ///
 /// Reference: cg_clif/src/abi/mod.rs `codegen_drop`
@@ -1630,47 +1630,110 @@ fn codegen_drop(
     let body = fx.ra_body();
     let ty = place_ty(fx.db(), body, place);
 
-    // Find the Drop trait
-    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
-    let Some(drop_trait) = lang_items.Drop else {
-        // No Drop trait available (e.g. minicore without drop feature)
+    let interner = DbInterner::new_with(fx.db(), fx.local_crate());
+    if !hir_ty::drop::has_drop_glue_mono(interner, ty.as_ref()) {
         fx.bcx.ins().jump(target_block, &[]);
         return;
-    };
+    }
 
-    // Check if the type has a Drop impl
-    let Some(drop_func_id) = resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, &ty) else {
-        // No Drop impl — just jump to target (no-op drop)
-        fx.bcx.ins().jump(target_block, &[]);
-        return;
-    };
-
-    // The drop method signature is `fn drop(&mut self)` — takes one pointer arg, returns void.
-    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
-    drop_sig.params.push(AbiParam::new(fx.pointer_type));
-
-    // Get a pointer to the place (drop takes &mut self).
+    // Get a pointer to the place (drop takes *mut T / &mut self).
     // Spills register-stored places to the stack if necessary.
     let drop_place = codegen_place(fx, place);
     let ptr = drop_place.to_ptr_maybe_spill(fx).get_addr(&mut fx.bcx, fx.pointer_type);
 
-    // Mangle the drop function name
-    let interner = DbInterner::new_no_crate(fx.db());
-    let fn_name = symbol_mangling::mangle_function(
-        fx.db(), drop_func_id,
-        GenericArgs::empty(interner),
-        fx.ext_crate_disambiguators(),
-    );
+    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+    drop_sig.params.push(AbiParam::new(fx.pointer_type));
+
+    // Optimization: if the type has a direct Drop impl and no fields need
+    // recursive dropping, call Drop::drop directly (avoiding the
+    // drop_in_place wrapper). Otherwise, call drop_in_place::<T>.
+    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
+    let direct_drop = lang_items.Drop.and_then(|drop_trait| {
+        resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, &ty)
+    });
+    let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), &ty);
+
+    let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
+        // Simple case: just call Drop::drop directly
+        let adt_subst = match ty.as_ref().kind() {
+            TyKind::Adt(_, subst) => Some(subst.store()),
+            _ => None,
+        };
+        let interner = DbInterner::new_no_crate(fx.db());
+        let generic_args = adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+        symbol_mangling::mangle_function(
+            fx.db(), drop_func_id, generic_args.as_ref(), fx.ext_crate_disambiguators(),
+        )
+    } else {
+        // Needs recursive field drops — use drop_in_place glue
+        symbol_mangling::mangle_drop_in_place(
+            fx.db(), ty.as_ref(), fx.ext_crate_disambiguators(),
+        )
+    };
 
     let callee_id = fx.module
         .declare_function(&fn_name, Linkage::Import, &drop_sig)
         .expect("declare drop fn");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
-
-    // Call drop(&mut self) with pointer to the place
     fx.bcx.ins().call(callee_ref, &[ptr]);
 
     fx.bcx.ins().jump(target_block, &[]);
+}
+
+/// Check whether a type has fields that themselves need dropping.
+/// Returns true if any field (struct fields, tuple elements, enum variant
+/// fields, closure captures) has drop glue, requiring a `drop_in_place`
+/// wrapper rather than a simple `Drop::drop` call.
+fn type_has_droppable_fields(
+    db: &dyn HirDatabase,
+    krate: base_db::Crate,
+    ty: &StoredTy,
+) -> bool {
+    let interner = DbInterner::new_with(db, krate);
+    match ty.as_ref().kind() {
+        TyKind::Adt(adt_def, subst) => {
+            let adt_id = adt_def.inner().id;
+            match adt_id {
+                hir_def::AdtId::StructId(id) => {
+                    use hir_def::signatures::StructFlags;
+                    if db.struct_signature(id).flags.intersects(
+                        StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA,
+                    ) {
+                        return false;
+                    }
+                    db.field_types(id.into()).iter().any(|(_, field_ty)| {
+                        hir_ty::drop::has_drop_glue_mono(
+                            interner,
+                            field_ty.get().instantiate(interner, subst),
+                        )
+                    })
+                }
+                hir_def::AdtId::UnionId(_) => false,
+                hir_def::AdtId::EnumId(id) => {
+                    id.enum_variants(db).variants.iter().any(|&(variant, _, _)| {
+                        db.field_types(variant.into()).iter().any(|(_, field_ty)| {
+                            hir_ty::drop::has_drop_glue_mono(
+                                interner,
+                                field_ty.get().instantiate(interner, subst),
+                            )
+                        })
+                    })
+                }
+            }
+        }
+        TyKind::Tuple(tys) => {
+            tys.iter().any(|elem_ty| hir_ty::drop::has_drop_glue_mono(interner, elem_ty))
+        }
+        TyKind::Closure(closure_id, subst) => {
+            let owner = db.lookup_intern_closure(closure_id.0).0;
+            let infer = hir_ty::InferenceResult::for_body(db, owner);
+            let (captures, _) = infer.closure_info(closure_id.0);
+            captures.iter().any(|capture| {
+                hir_ty::drop::has_drop_glue_mono(interner, capture.ty(db, subst))
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Resolve the `Drop::drop` impl method for a given type, if any.
@@ -3365,18 +3428,212 @@ fn collect_vtable_methods(
     }
 }
 
+/// Generate a `drop_in_place::<T>` glue function for the given type.
+///
+/// The generated function takes `*mut T` and:
+/// 1. Calls `Drop::drop(&mut *ptr)` if T has a Drop impl
+/// 2. Recursively calls `drop_in_place` for each field that needs dropping
+///
+/// Returns the Cranelift `FuncId` for the generated function.
+fn compile_drop_in_place(
+    module: &mut impl Module,
+    isa: &dyn TargetIsa,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    ty: &StoredTy,
+    local_crate: base_db::Crate,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> Result<FuncId, String> {
+    let pointer_type = pointer_ty(dl);
+    let interner = DbInterner::new_with(db, local_crate);
+
+    // Signature: fn(*mut T) -> void
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.params.push(AbiParam::new(pointer_type));
+
+    let fn_name = symbol_mangling::mangle_drop_in_place(
+        db, ty.as_ref(), ext_crate_disambiguators,
+    );
+    let func_id = module
+        .declare_function(&fn_name, Linkage::Local, &sig)
+        .map_err(|e| format!("declare drop_in_place: {e}"))?;
+
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+        sig.clone(),
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let entry_block = bcx.create_block();
+        bcx.switch_to_block(entry_block);
+        bcx.append_block_params_for_function_params(entry_block);
+        let self_ptr = bcx.block_params(entry_block)[0];
+
+        // 1. If T has a direct Drop impl, call Drop::drop(&mut *ptr)
+        let lang_items = hir_def::lang_item::lang_items(db, local_crate);
+        if let Some(drop_trait) = lang_items.Drop {
+            if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
+                let mut drop_sig = Signature::new(isa.default_call_conv());
+                drop_sig.params.push(AbiParam::new(pointer_type));
+
+                let adt_subst = match ty.as_ref().kind() {
+                    TyKind::Adt(_, subst) => Some(subst.store()),
+                    _ => None,
+                };
+                let generic_args =
+                    adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+                let drop_fn_name = symbol_mangling::mangle_function(
+                    db, drop_func_id, generic_args.as_ref(), ext_crate_disambiguators,
+                );
+
+                let callee_id = module
+                    .declare_function(&drop_fn_name, Linkage::Import, &drop_sig)
+                    .expect("declare Drop::drop");
+                let callee_ref = module.declare_func_in_func(callee_id, bcx.func);
+                bcx.ins().call(callee_ref, &[self_ptr]);
+            }
+        }
+
+        // 2. Drop fields that need dropping
+        // The drop_in_place::<FieldType> functions have the same signature: fn(*mut T)
+        let field_drop_sig = sig.clone();
+
+        match ty.as_ref().kind() {
+            TyKind::Adt(adt_def, subst) => {
+                let adt_id = adt_def.inner().id;
+                match adt_id {
+                    hir_def::AdtId::StructId(id) => {
+                        use hir_def::signatures::StructFlags;
+                        if !db.struct_signature(id).flags.intersects(
+                            StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA,
+                        ) {
+                            let layout = db
+                                .layout_of_ty(ty.clone(), env.clone())
+                                .map_err(|e| format!("layout error: {:?}", e))?;
+                            let field_types = db.field_types(id.into());
+                            for (field_idx, (_, field_ty_binder)) in
+                                field_types.iter().enumerate()
+                            {
+                                let field_ty =
+                                    field_ty_binder.get().instantiate(interner, subst);
+                                if hir_ty::drop::has_drop_glue_mono(interner, field_ty) {
+                                    let offset =
+                                        layout.fields.offset(field_idx).bytes() as i64;
+                                    let field_ptr =
+                                        bcx.ins().iadd_imm(self_ptr, offset);
+                                    let field_ty_stored = field_ty.store();
+                                    let name = symbol_mangling::mangle_drop_in_place(
+                                        db,
+                                        field_ty_stored.as_ref(),
+                                        ext_crate_disambiguators,
+                                    );
+                                    let callee = module
+                                        .declare_function(
+                                            &name,
+                                            Linkage::Import,
+                                            &field_drop_sig,
+                                        )
+                                        .expect("declare field drop_in_place");
+                                    let callee_ref =
+                                        module.declare_func_in_func(callee, bcx.func);
+                                    bcx.ins().call(callee_ref, &[field_ptr]);
+                                }
+                            }
+                        }
+                    }
+                    hir_def::AdtId::UnionId(_) => {} // union fields not dropped
+                    hir_def::AdtId::EnumId(id) => {
+                        // For enums, we need to switch on discriminant and drop
+                        // the appropriate variant's fields.
+                        // TODO: implement enum variant field drops
+                        let _ = id;
+                    }
+                }
+            }
+            TyKind::Tuple(tys) => {
+                let layout = db
+                    .layout_of_ty(ty.clone(), env.clone())
+                    .map_err(|e| format!("layout error: {:?}", e))?;
+                for (idx, elem_ty) in tys.iter().enumerate() {
+                    if hir_ty::drop::has_drop_glue_mono(interner, elem_ty) {
+                        let offset = layout.fields.offset(idx).bytes() as i64;
+                        let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
+                        let elem_stored = elem_ty.store();
+                        let name = symbol_mangling::mangle_drop_in_place(
+                            db,
+                            elem_stored.as_ref(),
+                            ext_crate_disambiguators,
+                        );
+                        let callee = module
+                            .declare_function(&name, Linkage::Import, &field_drop_sig)
+                            .expect("declare tuple field drop_in_place");
+                        let callee_ref = module.declare_func_in_func(callee, bcx.func);
+                        bcx.ins().call(callee_ref, &[field_ptr]);
+                    }
+                }
+            }
+            TyKind::Closure(closure_id, subst) => {
+                let owner = db.lookup_intern_closure(closure_id.0).0;
+                let infer = hir_ty::InferenceResult::for_body(db, owner);
+                let (captures, _) = infer.closure_info(closure_id.0);
+                let layout = db
+                    .layout_of_ty(ty.clone(), env.clone())
+                    .map_err(|e| format!("layout error: {:?}", e))?;
+                for (idx, capture) in captures.iter().enumerate() {
+                    let cap_ty = capture.ty(db, subst);
+                    if hir_ty::drop::has_drop_glue_mono(interner, cap_ty) {
+                        let offset = layout.fields.offset(idx).bytes() as i64;
+                        let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
+                        let cap_stored = cap_ty.store();
+                        let name = symbol_mangling::mangle_drop_in_place(
+                            db,
+                            cap_stored.as_ref(),
+                            ext_crate_disambiguators,
+                        );
+                        let callee = module
+                            .declare_function(&name, Linkage::Import, &field_drop_sig)
+                            .expect("declare capture drop_in_place");
+                        let callee_ref = module.declare_func_in_func(callee, bcx.func);
+                        bcx.ins().call(callee_ref, &[field_ptr]);
+                    }
+                }
+            }
+            _ => {} // primitive types, references, fn ptrs — nothing to drop
+        }
+
+        bcx.ins().return_(&[]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::new();
+    ctx.func = func;
+    module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| format!("define drop_in_place: {e}"))?;
+
+    Ok(func_id)
+}
+
 /// Collect all non-extern, non-intrinsic, local monomorphized function instances
 /// reachable from `root` by walking MIR call terminators. Returns them in BFS
 /// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
 /// representing a specific monomorphization. Cross-crate functions are skipped.
 ///
-/// Also returns any closures discovered via `AggregateKind::Closure` in statements.
+/// Also returns any closures discovered via `AggregateKind::Closure` in statements,
+/// and types that need `drop_in_place` glue functions.
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     root: hir_def::FunctionId,
     local_crate: base_db::Crate,
-) -> (Vec<(hir_def::FunctionId, StoredGenericArgs)>, Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>) {
+) -> (
+    Vec<(hir_def::FunctionId, StoredGenericArgs)>,
+    Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    Vec<StoredTy>,
+) {
     use std::collections::{HashSet, VecDeque};
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
@@ -3389,6 +3646,8 @@ fn collect_reachable_fns(
 
     let mut closure_visited = HashSet::new();
     let mut closure_result = Vec::new();
+
+    let mut drop_types = HashSet::new();
 
     queue.push_back((root, empty_args));
 
@@ -3433,6 +3692,7 @@ fn collect_reachable_fns(
             db, env, &body, interner, local_crate,
             &empty_args_stored, &mut queue,
             &mut closure_visited, &mut closure_result,
+            &mut drop_types,
         );
     }
 
@@ -3450,6 +3710,7 @@ fn collect_reachable_fns(
             db, env, &closure_body, interner, local_crate,
             &empty_args_stored, &mut queue,
             &mut closure_visited, &mut closure_result,
+            &mut drop_types,
         );
         // Process any newly discovered functions from closure bodies
         while let Some((func_id, generic_args)) = queue.pop_front() {
@@ -3478,11 +3739,94 @@ fn collect_reachable_fns(
                 db, env, &body, interner, local_crate,
                 &empty_args_stored, &mut queue,
                 &mut closure_visited, &mut closure_result,
+                &mut drop_types,
             );
         }
     }
 
-    (result, closure_result)
+    (result, closure_result, drop_types.into_iter().collect())
+}
+
+/// Transitively collect all types needing `drop_in_place` glue and their
+/// Drop impl methods. Starting from a root type, recurses into fields of
+/// structs, tuples, enums, and closures, collecting every type that has
+/// drop glue. Also pushes any Drop impl methods found into `fn_queue` so
+/// they get compiled.
+fn collect_drop_info(
+    db: &dyn HirDatabase,
+    local_crate: base_db::Crate,
+    ty: &StoredTy,
+    fn_queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
+) {
+    let interner = DbInterner::new_with(db, local_crate);
+
+    if !hir_ty::drop::has_drop_glue_mono(interner, ty.as_ref()) {
+        return;
+    }
+    if !drop_types.insert(ty.clone()) {
+        return;
+    }
+
+    // If this type has a direct Drop impl, add its method to the fn queue
+    let lang_items = hir_def::lang_item::lang_items(db, local_crate);
+    if let Some(drop_trait) = lang_items.Drop {
+        if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
+            let drop_args = match ty.as_ref().kind() {
+                TyKind::Adt(_, subst) => subst.store(),
+                _ => GenericArgs::empty(interner).store(),
+            };
+            fn_queue.push_back((drop_func_id, drop_args));
+        }
+    }
+
+    // Recurse into fields
+    match ty.as_ref().kind() {
+        TyKind::Adt(adt_def, subst) => {
+            let adt_id = adt_def.inner().id;
+            match adt_id {
+                hir_def::AdtId::StructId(id) => {
+                    use hir_def::signatures::StructFlags;
+                    if db.struct_signature(id).flags.intersects(
+                        StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA,
+                    ) {
+                        return;
+                    }
+                    let field_types = db.field_types(id.into());
+                    for (_, field_ty) in field_types.iter() {
+                        let ft = field_ty.get().instantiate(interner, subst).store();
+                        collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+                    }
+                }
+                hir_def::AdtId::UnionId(_) => {} // union fields not dropped
+                hir_def::AdtId::EnumId(id) => {
+                    for &(variant, _, _) in &id.enum_variants(db).variants {
+                        let field_types = db.field_types(variant.into());
+                        for (_, field_ty) in field_types.iter() {
+                            let ft = field_ty.get().instantiate(interner, subst).store();
+                            collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+                        }
+                    }
+                }
+            }
+        }
+        TyKind::Tuple(tys) => {
+            for elem_ty in tys.iter() {
+                let ft = elem_ty.store();
+                collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+            }
+        }
+        TyKind::Closure(closure_id, subst) => {
+            let owner = db.lookup_intern_closure(closure_id.0).0;
+            let infer = hir_ty::InferenceResult::for_body(db, owner);
+            let (captures, _) = infer.closure_info(closure_id.0);
+            for capture in captures.iter() {
+                let cap_ty = capture.ty(db, subst).store();
+                collect_drop_info(db, local_crate, &cap_ty, fn_queue, drop_types);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Scan a MIR body for callees (functions and closures) and push them onto
@@ -3497,6 +3841,7 @@ fn scan_body_for_callees(
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
     closure_visited: &mut std::collections::HashSet<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
     use hir_ty::mir::AggregateKind;
 
@@ -3560,14 +3905,9 @@ fn scan_body_for_callees(
                 }
             }
             TerminatorKind::Drop { place, .. } => {
-                // Discover drop impl methods for types being dropped
+                // Transitively discover drop types and their Drop impl methods
                 let ty = place_ty(db, body, place);
-                let lang_items = hir_def::lang_item::lang_items(db, local_crate);
-                if let Some(drop_trait) = lang_items.Drop {
-                    if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, &ty) {
-                        queue.push_back((drop_func_id, empty_args_stored.clone()));
-                    }
-                }
+                collect_drop_info(db, local_crate, &ty, queue, drop_types);
             }
             _ => {}
         }
@@ -3593,7 +3933,8 @@ pub fn compile_executable(
     let mut module = ObjectModule::new(builder);
 
     // Discover and compile all reachable local monomorphized function instances
-    let (reachable_fns, reachable_closures) = collect_reachable_fns(db, env, main_func_id, local_crate);
+    let (reachable_fns, reachable_closures, drop_types) =
+        collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 
     for (func_id, generic_args) in &reachable_fns {
@@ -3622,6 +3963,14 @@ pub fn compile_executable(
         compile_fn(
             &mut module, &*isa, db, dl, env, &body, &closure_name, Linkage::Export,
             local_crate, ext_crate_disambiguators, &[],
+        )?;
+    }
+
+    // Compile drop_in_place glue functions
+    for ty in &drop_types {
+        compile_drop_in_place(
+            &mut module, &*isa, db, dl, env, ty,
+            local_crate, ext_crate_disambiguators,
         )?;
     }
 

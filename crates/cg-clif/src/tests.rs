@@ -1591,8 +1591,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         }
         .store();
 
-        // Discover all reachable functions and closures
-        let (reachable_fns, reachable_closures) =
+        // Discover all reachable functions, closures, and drop types
+        let (reachable_fns, reachable_closures, drop_types) =
             crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
 
         // Compile all reachable functions
@@ -1622,6 +1622,15 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
             )
             .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
+        }
+
+        // Compile drop_in_place glue functions
+        for ty in &drop_types {
+            crate::compile_drop_in_place(
+                &mut jit_module, &*isa, &db, &dl, &env, ty,
+                local_crate, &empty_map,
+            )
+            .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
         }
 
         // Finalize: make all compiled code executable
@@ -1762,6 +1771,72 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn jit_drop_field_recursive() {
+    // Verify that dropping a struct without a Drop impl still drops its fields.
+    // Outer has no Drop impl, but contains Inner which does.
+    // Inner's drop writes through a raw pointer, proving it was called.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Inner {
+    target: *mut i32,
+}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        unsafe { *(self.target) = 42; }
+    }
+}
+struct Outer {
+    inner: Inner,
+}
+fn make_and_drop(target: *mut i32) {
+    let _o = Outer { inner: Inner { target } };
+}
+fn foo() -> i32 {
+    let mut result: i32 = 0;
+    make_and_drop(&mut result as *mut i32);
+    result
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn jit_drop_generic() {
+    // Verify that Drop::drop works for generic types.
+    // The drop impl writes through a raw pointer — proving the correct
+    // monomorphized drop function is called with the right generic args.
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Guard<T> {
+    target: *mut T,
+    val: T,
+}
+impl<T> Drop for Guard<T> {
+    fn drop(&mut self) {
+        unsafe { *(self.target) = self.val; }
+    }
+}
+fn write_via_drop(target: *mut i32) {
+    let _g = Guard { target, val: 42 };
+}
+fn foo() -> i32 {
+    let mut result: i32 = 0;
+    write_via_drop(&mut result as *mut i32);
+    result
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
 }
 
 // ---------------------------------------------------------------------------
