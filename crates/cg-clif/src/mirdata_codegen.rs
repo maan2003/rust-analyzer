@@ -3512,4 +3512,297 @@ mod tests {
         let result: usize = mirdata_jit_run(&fn_body, &layout_entries);
         assert_eq!(result, 3);
     }
+
+    // -- Enum matching: SwitchInt + Downcast + field extraction -------------------
+
+    #[test]
+    fn mirdata_enum_match() {
+        // Simulate matching on a simple 2-variant enum (like Option<i32>) with
+        // direct tag encoding:
+        //
+        // enum MyOption { None=0, Some(i32)=1 }
+        //
+        // fn extract_or_default(opt: MyOption) -> i32 {
+        //     match opt {
+        //         MyOption::Some(val) => val,
+        //         MyOption::None => -1,
+        //     }
+        // }
+        //
+        // Layout: size=8, align=4
+        //   tag at field 0 (offset 0, u8)
+        //   variant 0 (None): no fields
+        //   variant 1 (Some): field 0 at offset 4 (i32)
+        let enum_ty = Ty::Adt((100, 100), "MyOption".into(), vec![]);
+        let u8_layout = TypeLayoutEntry {
+            ty: Ty::Uint(UintTy::U8),
+            layout: LayoutInfo {
+                size: 1,
+                align: 1,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Int { size_bytes: 1, signed: false },
+                    valid_range_start: 0,
+                    valid_range_end: 255,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        };
+        let enum_layout = TypeLayoutEntry {
+            ty: enum_ty.clone(),
+            layout: LayoutInfo {
+                size: 8,
+                align: 4,
+                backend_repr: ExportedBackendRepr::Memory { sized: true },
+                fields: ExportedFieldsShape::Arbitrary { offsets: vec![0] }, // tag at offset 0
+                variants: ExportedVariants::Multiple {
+                    tag: ExportedScalar {
+                        primitive: ExportedPrimitive::Int { size_bytes: 1, signed: false },
+                        valid_range_start: 0,
+                        valid_range_end: 1,
+                    },
+                    tag_encoding: ExportedTagEncoding::Direct,
+                    tag_field: 0,
+                    variants: vec![
+                        // Variant 0 (None): just tag, no payload
+                        LayoutInfo {
+                            size: 8,
+                            align: 4,
+                            backend_repr: ExportedBackendRepr::Memory { sized: true },
+                            fields: ExportedFieldsShape::Arbitrary { offsets: vec![] },
+                            variants: ExportedVariants::Single { index: 0 },
+                            largest_niche: None,
+                        },
+                        // Variant 1 (Some): payload i32 at offset 4
+                        LayoutInfo {
+                            size: 8,
+                            align: 4,
+                            backend_repr: ExportedBackendRepr::Memory { sized: true },
+                            fields: ExportedFieldsShape::Arbitrary { offsets: vec![4] },
+                            variants: ExportedVariants::Single { index: 1 },
+                            largest_niche: None,
+                        },
+                    ],
+                },
+                largest_niche: None,
+            },
+        };
+        let layout_entries = vec![
+            i32_layout_entry(),    // 0
+            u8_layout,             // 1
+            enum_layout,           // 2
+        ];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        // Build the function: fn extract(opt: MyOption) -> i32
+        // MIR:
+        //   bb0: _2 = Discriminant(_1)
+        //         SwitchInt(_2, [0 → bb1, otherwise → bb2])
+        //   bb1 (None):  _0 = const -1i32; goto bb3
+        //   bb2 (Some):  _0 = Copy((_1 as Some).0); goto bb3
+        //   bb3: return
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "extract".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: enum_ty.clone(), layout: Some(2) },      // _1: opt (arg)
+                    Local { ty: Ty::Uint(UintTy::U8), layout: Some(1) }, // _2: discriminant
+                ],
+                arg_count: 1,
+                blocks: vec![
+                    // bb0: get discriminant and switch
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::Discriminant(Place { local: 1, projections: vec![] }),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place { local: 2, projections: vec![] }),
+                            targets: SwitchTargets {
+                                values: vec![0], // 0 = None
+                                targets: vec![1, 2], // [None→bb1, otherwise(Some)→bb2]
+                            },
+                        },
+                        is_cleanup: false,
+                    },
+                    // bb1 (None): _0 = -1
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: Ty::Int(IntTy::I32),
+                                kind: ConstKind::Scalar(-1i32 as u32 as u128, 4),
+                            })),
+                        )],
+                        terminator: Terminator::Goto(3),
+                        is_cleanup: false,
+                    },
+                    // bb2 (Some): _0 = (_1 as variant 1).field 0
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![
+                                    Projection::Downcast(1),
+                                    Projection::Field(0, Ty::Int(IntTy::I32)),
+                                ],
+                            })),
+                        )],
+                        terminator: Terminator::Goto(3),
+                        is_cleanup: false,
+                    },
+                    // bb3: return
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        // Build a caller that constructs Some(42) and calls extract
+        //
+        // fn test() -> i32 {
+        //   let opt: MyOption = Some(42);
+        //   extract(opt)
+        // }
+        //
+        // MIR for constructing Some(42):
+        //   _1 = Aggregate(Adt(MyOption, variant=1), [const 42])
+        //   SetDiscriminant(_1, 1)
+        let caller = FnBody {
+            def_path_hash: (1, 1),
+            name: "test_enum".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: enum_ty.clone(), layout: Some(2) },      // _1: opt
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![
+                            // _1 = Aggregate(Adt(MyOption, variant=1), [42])
+                            Statement::Assign(
+                                Place { local: 1, projections: vec![] },
+                                Rvalue::Aggregate(
+                                    ra_mir_types::AggregateKind::Adt((100, 100), 1, vec![]),
+                                    vec![Operand::Constant(ConstOperand {
+                                        ty: Ty::Int(IntTy::I32),
+                                        kind: ConstKind::Scalar(42, 4),
+                                    })],
+                                ),
+                            ),
+                            Statement::SetDiscriminant {
+                                place: Place { local: 1, projections: vec![] },
+                                variant_index: 1,
+                            },
+                        ],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef((0, 0), vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![Operand::Copy(Place { local: 1, projections: vec![] })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let extract_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &fn_body, &layouts,
+            "extract", Linkage::Export, &empty_reg, &ty_layouts,
+        ).expect("compile extract");
+
+        // Also test the None case: construct None and call extract
+        let caller_none = FnBody {
+            def_path_hash: (2, 2),
+            name: "test_enum_none".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: enum_ty.clone(), layout: Some(2) },      // _1: opt
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![
+                            // _1 = Aggregate(Adt(MyOption, variant=0), [])
+                            Statement::Assign(
+                                Place { local: 1, projections: vec![] },
+                                Rvalue::Aggregate(
+                                    ra_mir_types::AggregateKind::Adt((100, 100), 0, vec![]),
+                                    vec![],
+                                ),
+                            ),
+                            Statement::SetDiscriminant {
+                                place: Place { local: 1, projections: vec![] },
+                                variant_index: 0,
+                            },
+                        ],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef((0, 0), vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![Operand::Copy(Place { local: 1, projections: vec![] })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert((0u64, 0u64), extract_id);
+
+        let caller_some_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller, &layouts,
+            "test_enum", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile test_enum");
+
+        let caller_none_id = compile_mirdata_fn(
+            &mut module, &*isa, &dl, &caller_none, &layouts,
+            "test_enum_none", Linkage::Export, &fn_registry, &ty_layouts,
+        ).expect("compile test_enum_none");
+
+        module.finalize_definitions().unwrap();
+
+        unsafe {
+            let f_some: fn() -> i32 = std::mem::transmute(module.get_finalized_function(caller_some_id));
+            assert_eq!(f_some(), 42); // Some(42) → extract → 42
+
+            let f_none: fn() -> i32 = std::mem::transmute(module.get_finalized_function(caller_none_id));
+            assert_eq!(f_none(), -1); // None → extract → -1
+        }
+    }
 }
