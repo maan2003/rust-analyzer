@@ -8,12 +8,14 @@
 //! Uses the shared `FunctionCx` with `MirSource::Mirdata` variant, which gives
 //! access to the full `CPlace`/`CValue` infrastructure without duplication.
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
+use std::collections::HashMap;
+
+use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, Value};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{FuncId, Linkage, Module};
-use ra_mir_types::{Body, ConstKind, Operand, Rvalue, Statement, Terminator};
+use ra_mir_types::{Body, CastKind, ConstKind, Operand, PointerCoercion, Rvalue, Statement, Terminator};
 use rustc_abi::{BackendRepr, Float, Primitive, TargetDataLayout};
 use triomphe::Arc as TArc;
 
@@ -48,46 +50,122 @@ fn build_mirdata_fn_sig(
     layouts: &[LayoutArc],
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
-    let ptr_ty = pointer_ty(dl);
 
     // Return type: locals[0]
     let ret_layout = local_layout(&body.locals[0], layouts)?;
-    match ret_layout.backend_repr {
-        BackendRepr::Scalar(scalar) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-        }
-        BackendRepr::ScalarPair(a, b) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
-        }
-        _ if ret_layout.is_zst() => {}
-        _ => {
-            sig.params.push(AbiParam::special(
-                ptr_ty,
-                cranelift_codegen::ir::ArgumentPurpose::StructReturn,
-            ));
-        }
-    }
+    crate::append_ret_to_sig(&mut sig, dl, &ret_layout);
 
     // Parameters: locals[1..=arg_count]
     for i in 1..=body.arg_count as usize {
         let param_layout = local_layout(&body.locals[i], layouts)?;
-        match param_layout.backend_repr {
-            BackendRepr::Scalar(scalar) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-            }
-            BackendRepr::ScalarPair(a, b) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
-                sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
-            }
-            _ if param_layout.is_zst() => {}
-            _ => {
-                sig.params.push(AbiParam::new(ptr_ty));
-            }
-        }
+        crate::append_param_to_sig(&mut sig, dl, &param_layout);
     }
 
     Ok(sig)
+}
+
+// ---------------------------------------------------------------------------
+// Place codegen (projections)
+// ---------------------------------------------------------------------------
+
+/// Resolve a mirdata Place (local + projections) to a CPlace.
+///
+/// Tracks the current `ra_mir_types::Ty` through projections to resolve
+/// field/pointee/element layouts via the `ty_layouts` map.
+fn codegen_md_place(
+    fx: &mut FunctionCx<'_, impl Module>,
+    place: &ra_mir_types::Place,
+) -> CPlace {
+    if place.projections.is_empty() {
+        return fx.local_place_idx(place.local as usize).clone();
+    }
+
+    let mut cplace = fx.local_place_idx(place.local as usize).clone();
+
+    // Get the local's type to track through projections
+    let MirSource::Mirdata { body, .. } = &fx.mir else { unreachable!() };
+    let mut cur_ty = body.locals[place.local as usize].ty.clone();
+
+    for proj in &place.projections {
+        match proj {
+            ra_mir_types::Projection::Field(field_idx, field_ty) => {
+                let field_layout = fx.md_layout(field_ty);
+                cplace = cplace.place_field(fx, *field_idx as usize, field_layout);
+                cur_ty = field_ty.clone();
+            }
+            ra_mir_types::Projection::Deref => {
+                let pointee_ty = match &cur_ty {
+                    ra_mir_types::Ty::Ref(_, pointee) => (**pointee).clone(),
+                    ra_mir_types::Ty::RawPtr(_, pointee) => (**pointee).clone(),
+                    _ => panic!("Deref on non-pointer type: {:?}", cur_ty),
+                };
+                let pointee_layout = fx.md_layout(&pointee_ty);
+                let cval = cplace.to_cvalue(fx);
+                cplace = match cval.layout.backend_repr {
+                    BackendRepr::ScalarPair(_, _) => {
+                        // Fat pointer (e.g. &dyn Trait, &[T])
+                        let (data_ptr, meta) = cval.load_scalar_pair(fx);
+                        CPlace::for_ptr_with_extra(
+                            Pointer::new(data_ptr),
+                            meta,
+                            pointee_layout,
+                        )
+                    }
+                    _ => {
+                        let ptr_val = cval.load_scalar(fx);
+                        CPlace::for_ptr(Pointer::new(ptr_val), pointee_layout)
+                    }
+                };
+                cur_ty = pointee_ty;
+            }
+            ra_mir_types::Projection::Downcast(variant_idx) => {
+                use rustc_abi::Variants;
+                // For multi-variant enums in registers, spill to memory
+                if cplace.is_register() {
+                    if matches!(&cplace.layout.variants, Variants::Multiple { .. }) {
+                        let cval = cplace.to_cvalue(fx);
+                        let ptr = cval.force_stack(fx);
+                        cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                    }
+                }
+                let variant_layout = md_variant_layout(&cplace.layout, *variant_idx);
+                cplace = cplace.downcast_variant(variant_layout);
+                // cur_ty stays the same (Downcast doesn't change the Rust type)
+            }
+            ra_mir_types::Projection::Index(index_local) => {
+                let index_place = fx.local_place_idx(*index_local as usize).clone();
+                let index_val = index_place.to_cvalue(fx).load_scalar(fx);
+                let elem_ty = match &cur_ty {
+                    ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => (**elem).clone(),
+                    _ => panic!("Index on non-array/slice type: {:?}", cur_ty),
+                };
+                let elem_layout = fx.md_layout(&elem_ty);
+                let offset = fx.bcx.ins().imul_imm(index_val, elem_layout.size.bytes() as i64);
+                // Arrays in registers → spill to memory
+                if cplace.is_register() {
+                    let cval = cplace.to_cvalue(fx);
+                    let ptr = cval.force_stack(fx);
+                    cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                }
+                cplace = CPlace::for_ptr(
+                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, offset),
+                    elem_layout,
+                );
+                cur_ty = elem_ty;
+            }
+            ra_mir_types::Projection::ConstantIndex { .. } => todo!("ConstantIndex projection in mirdata"),
+            ra_mir_types::Projection::Subslice { .. } => todo!("Subslice projection in mirdata"),
+            ra_mir_types::Projection::OpaqueCast(_) => todo!("OpaqueCast projection in mirdata"),
+        }
+    }
+
+    cplace
+}
+
+/// Compute a variant layout for Downcast projection (mirdata path).
+/// Delegates to the shared `variant_layout` in lib.rs.
+fn md_variant_layout(parent_layout: &LayoutArc, variant_idx: u32) -> LayoutArc {
+    crate::variant_layout(parent_layout, rac_abi::VariantIdx::from_u32(variant_idx))
 }
 
 // ---------------------------------------------------------------------------
@@ -101,9 +179,7 @@ fn codegen_md_operand(
 ) -> CValue {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => {
-            assert!(place.projections.is_empty(), "projections not yet supported");
-            let local_place = fx.local_place_idx(place.local as usize).clone();
-            local_place.to_cvalue(fx)
+            codegen_md_place(fx, place).to_cvalue(fx)
         }
         Operand::Constant(c) => match &c.kind {
             ConstKind::Scalar(bits, _size) => {
@@ -128,6 +204,75 @@ fn codegen_md_operand(
     }
 }
 
+fn codegen_md_cast(
+    fx: &mut FunctionCx<'_, impl Module>,
+    kind: &CastKind,
+    operand: &Operand,
+    dest_layout: &LayoutArc,
+) -> CValue {
+    // Handle ReifyFnPointer: FnDef (ZST) → fn pointer via fn_registry lookup
+    if let CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer) = kind {
+        let ra_mir_types::Operand::Constant(c) = operand else {
+            panic!("ReifyFnPointer on non-constant operand");
+        };
+        let ra_mir_types::Ty::FnDef(hash, _) = &c.ty else {
+            panic!("ReifyFnPointer on non-FnDef type: {:?}", c.ty);
+        };
+        let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
+            unreachable!()
+        };
+        let func_id = *fn_registry.get(hash).expect("ReifyFnPointer: function not in fn_registry");
+        let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
+        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, func_ref);
+        return CValue::by_val(func_addr, dest_layout.clone());
+    }
+
+    // Load source operand as scalar
+    let src_layout = match operand {
+        Operand::Copy(p) | Operand::Move(p) => {
+            fx.local_place_idx(p.local as usize).layout.clone()
+        }
+        Operand::Constant(_) => dest_layout.clone(),
+    };
+    let from_cval = codegen_md_operand(fx, operand, &src_layout);
+    let from_val = from_cval.load_scalar(fx);
+
+    let BackendRepr::Scalar(target_scalar) = dest_layout.backend_repr else {
+        todo!("cast target must be scalar in mirdata");
+    };
+
+    // Determine source signedness from source layout
+    let from_signed = match from_cval.layout.backend_repr {
+        BackendRepr::Scalar(ref s) => matches!(s.primitive(), Primitive::Int(_, true)),
+        _ => false,
+    };
+
+    let scalar_kind = match kind {
+        CastKind::IntToInt => crate::ScalarCastKind::IntToInt,
+        CastKind::FloatToInt => crate::ScalarCastKind::FloatToInt,
+        CastKind::IntToFloat => crate::ScalarCastKind::IntToFloat,
+        CastKind::FloatToFloat => crate::ScalarCastKind::FloatToFloat,
+        CastKind::PtrToPtr
+        | CastKind::FnPtrToPtr
+        | CastKind::PointerExposeProvenance
+        | CastKind::PointerWithExposedProvenance
+        | CastKind::PointerCoercion(
+            PointerCoercion::MutToConstPointer
+            | PointerCoercion::UnsafeFnPointer
+            | PointerCoercion::ArrayToPointer
+            | PointerCoercion::ClosureFnPointer,
+        ) => crate::ScalarCastKind::PtrLike,
+        CastKind::Transmute => crate::ScalarCastKind::Transmute,
+        CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer) => {
+            unreachable!("handled above")
+        }
+        CastKind::PointerCoercion(PointerCoercion::Unsize) => {
+            todo!("Unsize coercion in mirdata")
+        }
+    };
+    crate::codegen_scalar_cast(fx, scalar_kind, from_val, from_signed, &target_scalar, dest_layout)
+}
+
 fn codegen_md_rvalue(
     fx: &mut FunctionCx<'_, impl Module>,
     rvalue: &Rvalue,
@@ -135,7 +280,147 @@ fn codegen_md_rvalue(
 ) -> CValue {
     match rvalue {
         Rvalue::Use(operand) => codegen_md_operand(fx, operand, dest_layout),
+        Rvalue::Cast(kind, operand, _ty) => codegen_md_cast(fx, kind, operand, dest_layout),
+        Rvalue::BinaryOp(op, lhs, rhs) => {
+            // For Copy/Move, layout comes from the local. For constants,
+            // use dest_layout as fallback (correct for arithmetic; for
+            // comparisons, use locals instead of constants).
+            let op_layout = match lhs {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    fx.local_place_idx(p.local as usize).layout.clone()
+                }
+                Operand::Constant(_) => dest_layout.clone(),
+            };
+            let lhs_cval = codegen_md_operand(fx, lhs, &op_layout);
+            let rhs_cval = codegen_md_operand(fx, rhs, &op_layout);
+            let lhs_val = lhs_cval.load_scalar(fx);
+            let rhs_val = rhs_cval.load_scalar(fx);
+
+            let BackendRepr::Scalar(scalar) = lhs_cval.layout.backend_repr else {
+                panic!("expected scalar for binop operand");
+            };
+            let val = match scalar.primitive() {
+                Primitive::Int(_, signed) => {
+                    crate::codegen_int_binop(fx, op, lhs_val, rhs_val, signed)
+                }
+                Primitive::Float(_) => crate::codegen_float_binop(fx, op, lhs_val, rhs_val),
+                Primitive::Pointer(_) => todo!("pointer binop in mirdata"),
+            };
+            CValue::by_val(val, dest_layout.clone())
+        }
+        Rvalue::UnaryOp(op, operand) => {
+            let val_cval = codegen_md_operand(fx, operand, dest_layout);
+            let val = val_cval.load_scalar(fx);
+            let res = match op {
+                ra_mir_types::UnOp::Neg => fx.bcx.ins().ineg(val),
+                ra_mir_types::UnOp::Not => fx.bcx.ins().bnot(val),
+                ra_mir_types::UnOp::PtrMetadata => todo!("PtrMetadata in mirdata"),
+            };
+            CValue::by_val(res, dest_layout.clone())
+        }
+        Rvalue::Ref(_, place) | Rvalue::RawPtr(_, place) => {
+            let place = codegen_md_place(fx, place);
+            // If the place is in registers, spill to a stack slot to get an address.
+            let ptr = if place.is_register() {
+                let cval = place.to_cvalue(fx);
+                cval.force_stack(fx)
+            } else {
+                place.to_ptr()
+            };
+            CValue::by_val(ptr.get_addr(&mut fx.bcx, fx.pointer_type), dest_layout.clone())
+        }
+        Rvalue::CopyForDeref(place) => {
+            codegen_md_place(fx, place).to_cvalue(fx)
+        }
+        Rvalue::Discriminant(place) => {
+            let place = codegen_md_place(fx, place);
+            let discr = crate::codegen_get_discriminant(fx, &place, dest_layout);
+            CValue::by_val(discr, dest_layout.clone())
+        }
+        Rvalue::Aggregate(agg_kind, operands) => {
+            let dest_place = CPlace::new_stack_slot(fx, dest_layout.clone());
+            match agg_kind {
+                ra_mir_types::AggregateKind::Tuple
+                | ra_mir_types::AggregateKind::Adt(_, 0, _)
+                | ra_mir_types::AggregateKind::Closure(_, _) => {
+                    // Simple struct-like: write each field
+                    for (i, operand) in operands.iter().enumerate() {
+                        let field_place = dest_place.place_field(
+                            fx,
+                            i,
+                            fx.md_layout(&operand_ty(fx, operand)),
+                        );
+                        let val = codegen_md_operand(fx, operand, &field_place.layout);
+                        field_place.write_cvalue(fx, val);
+                    }
+                }
+                ra_mir_types::AggregateKind::Adt(_, variant_idx, _) => {
+                    // Enum variant
+                    let variant_layout = md_variant_layout(dest_layout, *variant_idx);
+                    let variant_place = dest_place.downcast_variant(variant_layout);
+                    for (i, operand) in operands.iter().enumerate() {
+                        let field_place = variant_place.place_field(
+                            fx,
+                            i,
+                            fx.md_layout(&operand_ty(fx, operand)),
+                        );
+                        let val = codegen_md_operand(fx, operand, &field_place.layout);
+                        field_place.write_cvalue(fx, val);
+                    }
+                    crate::codegen_set_discriminant(fx, &dest_place, rac_abi::VariantIdx::from_u32(*variant_idx));
+                }
+                ra_mir_types::AggregateKind::Array(elem_ty) => {
+                    let elem_layout = fx.md_layout(elem_ty);
+                    for (i, operand) in operands.iter().enumerate() {
+                        let offset = elem_layout.size.bytes() as i64 * i as i64;
+                        let field_ptr = dest_place.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, offset);
+                        let field_place = CPlace::for_ptr(field_ptr, elem_layout.clone());
+                        let val = codegen_md_operand(fx, operand, &field_place.layout);
+                        field_place.write_cvalue(fx, val);
+                    }
+                }
+                _ => panic!("unsupported aggregate kind: {:?}", agg_kind),
+            }
+            dest_place.to_cvalue(fx)
+        }
         _ => panic!("unsupported rvalue: {:?}", rvalue),
+    }
+}
+
+/// Get the type of an operand (for aggregate field layout resolution).
+fn operand_ty(
+    fx: &FunctionCx<'_, impl Module>,
+    operand: &Operand,
+) -> ra_mir_types::Ty {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => {
+            let MirSource::Mirdata { body, .. } = &fx.mir else { unreachable!() };
+            // For projections, we'd need to walk the type. For now, handle the
+            // common case of a bare local.
+            if place.projections.is_empty() {
+                body.locals[place.local as usize].ty.clone()
+            } else {
+                // Walk through projections to get the final type
+                let mut ty = body.locals[place.local as usize].ty.clone();
+                for proj in &place.projections {
+                    ty = match proj {
+                        ra_mir_types::Projection::Field(_, field_ty) => field_ty.clone(),
+                        ra_mir_types::Projection::Deref => match &ty {
+                            ra_mir_types::Ty::Ref(_, inner) | ra_mir_types::Ty::RawPtr(_, inner) => (**inner).clone(),
+                            _ => panic!("Deref on non-pointer"),
+                        },
+                        ra_mir_types::Projection::Index(_) => match &ty {
+                            ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => (**elem).clone(),
+                            _ => panic!("Index on non-array"),
+                        },
+                        ra_mir_types::Projection::Downcast(_) => ty, // type stays the same
+                        _ => panic!("unsupported projection in operand_ty"),
+                    };
+                }
+                ty
+            }
+        }
+        Operand::Constant(c) => c.ty.clone(),
     }
 }
 
@@ -146,13 +431,18 @@ fn codegen_md_rvalue(
 fn codegen_md_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &Statement) {
     match stmt {
         Statement::Assign(place, rvalue) => {
-            assert!(place.projections.is_empty(), "projections not yet supported");
-            let dest = fx.local_place_idx(place.local as usize).clone();
+            let dest = codegen_md_place(fx, place);
             let val = codegen_md_rvalue(fx, rvalue, &dest.layout);
             dest.write_cvalue(fx, val);
         }
+        Statement::SetDiscriminant { place, variant_index } => {
+            let dest = codegen_md_place(fx, place);
+            crate::codegen_set_discriminant(fx, &dest, rac_abi::VariantIdx::from_u32(*variant_index));
+        }
+        Statement::Deinit(_) => {
+            // Deinit is a no-op in our codegen (used by drop elaboration)
+        }
         Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Nop => {}
-        _ => panic!("unsupported statement: {:?}", stmt),
     }
 }
 
@@ -160,37 +450,148 @@ fn codegen_md_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &Terminator
     match term {
         Terminator::Return => {
             let ret_place = fx.local_place_idx(0).clone();
-            if ret_place.layout.is_zst() {
-                fx.bcx.ins().return_(&[]);
-            } else {
-                let cval = ret_place.to_cvalue(fx);
-                match ret_place.layout.backend_repr {
-                    BackendRepr::Scalar(_) => {
-                        let val = cval.load_scalar(fx);
-                        fx.bcx.ins().return_(&[val]);
-                    }
-                    BackendRepr::ScalarPair(_, _) => {
-                        let (a, b) = cval.load_scalar_pair(fx);
-                        fx.bcx.ins().return_(&[a, b]);
-                    }
-                    _ => panic!("unsupported return value repr"),
-                }
-            }
+            crate::codegen_return(fx, &ret_place);
         }
         Terminator::Goto(target) => {
             let block = fx.clif_block_idx(*target as usize);
             fx.bcx.ins().jump(block, &[]);
         }
+        Terminator::SwitchInt { discr, targets } => {
+            let discr_layout = match discr {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    fx.local_place_idx(p.local as usize).layout.clone()
+                }
+                Operand::Constant(_) => panic!("SwitchInt on constant"),
+            };
+            let discr_val = codegen_md_operand(fx, discr, &discr_layout).load_scalar(fx);
+            let otherwise_idx = *targets.targets.last().unwrap() as usize;
+            let otherwise = fx.clif_block_idx(otherwise_idx);
+            let mut switch = Switch::new();
+            for (val, target) in targets.values.iter().zip(targets.targets.iter()) {
+                switch.set_entry(*val as u128, fx.clif_block_idx(*target as usize));
+            }
+            switch.emit(&mut fx.bcx, discr_val, otherwise);
+        }
+        Terminator::Call { func, args, dest, target, unwind: _ } => {
+            // Resolve callee FuncId from fn_registry
+            let func_id = match func {
+                Operand::Constant(c) => {
+                    let ra_mir_types::Ty::FnDef(hash, _) = &c.ty else {
+                        panic!("non-FnDef call not yet supported in mirdata");
+                    };
+                    let MirSource::Mirdata { fn_registry, .. } = &fx.mir else {
+                        unreachable!()
+                    };
+                    *fn_registry.get(hash).expect("called function not found in fn_registry")
+                }
+                _ => panic!("indirect calls not yet supported in mirdata"),
+            };
+
+            let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
+
+            // Build call arguments (scalar-only for now)
+            let mut call_args = Vec::new();
+            for arg in args {
+                let arg_layout = match arg {
+                    Operand::Copy(p) | Operand::Move(p) => {
+                        fx.local_place_idx(p.local as usize).layout.clone()
+                    }
+                    Operand::Constant(_) => {
+                        // For constant args in calls, we need the callee's param layout.
+                        // For now, require using locals for call args.
+                        panic!("constant args in call not yet supported; assign to local first");
+                    }
+                };
+                let arg_cval = codegen_md_operand(fx, arg, &arg_layout);
+                match arg_cval.layout.backend_repr {
+                    BackendRepr::Scalar(_) => call_args.push(arg_cval.load_scalar(fx)),
+                    BackendRepr::ScalarPair(_, _) => {
+                        let (a, b) = arg_cval.load_scalar_pair(fx);
+                        call_args.push(a);
+                        call_args.push(b);
+                    }
+                    _ if arg_cval.layout.is_zst() => {}
+                    _ => panic!("memory-repr call args not yet supported in mirdata"),
+                }
+            }
+
+            let call = fx.bcx.ins().call(func_ref, &call_args);
+
+            // Store return value
+            let dest_place = codegen_md_place(fx, dest);
+            if !dest_place.layout.is_zst() {
+                let results = fx.bcx.inst_results(call).to_vec();
+                match dest_place.layout.backend_repr {
+                    BackendRepr::Scalar(_) => {
+                        let cval = CValue::by_val(results[0], dest_place.layout.clone());
+                        dest_place.write_cvalue(fx, cval);
+                    }
+                    BackendRepr::ScalarPair(_, _) => {
+                        let cval =
+                            CValue::by_val_pair(results[0], results[1], dest_place.layout.clone());
+                        dest_place.write_cvalue(fx, cval);
+                    }
+                    _ => panic!("non-scalar return not yet supported in mirdata call"),
+                }
+            }
+
+            // Continue to target block
+            if let Some(target) = target {
+                let block = fx.clif_block_idx(*target as usize);
+                fx.bcx.ins().jump(block, &[]);
+            }
+        }
         Terminator::Unreachable => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
         }
-        _ => panic!("unsupported terminator: {:?}", term),
+        Terminator::Drop { place: _, target, unwind: _ } => {
+            // Drop is a no-op for now (we don't have drop glue).
+            // Just jump to the target block.
+            let block = fx.clif_block_idx(*target as usize);
+            fx.bcx.ins().jump(block, &[]);
+        }
+        Terminator::Assert { cond, expected, target, unwind: _ } => {
+            let cond_layout = match cond {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    fx.local_place_idx(p.local as usize).layout.clone()
+                }
+                Operand::Constant(_) => panic!("Assert on constant"),
+            };
+            let cond_val = codegen_md_operand(fx, cond, &cond_layout).load_scalar(fx);
+            let target_block = fx.clif_block_idx(*target as usize);
+            let trap_block = fx.bcx.create_block();
+            if *expected {
+                fx.bcx.ins().brif(cond_val, target_block, &[], trap_block, &[]);
+            } else {
+                fx.bcx.ins().brif(cond_val, trap_block, &[], target_block, &[]);
+            }
+            fx.bcx.switch_to_block(trap_block);
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+        }
+        Terminator::UnwindResume => {
+            // In our JIT context, unwind resume is just a trap
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
+
+/// Build a `Ty → LayoutArc` lookup map from the layout table entries and
+/// their converted layouts. Used for field/pointee layout resolution in
+/// place projections.
+pub fn build_ty_layout_map(
+    layout_entries: &[ra_mir_types::TypeLayoutEntry],
+    layouts: &[LayoutArc],
+) -> HashMap<ra_mir_types::Ty, LayoutArc> {
+    layout_entries
+        .iter()
+        .zip(layouts.iter())
+        .map(|(entry, layout)| (entry.ty.clone(), layout.clone()))
+        .collect()
+}
 
 pub fn compile_mirdata_fn(
     module: &mut impl Module,
@@ -200,6 +601,8 @@ pub fn compile_mirdata_fn(
     layouts: &[LayoutArc],
     fn_name: &str,
     linkage: Linkage,
+    fn_registry: &HashMap<(u64, u64), FuncId>,
+    ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
 ) -> Result<FuncId, String> {
     let body = &fn_body.body;
     let pointer_type = pointer_ty(dl);
@@ -247,7 +650,15 @@ pub fn compile_mirdata_fn(
                     CPlace::for_ptr(Pointer::dangling(layout.align.abi), layout)
                 }
                 _ => {
-                    return Err("memory-repr locals not yet supported in mirdata codegen".into());
+                    // Memory-repr: allocate a stack slot
+                    let size = u32::try_from(layout.size.bytes()).expect("stack slot too large");
+                    let align_shift = layout.align.abi.bytes().trailing_zeros() as u8;
+                    let slot = bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        size,
+                        align_shift,
+                    ));
+                    CPlace::for_ptr(Pointer::stack_slot(slot), layout)
                 }
             };
             local_map.push(place);
@@ -256,6 +667,18 @@ pub fn compile_mirdata_fn(
         // Wire parameters to locals
         let block_params: Vec<Value> = bcx.block_params(entry_block).to_vec();
         let mut param_idx = 0;
+
+        // If return type is memory-repr (sret), first param is the sret pointer.
+        // Override the return local (index 0) to point at the caller-provided sret.
+        let ret_layout = &local_map[0].layout;
+        let ret_is_sret = !ret_layout.is_zst()
+            && matches!(ret_layout.backend_repr, BackendRepr::Memory { .. });
+        if ret_is_sret {
+            let sret_ptr = block_params[param_idx];
+            local_map[0] = CPlace::for_ptr(Pointer::new(sret_ptr), local_map[0].layout.clone());
+            param_idx += 1;
+        }
+
         for i in 1..=body.arg_count as usize {
             let place = &local_map[i];
             if place.layout.is_zst() {
@@ -271,7 +694,16 @@ pub fn compile_mirdata_fn(
                     place.def_var(1, block_params[param_idx + 1], &mut bcx);
                     param_idx += 2;
                 }
-                _ => return Err("memory-repr params not yet supported".into()),
+                _ => {
+                    // Memory-repr: param is an incoming pointer. Create a CPlace
+                    // pointing at the caller-provided memory.
+                    let incoming_ptr = block_params[param_idx];
+                    local_map[i] = CPlace::for_ptr(
+                        Pointer::new(incoming_ptr),
+                        place.layout.clone(),
+                    );
+                    param_idx += 1;
+                }
             }
         }
 
@@ -281,7 +713,7 @@ pub fn compile_mirdata_fn(
             isa,
             pointer_type,
             dl,
-            mir: MirSource::Mirdata { body, layouts },
+            mir: MirSource::Mirdata { body, layouts, fn_registry, ty_layouts },
             block_map,
             local_map,
         };
@@ -344,7 +776,9 @@ mod tests {
         layout_entries: &[TypeLayoutEntry],
     ) -> R {
         let layouts = convert_mirdata_layouts(layout_entries);
+        let ty_layouts = build_ty_layout_map(layout_entries, &layouts);
         let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
 
         let func_id = compile_mirdata_fn(
             &mut module,
@@ -354,6 +788,8 @@ mod tests {
             &layouts,
             &fn_body.name,
             Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
         )
         .expect("compile_mirdata_fn failed");
 
@@ -553,6 +989,7 @@ mod tests {
     fn mirdata_with_args() {
         let layout_entries = vec![i32_layout_entry()];
         let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
         let fn_body = FnBody {
             def_path_hash: (0, 0),
             name: "identity".to_string(),
@@ -576,6 +1013,7 @@ mod tests {
         };
 
         let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
         let func_id = compile_mirdata_fn(
             &mut module,
             &*isa,
@@ -584,6 +1022,8 @@ mod tests {
             &layouts,
             "identity",
             Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
         )
         .expect("compile_mirdata_fn failed");
 
@@ -593,6 +1033,670 @@ mod tests {
             let f: fn(i32, i32) -> i32 = std::mem::transmute(code);
             assert_eq!(f(7, 13), 7);
             assert_eq!(f(100, 200), 100);
+        }
+    }
+
+    // -- fn add(a: i32, b: i32) -> i32 { a + b } ----------------------------
+
+    #[test]
+    fn mirdata_binop_add() {
+        let layout_entries = vec![i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "add".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: a
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _2: b
+                ],
+                arg_count: 2,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Operand::Copy(Place { local: 2, projections: vec![] }),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &fn_body,
+            &layouts,
+            "add",
+            Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
+        )
+        .expect("compile_mirdata_fn failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32, i32) -> i32 = std::mem::transmute(code);
+            assert_eq!(f(3, 4), 7);
+            assert_eq!(f(-10, 25), 15);
+            assert_eq!(f(i32::MAX, 1), i32::MIN); // wrapping
+        }
+    }
+
+    // -- fn max(a: i32, b: i32) -> i32 { if a >= b { a } else { b } } -------
+
+    #[test]
+    fn mirdata_switchint_max() {
+        let layout_entries = vec![i32_layout_entry(), bool_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+        // MIR:
+        //   _3: bool = Ge(Copy(_1), Copy(_2))
+        //   switchInt(_3) -> [0: bb2, otherwise: bb1]
+        // bb1: _0 = Copy(_1); return
+        // bb2: _0 = Copy(_2); return
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "max".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: a
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _2: b
+                    Local { ty: Ty::Bool, layout: Some(1) },            // _3: cmp
+                ],
+                arg_count: 2,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 3, projections: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Ge,
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                            ),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place { local: 3, projections: vec![] }),
+                            targets: SwitchTargets {
+                                values: vec![0],      // 0 = false → bb2
+                                targets: vec![2, 1],  // otherwise (true) → bb1
+                            },
+                        },
+                        is_cleanup: false,
+                    },
+                    // bb1: a >= b, return a
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place { local: 1, projections: vec![] })),
+                        )],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                    // bb2: a < b, return b
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place { local: 2, projections: vec![] })),
+                        )],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &fn_body,
+            &layouts,
+            "max",
+            Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
+        )
+        .expect("compile_mirdata_fn failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32, i32) -> i32 = std::mem::transmute(code);
+            assert_eq!(f(10, 5), 10);
+            assert_eq!(f(3, 7), 7);
+            assert_eq!(f(4, 4), 4);
+            assert_eq!(f(-1, -5), -1);
+        }
+    }
+
+    // -- call between mirdata functions: double(x) = x + x, caller calls it --
+
+    #[test]
+    fn mirdata_call_between_fns() {
+        let layout_entries = vec![i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        // Callee: fn double(x: i32) -> i32 { x + x }
+        let callee_hash: (u64, u64) = (1, 1);
+        let callee = FnBody {
+            def_path_hash: callee_hash,
+            name: "double".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: x
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        // Caller: fn test_fn() -> i32 { double(21) }
+        // MIR:
+        //   _1 = const 21
+        //   _0 = call double(Copy(_1)) -> bb1
+        // bb1: return
+        let caller = FnBody {
+            def_path_hash: (2, 2),
+            name: "test_fn".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: arg for double
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: Ty::Int(IntTy::I32),
+                                kind: ConstKind::Scalar(21, 4),
+                            })),
+                        )],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef(callee_hash, vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![Operand::Copy(Place { local: 1, projections: vec![] })],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+
+        // Compile callee first
+        let empty_reg = HashMap::new();
+        let callee_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &callee,
+            &layouts,
+            "double",
+            Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
+        )
+        .expect("compile callee failed");
+
+        // Compile caller with fn_registry pointing to callee
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(callee_hash, callee_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &caller,
+            &layouts,
+            "test_fn",
+            Linkage::Export,
+            &fn_registry,
+            &ty_layouts,
+        )
+        .expect("compile caller failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 42); // double(21) = 21 + 21 = 42
+        }
+    }
+
+    // -- call a native extern "C" function registered as JIT symbol ----------
+
+    #[test]
+    fn mirdata_call_native() {
+        let layout_entries = vec![i32_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+
+        // Native function that will be registered as a JIT symbol
+        extern "C" fn native_mul(a: i32, b: i32) -> i32 {
+            a * b
+        }
+
+        // Build JIT module with native symbol registered
+        let isa = crate::build_host_isa(false);
+        let dl = TargetDataLayout::parse_from_llvm_datalayout_string(
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+            AddressSpace(0),
+        )
+        .map_err(|_| "failed to parse data layout")
+        .unwrap();
+        let mut builder =
+            JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        builder.symbol("native_mul", native_mul as *const u8);
+        let mut module = JITModule::new(builder);
+
+        // Declare native_mul as an import so the call codegen can reference it
+        let native_hash: (u64, u64) = (99, 99);
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32));
+        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32));
+        sig.returns.push(AbiParam::new(cranelift_codegen::ir::types::I32));
+        let native_func_id = module
+            .declare_function("native_mul", Linkage::Import, &sig)
+            .expect("declare native_mul");
+
+        // Mirdata body: fn test() -> i32 { native_mul(6, 7) }
+        // MIR:
+        //   _1 = const 6
+        //   _2 = const 7
+        //   _0 = call native_mul(Copy(_1), Copy(_2)) -> bb1
+        // bb1: return
+        let caller = FnBody {
+            def_path_hash: (0, 0),
+            name: "test_native".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _2
+                ],
+                arg_count: 0,
+                blocks: vec![
+                    BasicBlock {
+                        stmts: vec![
+                            Statement::Assign(
+                                Place { local: 1, projections: vec![] },
+                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(6, 4),
+                                })),
+                            ),
+                            Statement::Assign(
+                                Place { local: 2, projections: vec![] },
+                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                    ty: Ty::Int(IntTy::I32),
+                                    kind: ConstKind::Scalar(7, 4),
+                                })),
+                            ),
+                        ],
+                        terminator: Terminator::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: Ty::FnDef(native_hash, vec![]),
+                                kind: ConstKind::ZeroSized,
+                            }),
+                            args: vec![
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                            ],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(1),
+                            unwind: UnwindAction::Terminate,
+                        },
+                        is_cleanup: false,
+                    },
+                    BasicBlock {
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                        is_cleanup: false,
+                    },
+                ],
+            },
+        };
+
+        let mut fn_registry = HashMap::new();
+        fn_registry.insert(native_hash, native_func_id);
+        let caller_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &caller,
+            &layouts,
+            "test_native",
+            Linkage::Export,
+            &fn_registry,
+            &ty_layouts,
+        )
+        .expect("compile caller failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(caller_id);
+        unsafe {
+            let f: fn() -> i32 = std::mem::transmute(code);
+            assert_eq!(f(), 42); // native_mul(6, 7) = 42
+        }
+    }
+
+    // -- fn cast_i32_to_i64(x: i32) -> i64 { x as i64 } ---------------------
+
+    fn i64_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::Int(IntTy::I64),
+            layout: LayoutInfo {
+                size: 8,
+                align: 8,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Int { size_bytes: 8, signed: true },
+                    valid_range_start: 0,
+                    valid_range_end: u64::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    fn u64_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::Uint(UintTy::U64),
+            layout: LayoutInfo {
+                size: 8,
+                align: 8,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Int { size_bytes: 8, signed: false },
+                    valid_range_start: 0,
+                    valid_range_end: u64::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    fn usize_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::Uint(UintTy::Usize),
+            layout: LayoutInfo {
+                size: 8,
+                align: 8,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Pointer,
+                    valid_range_start: 0,
+                    valid_range_end: u64::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    /// Layout for a struct { i32, i32 } — two fields at offsets 0 and 4.
+    fn pair_i32_layout_entry() -> TypeLayoutEntry {
+        let adt_ty = Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]);
+        TypeLayoutEntry {
+            ty: adt_ty,
+            layout: LayoutInfo {
+                size: 8,
+                align: 4,
+                backend_repr: ExportedBackendRepr::ScalarPair(
+                    ExportedScalar {
+                        primitive: ExportedPrimitive::Int { size_bytes: 4, signed: true },
+                        valid_range_start: 0,
+                        valid_range_end: u32::MAX as u128,
+                    },
+                    ExportedScalar {
+                        primitive: ExportedPrimitive::Int { size_bytes: 4, signed: true },
+                        valid_range_start: 0,
+                        valid_range_end: u32::MAX as u128,
+                    },
+                ),
+                fields: ExportedFieldsShape::Arbitrary { offsets: vec![0, 4] },
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    /// Layout for *const i32 (thin pointer, scalar)
+    fn ptr_i32_layout_entry() -> TypeLayoutEntry {
+        TypeLayoutEntry {
+            ty: Ty::RawPtr(Mutability::Not, Box::new(Ty::Int(IntTy::I32))),
+            layout: LayoutInfo {
+                size: 8,
+                align: 8,
+                backend_repr: ExportedBackendRepr::Scalar(ExportedScalar {
+                    primitive: ExportedPrimitive::Pointer,
+                    valid_range_start: 0,
+                    valid_range_end: u64::MAX as u128,
+                }),
+                fields: ExportedFieldsShape::Primitive,
+                variants: ExportedVariants::Single { index: 0 },
+                largest_niche: None,
+            },
+        }
+    }
+
+    // -- struct field access: (i32, i32).1 ----------------------------------
+
+    #[test]
+    fn mirdata_tuple_field_access() {
+        // fn foo() -> i32 {
+        //   let pair: (i32, i32) = (10, 20);
+        //   pair.1
+        // }
+        // MIR:
+        //   _1: (i32, i32) = Aggregate(Tuple, [const 10, const 20])
+        //   _0: i32 = Use(Copy(_1.1))
+        let pair_ty = Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]);
+        let layout_entries = vec![i32_layout_entry(), pair_i32_layout_entry()];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "tuple_field".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: pair_ty.clone(), layout: Some(1) },       // _1: pair
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Aggregate(
+                                ra_mir_types::AggregateKind::Tuple,
+                                vec![
+                                    Operand::Constant(ConstOperand {
+                                        ty: Ty::Int(IntTy::I32),
+                                        kind: ConstKind::Scalar(10, 4),
+                                    }),
+                                    Operand::Constant(ConstOperand {
+                                        ty: Ty::Int(IntTy::I32),
+                                        kind: ConstKind::Scalar(20, 4),
+                                    }),
+                                ],
+                            ),
+                        ),
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![Projection::Field(1, Ty::Int(IntTy::I32))],
+                            })),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let result: i32 = mirdata_jit_run(&fn_body, &layout_entries);
+        assert_eq!(result, 20);
+    }
+
+    // -- ref and deref: &x then *ref ----------------------------------------
+
+    #[test]
+    fn mirdata_ref_deref() {
+        // fn foo() -> i32 {
+        //   let x: i32 = 42;
+        //   let r: *const i32 = &raw const x;
+        //   *r
+        // }
+        // MIR:
+        //   _1: i32 = const 42
+        //   _2: *const i32 = RawPtr(Not, _1)
+        //   _0: i32 = Use(Copy(*_2))
+        let layout_entries = vec![i32_layout_entry(), ptr_i32_layout_entry()];
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "ref_deref".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _0: return
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) },  // _1: x
+                    Local { ty: Ty::RawPtr(Mutability::Not, Box::new(Ty::Int(IntTy::I32))), layout: Some(1) }, // _2: ptr
+                ],
+                arg_count: 0,
+                blocks: vec![BasicBlock {
+                    stmts: vec![
+                        Statement::Assign(
+                            Place { local: 1, projections: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: Ty::Int(IntTy::I32),
+                                kind: ConstKind::Scalar(42, 4),
+                            })),
+                        ),
+                        Statement::Assign(
+                            Place { local: 2, projections: vec![] },
+                            Rvalue::RawPtr(Mutability::Not, Place { local: 1, projections: vec![] }),
+                        ),
+                        Statement::Assign(
+                            Place { local: 0, projections: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 2,
+                                projections: vec![Projection::Deref],
+                            })),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let result: i32 = mirdata_jit_run(&fn_body, &layout_entries);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn mirdata_cast_i32_to_i64() {
+        let layout_entries = vec![i32_layout_entry(), i64_layout_entry()];
+        let layouts = convert_mirdata_layouts(&layout_entries);
+        let ty_layouts = build_ty_layout_map(&layout_entries, &layouts);
+        // fn cast(x: i32) -> i64 { x as i64 }
+        // MIR:
+        //   _0 = Cast(IntToInt, Copy(_1), i64)
+        let fn_body = FnBody {
+            def_path_hash: (0, 0),
+            name: "cast_i32_i64".to_string(),
+            num_generic_params: 0,
+            body: Body {
+                locals: vec![
+                    Local { ty: Ty::Int(IntTy::I64), layout: Some(1) }, // _0: return i64
+                    Local { ty: Ty::Int(IntTy::I32), layout: Some(0) }, // _1: x i32
+                ],
+                arg_count: 1,
+                blocks: vec![BasicBlock {
+                    stmts: vec![Statement::Assign(
+                        Place { local: 0, projections: vec![] },
+                        Rvalue::Cast(
+                            CastKind::IntToInt,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                            Ty::Int(IntTy::I64),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                    is_cleanup: false,
+                }],
+            },
+        };
+
+        let (mut module, isa, dl) = make_jit_module();
+        let empty_reg = HashMap::new();
+        let func_id = compile_mirdata_fn(
+            &mut module,
+            &*isa,
+            &dl,
+            &fn_body,
+            &layouts,
+            "cast_i32_i64",
+            Linkage::Export,
+            &empty_reg,
+            &ty_layouts,
+        )
+        .expect("compile_mirdata_fn failed");
+
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(func_id);
+        unsafe {
+            let f: fn(i32) -> i64 = std::mem::transmute(code);
+            assert_eq!(f(42), 42i64);
+            assert_eq!(f(-1), -1i64); // sign extension
+            assert_eq!(f(i32::MAX), i32::MAX as i64);
+            assert_eq!(f(i32::MIN), i32::MIN as i64);
         }
     }
 }

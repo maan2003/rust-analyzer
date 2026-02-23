@@ -474,6 +474,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 let u = match u {
                     UnOp::Not => "!",
                     UnOp::Neg => "-",
+                    UnOp::PtrMetadata => "PtrMetadata",
                 };
                 w!(self, "{u} ");
                 self.operand(o);
