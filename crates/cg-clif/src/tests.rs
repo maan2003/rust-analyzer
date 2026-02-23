@@ -1523,6 +1523,147 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Fn pointer / indirect call tests (M11e)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_fn_pointer_call() {
+    let result: i32 = jit_run(
+        r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+fn foo() -> i32 {
+    let f: fn(i32, i32) -> i32 = add;
+    f(3, 4)
+}
+"#,
+        &["add", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn jit_fn_pointer_higher_order() {
+    let result: i32 = jit_run(
+        r#"
+fn double(x: i32) -> i32 {
+    x * 2
+}
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+fn foo() -> i32 {
+    apply(double, 21)
+}
+"#,
+        &["double", "apply", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+/// Helper: JIT-compile using automatic reachable function discovery (including closures).
+///
+/// Unlike `jit_run`, this doesn't require listing function names explicitly.
+/// It uses `collect_reachable_fns` to discover all reachable functions and
+/// closures from the entry function.
+fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
+    let full_src = fixture_src(src);
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let isa = crate::build_host_isa(false);
+        let empty_map = std::collections::HashMap::new();
+
+        let mut jit_builder =
+            cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        jit_builder.symbol("fmodf", fmodf as *const u8);
+        jit_builder.symbol("fmod", fmod as *const u8);
+        let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
+
+        let entry_func_id = find_fn(&db, file_id, entry);
+        let local_crate = entry_func_id.krate(&db);
+        let env = hir_ty::ParamEnvAndCrate {
+            param_env: db.trait_environment(entry_func_id.into()),
+            krate: local_crate,
+        }
+        .store();
+
+        // Discover all reachable functions and closures
+        let (reachable_fns, reachable_closures) =
+            crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
+
+        // Compile all reachable functions
+        let dl = get_target_data_layout(&db, entry_func_id);
+        for (func_id, generic_args) in &reachable_fns {
+            let fn_name = crate::symbol_mangling::mangle_function(
+                &db, *func_id, generic_args.as_ref(), &empty_map,
+            );
+            let body = db
+                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                .unwrap_or_else(|e| panic!("MIR error for {fn_name}: {:?}", e));
+            crate::compile_fn(
+                &mut jit_module, &*isa, &db, &dl, &env, &body, &fn_name,
+                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+            )
+            .unwrap_or_else(|e| panic!("compiling fn failed: {e}"));
+        }
+
+        // Compile all reachable closures
+        for (closure_id, closure_subst) in &reachable_closures {
+            let body = db
+                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
+                .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
+            let closure_name = crate::symbol_mangling::mangle_closure(&db, *closure_id, &empty_map);
+            crate::compile_fn(
+                &mut jit_module, &*isa, &db, &dl, &env, &body, &closure_name,
+                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+            )
+            .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
+        }
+
+        // Finalize: make all compiled code executable
+        jit_module.finalize_definitions().unwrap();
+
+        // Look up the entry function pointer
+        let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
+        let entry_mangled = mangled_name(&db, entry_func_id);
+
+        let entry_id = jit_module
+            .declare_function(&entry_mangled, cranelift_module::Linkage::Import, &sig)
+            .expect("declare entry");
+        let code_ptr = jit_module.get_finalized_function(entry_id);
+
+        unsafe {
+            let f: extern "C" fn() -> R = std::mem::transmute(code_ptr);
+            f()
+        }
+    })
+}
+
+#[test]
+fn jit_closure_basic() {
+    let result: i32 = jit_run_reachable(
+        r#"
+//- minicore: fn
+//- /main.rs
+fn apply(f: impl Fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+fn foo() -> i32 {
+    let offset = 10;
+    apply(|x| x + offset, 32)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+// ---------------------------------------------------------------------------
 // Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
 // ---------------------------------------------------------------------------
 

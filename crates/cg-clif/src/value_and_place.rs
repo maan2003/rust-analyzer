@@ -427,8 +427,15 @@ impl CPlace {
                 let addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
                 CValue::by_val_pair(addr, extra, ref_layout)
             }
-            _ => {
-                let addr = self.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+            CPlaceInner::Addr(ptr, None) => {
+                let addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+                CValue::by_val(addr, ref_layout)
+            }
+            CPlaceInner::Var(_) | CPlaceInner::VarPair(_, _) => {
+                // Register-stored value: spill to stack so we can take its address.
+                let cval = self.to_cvalue(fx);
+                let ptr = cval.force_stack(fx);
+                let addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
                 CValue::by_val(addr, ref_layout)
             }
         }

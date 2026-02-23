@@ -71,6 +71,32 @@ pub fn mangle_function(
     m.out
 }
 
+/// Produce a symbol name for a closure.
+///
+/// Uses a simple scheme: `_Rclosure_{owner_crate}_{closure_id}` since closures
+/// don't have a proper DefPath in r-a. The InternedClosureId is used as a
+/// unique identifier within the crate.
+pub fn mangle_closure(
+    db: &dyn HirDatabase,
+    closure_id: hir_ty::db::InternedClosureId,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> String {
+    let def = db.lookup_intern_closure(closure_id);
+    let owner = def.0;
+    let krate = owner.module(db).krate(db);
+    let file_dis = krate.data(db).root_file_id.index() as u64;
+    let extra = krate.extra_data(db);
+    let crate_name = extra.display_name.as_ref()
+        .map(|dn| dn.crate_name().to_string())
+        .unwrap_or_else(|| format!("crate{}", file_dis));
+    let disamb = ext_crate_disambiguators
+        .get(&crate_name)
+        .copied()
+        .unwrap_or(file_dis);
+    // Use a simple unique name: crate + disambiguator + closure intern id
+    format!("_Rclosure_{}_{:x}_{:?}", crate_name, disamb, closure_id)
+}
+
 // ---------------------------------------------------------------------------
 // SymbolMangler
 // ---------------------------------------------------------------------------
