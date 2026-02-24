@@ -119,8 +119,7 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
                 if local_decl.ty.has_param() {
                     continue;
                 }
-                let normalized = tcx
-                    .try_normalize_erasing_regions(typing_env, local_decl.ty)
+                let normalized = tcx.try_normalize_erasing_regions(typing_env, local_decl.ty)
                     .unwrap_or(local_decl.ty);
                 export_type_layout_recursive(tcx, normalized, &mut layout_table, &mut visited_types);
             }
@@ -355,9 +354,12 @@ fn collect_mono_layouts<'tcx>(
                         for local_decl in callee_body.local_decls.iter() {
                             let mono_ty = ty::EarlyBinder::bind(local_decl.ty)
                                 .instantiate(tcx, substs);
-                            let normalized = tcx
-                                .try_normalize_erasing_regions(typing_env, mono_ty)
-                                .unwrap_or(mono_ty);
+                            let normalized = if mono_ty.has_param() {
+                                mono_ty
+                            } else {
+                                tcx.try_normalize_erasing_regions(typing_env, mono_ty)
+                                    .unwrap_or(mono_ty)
+                            };
                             export_type_layout_recursive(
                                 tcx,
                                 normalized,
@@ -412,9 +414,12 @@ fn export_type_layout_recursive<'tcx>(
             for variant in adt_def.variants() {
                 for field in &variant.fields {
                     let field_ty = field.ty(tcx, args);
-                    let normalized = tcx
-                        .try_normalize_erasing_regions(typing_env, field_ty)
-                        .unwrap_or(field_ty);
+                    let normalized = if field_ty.has_param() {
+                        field_ty
+                    } else {
+                        tcx.try_normalize_erasing_regions(typing_env, field_ty)
+                            .unwrap_or(field_ty)
+                    };
                     export_type_layout_recursive(tcx, normalized, layout_table, visited);
                 }
             }
