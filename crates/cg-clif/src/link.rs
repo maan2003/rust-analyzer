@@ -125,7 +125,8 @@ pub fn load_mirdata_layouts(mirdata_path: &Path) -> Result<(MirData, Vec<LayoutA
 
 /// Find the `.mirdata` file path.
 ///
-/// Uses `RA_MIRDATA` environment variable, or looks for `sysroot.mirdata`
+/// Uses `RA_MIRDATA` environment variable, or looks for
+/// `sysroot.mirdata`
 /// next to the sysroot libdir.
 pub fn find_mirdata_path() -> Result<PathBuf, String> {
     // Check environment variable first
