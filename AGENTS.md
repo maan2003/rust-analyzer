@@ -26,4 +26,7 @@ just update-mirdata
 
 # run crates/cg-clif tests
 just test-clif
+
+# run a specific cg-clif test
+just test-clif -E 'test(mirdata_jit_iter_sum)' --no-capture
 ```
