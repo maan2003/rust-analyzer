@@ -1054,7 +1054,7 @@ fn foo() -> i32 {
 /// Uses disambiguators from `.mirdata` if available (via `RA_MIRDATA` env var
 /// or default sysroot location). Falls back to an empty map for tests that
 /// don't make cross-crate calls.
-fn compile_and_run(src: &str, test_name: &str) -> i32 {
+fn compile_and_run_legacy(src: &str, test_name: &str) -> i32 {
     let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
     attach_db(&db, || {
@@ -1067,7 +1067,7 @@ fn compile_and_run(src: &str, test_name: &str) -> i32 {
         std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
         let output_path = tmp_dir.join(test_name);
 
-        // Try to load .mirdata; fall back to empty map for non-cross-crate tests
+        // Try to load .mirdata; fall back to empty map for non-cross-crate tests.
         let disambiguators = crate::link::extract_crate_disambiguators()
             .unwrap_or_default();
         let result = crate::compile_executable(
@@ -1103,13 +1103,13 @@ fn compile_and_run(src: &str, test_name: &str) -> i32 {
 
 #[test]
 fn compile_and_run_empty_main() {
-    let code = compile_and_run("fn main() {}", "empty_main");
+    let code = compile_and_run_legacy("fn main() {}", "empty_main");
     assert_eq!(code, 0);
 }
 
 #[test]
 fn compile_and_run_exit_code() {
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 extern "C" {
     fn exit(code: i32) -> !;
@@ -1125,7 +1125,7 @@ fn main() -> ! {
 
 #[test]
 fn compile_and_run_multi_fn() {
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 extern "C" {
     fn exit(code: i32) -> !;
@@ -1352,7 +1352,7 @@ fn foo() -> i32 {
 
 #[test]
 fn compile_and_run_dyn_dispatch() {
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 //- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
 //- /main.rs
@@ -1380,7 +1380,7 @@ fn main() -> ! {
 
 #[test]
 fn compile_and_run_generics() {
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 extern "C" {
     fn exit(code: i32) -> !;
@@ -1399,7 +1399,7 @@ fn main() -> ! {
 
 #[test]
 fn compile_and_run_structs_and_enums() {
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 extern "C" {
     fn exit(code: i32) -> !;
@@ -1425,7 +1425,7 @@ fn main() -> ! {
 fn compile_and_run_heap_alloc() {
     // Manual heap allocation using the real allocator shims (__rust_alloc/dealloc).
     // This exercises the same allocator path that Vec uses internally.
-    let code = compile_and_run(
+    let code = compile_and_run_legacy(
         r#"
 //- minicore: drop, sized, copy, size_of
 //- /main.rs

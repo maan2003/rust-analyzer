@@ -21,7 +21,6 @@ pub struct MirData {
     pub crates: Vec<CrateInfo>,
     pub bodies: Vec<FnBody>,
     pub layouts: Vec<TypeLayoutEntry>,
-    #[serde(default)]
     pub generic_fn_lookup: Vec<GenericFnLookupEntry>,
 }
 
