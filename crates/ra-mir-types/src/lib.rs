@@ -21,6 +21,8 @@ pub struct MirData {
     pub crates: Vec<CrateInfo>,
     pub bodies: Vec<FnBody>,
     pub layouts: Vec<TypeLayoutEntry>,
+    #[serde(default)]
+    pub generic_fn_lookup: Vec<GenericFnLookupEntry>,
 }
 
 /// Crate name + StableCrateId.
@@ -40,6 +42,47 @@ pub struct FnBody {
     /// Number of generic type params (0 = non-generic)
     pub num_generic_params: usize,
     pub body: Body,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenericFnLookupKey {
+    pub stable_crate_id: u64,
+    pub normalized_path: String,
+    pub num_generic_params: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GenericFnLookupEntry {
+    pub key: GenericFnLookupKey,
+    pub def_path_hash: DefPathHash,
+}
+
+pub fn normalize_def_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut depth = 0u32;
+
+    for ch in path.chars() {
+        match ch {
+            '<' => {
+                if depth == 0 && out.ends_with("::") {
+                    out.pop();
+                    out.pop();
+                }
+                depth += 1;
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth == 0 => {
+                if !ch.is_whitespace() {
+                    out.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

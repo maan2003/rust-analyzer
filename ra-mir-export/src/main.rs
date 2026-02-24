@@ -32,7 +32,10 @@ use rustc_middle::ty::TyCtxt;
 use rustc_middle::{mir, ty};
 use rustc_middle::ty::TypeVisitableExt;
 
-use ra_mir_types::{CrateInfo, FnBody, MirData, TypeLayoutEntry};
+use ra_mir_types::{
+    CrateInfo, FnBody, GenericFnLookupEntry, GenericFnLookupKey, MirData, TypeLayoutEntry,
+    normalize_def_path,
+};
 
 struct ExportCallbacks {
     result: RefCell<Option<MirData>>,
@@ -46,8 +49,8 @@ impl rustc_driver::Callbacks for ExportCallbacks {
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
         let crates = extract_crate_ids(tcx);
-        let (bodies, layouts) = extract_mir_bodies(tcx);
-        let mir_data = MirData { crates, bodies, layouts };
+        let (bodies, layouts, generic_fn_lookup) = extract_mir_bodies(tcx);
+        let mir_data = MirData { crates, bodies, layouts, generic_fn_lookup };
 
         // Write the mirdata file *inside* the callback, before rustc's delayed
         // ICE handler can kill the process.
@@ -88,8 +91,9 @@ fn extract_crate_ids(tcx: TyCtxt<'_>) -> Vec<CrateInfo> {
 // MIR body extraction
 // ---------------------------------------------------------------------------
 
-fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
+fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Vec<GenericFnLookupEntry>) {
     let mut bodies = Vec::new();
+    let mut generic_fn_lookup = Vec::new();
     let mut stats = ExportStats::default();
     let mut visited = HashSet::new();
     let mut layout_table = LayoutTable::new();
@@ -97,7 +101,17 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
 
     for &cnum in tcx.crates(()) {
         let crate_def_id = cnum.as_def_id();
-        visit_module(tcx, crate_def_id, &mut bodies, &mut stats, &mut visited, &mut layout_table, &mut exported_def_ids, 0);
+        visit_module(
+            tcx,
+            crate_def_id,
+            &mut bodies,
+            &mut generic_fn_lookup,
+            &mut stats,
+            &mut visited,
+            &mut layout_table,
+            &mut exported_def_ids,
+            0,
+        );
     }
 
     // Collect layouts for types that appear in monomorphized generic function instances.
@@ -140,7 +154,7 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
     eprintln!("  Layout passes: +{} from local type walk, +{} from mono instances",
         mono_local_layouts, mono_inst_layouts);
 
-    (bodies, layout_table.entries)
+    (bodies, layout_table.entries, generic_fn_lookup)
 }
 
 #[derive(Default)]
@@ -190,6 +204,7 @@ fn visit_module<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
+    generic_fn_lookup: &mut Vec<GenericFnLookupEntry>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
@@ -212,21 +227,67 @@ fn visit_module<'tcx>(
         }
         match tcx.def_kind(child_def_id) {
             DefKind::Mod => {
-                visit_module(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids, depth + 1);
+                visit_module(
+                    tcx,
+                    child_def_id,
+                    out,
+                    generic_fn_lookup,
+                    stats,
+                    visited,
+                    layout_table,
+                    exported_def_ids,
+                    depth + 1,
+                );
             }
             DefKind::Fn | DefKind::AssocFn => {
-                try_export_fn(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
+                try_export_fn(
+                    tcx,
+                    child_def_id,
+                    out,
+                    generic_fn_lookup,
+                    stats,
+                    visited,
+                    layout_table,
+                    exported_def_ids,
+                );
             }
             DefKind::Impl { .. } => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
+                visit_impl_or_trait(
+                    tcx,
+                    child_def_id,
+                    out,
+                    generic_fn_lookup,
+                    stats,
+                    visited,
+                    layout_table,
+                    exported_def_ids,
+                );
             }
             DefKind::Trait => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
+                visit_impl_or_trait(
+                    tcx,
+                    child_def_id,
+                    out,
+                    generic_fn_lookup,
+                    stats,
+                    visited,
+                    layout_table,
+                    exported_def_ids,
+                );
             }
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 // Discover inherent impl methods (e.g. Vec::push, Vec::new)
                 for impl_def_id in tcx.inherent_impls(child_def_id) {
-                    visit_impl_or_trait(tcx, *impl_def_id, out, stats, visited, layout_table, exported_def_ids);
+                    visit_impl_or_trait(
+                        tcx,
+                        *impl_def_id,
+                        out,
+                        generic_fn_lookup,
+                        stats,
+                        visited,
+                        layout_table,
+                        exported_def_ids,
+                    );
                 }
             }
             _ => {}
@@ -238,6 +299,7 @@ fn visit_impl_or_trait<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
+    generic_fn_lookup: &mut Vec<GenericFnLookupEntry>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
@@ -247,7 +309,7 @@ fn visit_impl_or_trait<'tcx>(
         return;
     }
     for &item in tcx.associated_item_def_ids(def_id) {
-        try_export_fn(tcx, item, out, stats, visited, layout_table, exported_def_ids);
+        try_export_fn(tcx, item, out, generic_fn_lookup, stats, visited, layout_table, exported_def_ids);
     }
 }
 
@@ -255,6 +317,7 @@ fn try_export_fn<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     out: &mut Vec<FnBody>,
+    generic_fn_lookup: &mut Vec<GenericFnLookupEntry>,
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
@@ -283,14 +346,27 @@ fn try_export_fn<'tcx>(
         );
         let num_generic_params = tcx.generics_of(def_id).count();
 
-        FnBody {
+        let fn_body = FnBody {
             def_path_hash: hash,
             name,
             num_generic_params,
             body: translated,
-        }
+        };
+        let generic_lookup_entry = if num_generic_params > 0 {
+            Some(GenericFnLookupEntry {
+                key: GenericFnLookupKey {
+                    stable_crate_id: hash.0,
+                    normalized_path: normalize_def_path(&fn_body.name),
+                    num_generic_params,
+                },
+                def_path_hash: hash,
+            })
+        } else {
+            None
+        };
+        (fn_body, generic_lookup_entry)
     })) {
-        Ok(mut fn_body) => {
+        Ok((mut fn_body, generic_lookup_entry)) => {
             // Compute layouts for each local
             let body = tcx.optimized_mir(def_id);
             for (i, decl) in body.local_decls.iter().enumerate() {
@@ -298,6 +374,9 @@ fn try_export_fn<'tcx>(
             }
             stats.translated += 1;
             exported_def_ids.push(def_id);
+            if let Some(entry) = generic_lookup_entry {
+                generic_fn_lookup.push(entry);
+            }
             out.push(fn_body);
         }
         Err(_) => {

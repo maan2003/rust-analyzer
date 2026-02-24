@@ -2694,33 +2694,19 @@ fn impl_self_ty_name(db: &dyn hir_ty::db::HirDatabase, impl_id: hir_def::ImplId)
     }
 }
 
-/// Remove generic argument lists (`::<...>` / `<...>`) from a def path.
-fn strip_generic_args(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut depth = 0u32;
-
-    for ch in path.chars() {
-        match ch {
-            '<' => {
-                if depth == 0 && out.ends_with("::") {
-                    out.pop();
-                    out.pop();
-                }
-                depth += 1;
-            }
-            '>' => {
-                depth = depth.saturating_sub(1);
-            }
-            _ if depth == 0 => {
-                if !ch.is_whitespace() {
-                    out.push(ch);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    out
+fn generic_lookup_key_for_fn(
+    db: &dyn hir_ty::db::HirDatabase,
+    func_id: hir_def::FunctionId,
+    generic_args: &hir_ty::next_solver::StoredGenericArgs,
+    ext_crate_disambiguators: &std::collections::HashMap<String, u64>,
+) -> Option<ra_mir_types::GenericFnLookupKey> {
+    let stable_crate_id = stable_crate_id_for_fn(db, func_id, ext_crate_disambiguators)?;
+    let path = fn_display_path(db, func_id);
+    Some(ra_mir_types::GenericFnLookupKey {
+        stable_crate_id,
+        normalized_path: ra_mir_types::normalize_def_path(&path),
+        num_generic_params: mirdata_args_len(generic_args),
+    })
 }
 
 /// Convert an r-a type to a mirdata GenericArg.
@@ -2793,13 +2779,23 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
     let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
         &mirdata.layouts, &layouts,
     );
-    let mut mirdata_by_name: std::collections::HashMap<String, Vec<&ra_mir_types::FnBody>> =
+    let mut mirdata_by_hash: std::collections::HashMap<ra_mir_types::DefPathHash, &ra_mir_types::FnBody> =
         std::collections::HashMap::new();
     for fb in &mirdata.bodies {
-        mirdata_by_name
-            .entry(strip_generic_args(&fb.name))
-            .or_default()
-            .push(fb);
+        mirdata_by_hash.insert(fb.def_path_hash, fb);
+    }
+    let mut mirdata_generic_lookup: std::collections::HashMap<
+        ra_mir_types::GenericFnLookupKey,
+        Vec<&ra_mir_types::FnBody>,
+    > = std::collections::HashMap::new();
+    for entry in &mirdata.generic_fn_lookup {
+        let fb = mirdata_by_hash.get(&entry.def_path_hash).unwrap_or_else(|| {
+            panic!(
+                "generic_fn_lookup contains missing body hash: {:?}",
+                entry.def_path_hash
+            )
+        });
+        mirdata_generic_lookup.entry(entry.key.clone()).or_default().push(*fb);
     }
 
     // Extract crate disambiguators from mirdata
@@ -2862,51 +2858,32 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
             );
 
-            // Find the mirdata body by display path.
-            let path = fn_display_path(&db, *func_id);
-            let normalized_path = strip_generic_args(&path);
-            let candidates = mirdata_by_name
-                .get(&normalized_path)
-                .unwrap_or_else(|| panic!(
-                    "mirdata body not found for cross-crate generic: {} (normalized: {}, mangled: {})",
-                    path, normalized_path, mangled
-                ));
-
-            let mut candidates = candidates.clone();
-            let expected_stable_crate_id = stable_crate_id_for_fn(
+            let lookup_key = generic_lookup_key_for_fn(
                 &db,
                 *func_id,
+                generic_args,
                 &ext_crate_disambiguators,
-            );
-            if let Some(expected) = expected_stable_crate_id {
-                let by_crate: Vec<_> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|fb| fb.def_path_hash.0 == expected)
-                    .collect();
-                if !by_crate.is_empty() {
-                    candidates = by_crate;
-                }
-            }
-
-            if candidates.len() > 1 {
-                let by_param_count: Vec<_> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|fb| fb.num_generic_params == mirdata_args_len(generic_args))
-                    .collect();
-                if by_param_count.len() == 1 {
-                    candidates = by_param_count;
-                }
-            }
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing stable crate id for cross-crate generic: {}",
+                    fn_display_path(&db, *func_id)
+                )
+            });
+            let candidates = mirdata_generic_lookup
+                .get(&lookup_key)
+                .unwrap_or_else(|| panic!(
+                    "mirdata lookup miss for cross-crate generic: key={:?}, mangled={}",
+                    lookup_key, mangled
+                ));
 
             let fb = match candidates.as_slice() {
                 [fb] => *fb,
                 _ => {
                     let names: Vec<_> = candidates.iter().map(|fb| fb.name.as_str()).collect();
                     panic!(
-                        "ambiguous mirdata body match for cross-crate generic: {} (normalized: {}, candidates: {:?})",
-                        path, normalized_path, names
+                        "ambiguous mirdata lookup for key={:?}, candidates={:?}",
+                        lookup_key, names
                     );
                 }
             };
@@ -2934,7 +2911,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &fn_registry,
                 &ty_layouts,
             )
-            .unwrap_or_else(|e| panic!("compiling mirdata {} failed: {e}", path));
+            .unwrap_or_else(|e| panic!("compiling mirdata {} failed: {e}", fb.name));
         }
 
         // Compile local functions (user code)

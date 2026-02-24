@@ -24,9 +24,15 @@ The old blocker in this file is fixed:
   `alloc::vec::new`.
 - `fn_display_path` now includes impl self-type names when available
   (`alloc::vec::Vec::new`).
-- mirdata name matching now strips generic segments (`::<...>` / `<...>`) before lookup.
-- Candidate selection also filters by expected `StableCrateId` before generic-count matching.
-- Lookup now reports ambiguity explicitly instead of silently picking a wrong body.
+- `ra-mir-export` now emits `MirData.generic_fn_lookup`, an explicit lookup
+  table keyed by:
+  - `stable_crate_id`
+  - normalized definition path (generic segments stripped)
+  - generic type param count
+- `jit_run_with_std` now resolves cross-crate generic bodies through that
+  exported table directly instead of scanning all `mir_data.bodies` and
+  applying fallback filters.
+- Ambiguous/missing lookup keys now fail loudly at lookup time.
 
 This unblocked resolution of `Vec::new`/`Vec::push` bodies and moved failure to
 the next real issue.

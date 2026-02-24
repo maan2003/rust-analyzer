@@ -4397,6 +4397,7 @@ mod tests {
             crates: vec![CrateInfo { name: "test".into(), stable_crate_id: 42 }],
             bodies: vec![],
             layouts: vec![],
+            generic_fn_lookup: vec![],
         };
         let bytes = postcard::to_allocvec(&data).unwrap();
         let data2: MirData = postcard::from_bytes(&bytes).unwrap();
