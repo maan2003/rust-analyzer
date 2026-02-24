@@ -16,3 +16,5 @@ AVOID HACKS, just say it to the user
 
 You are in a "vibe coding" setting, user doesn't review the code, so you have to be very clear when
 you are doing a hack or something that will bite us in future.
+
+This is a new project, backward compatibility is never needed.
