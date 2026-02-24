@@ -1,10 +1,14 @@
+update-mirdata:
+    REPO_ROOT="{{justfile_directory()}}"; \
+    mirdata="$REPO_ROOT/target/sysroot.mirdata"; \
+    mkdir -p "$REPO_ROOT/target"; \
+    cargo run --manifest-path "$REPO_ROOT/ra-mir-export/Cargo.toml" --release -- -o "$mirdata"
+
 test-clif:
-    if [ -n "${RA_MIRDATA:-}" ]; then \
-      mirdata="$RA_MIRDATA"; \
-    else \
-      mirdata_dir="$(mktemp -d)"; \
-      trap 'rm -rf "$mirdata_dir"' EXIT; \
-      mirdata="$mirdata_dir/sysroot.mirdata"; \
+    REPO_ROOT="{{justfile_directory()}}"; \
+    mirdata="$REPO_ROOT/target/sysroot.mirdata"; \
+    if [ ! -f "$mirdata" ]; then \
+      echo "missing $mirdata; run 'just update-mirdata' first"; \
+      exit 1; \
     fi; \
-    cargo run --manifest-path ra-mir-export/Cargo.toml --release -- -o "$mirdata"; \
     RA_MIRDATA="$mirdata" cargo nextest run -p cg-clif --color=never

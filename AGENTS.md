@@ -21,6 +21,9 @@ This is a new project, backward compatibility is never needed.
 
 Common commands:
 ```bash
+# refresh target/sysroot.mirdata used by clif tests
+just update-mirdata
+
 # run crates/cg-clif tests
 just test-clif
 ```
