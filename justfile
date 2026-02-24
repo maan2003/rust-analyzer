@@ -1,3 +1,5 @@
+set positional-arguments := true
+
 update-mirdata:
     REPO_ROOT="{{justfile_directory()}}"; \
     mirdata="$REPO_ROOT/target/sysroot.mirdata"; \
@@ -11,4 +13,4 @@ test-clif *args:
       echo "missing $mirdata; run 'just update-mirdata' first"; \
       exit 1; \
     fi; \
-    RA_MIRDATA="$mirdata" cargo nextest run -p cg-clif --color=never {{args}}
+    RA_MIRDATA="$mirdata" cargo nextest run -p cg-clif --color=never "$@"
