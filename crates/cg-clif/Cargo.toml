@@ -41,3 +41,5 @@ test-fixture.path = "../test-fixture"
 test-utils.path = "../test-utils"
 salsa = { version = "0.25.2", default-features = false, features = ["salsa_unstable"] }
 salsa-macros = "0.25.2"
+cfg.path = "../cfg"
+vfs.path = "../vfs"

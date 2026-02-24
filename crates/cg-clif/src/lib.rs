@@ -497,13 +497,15 @@ fn codegen_cast(
             ItemContainerId::ExternBlockId(_)
         );
         let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
+        let interner = DbInterner::new_no_crate(fx.db());
+        let empty_args = GenericArgs::empty(interner);
         let (callee_sig, callee_name) = if is_extern {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
                 .expect("extern fn sig");
             let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
             (sig, name)
         } else if is_cross_crate {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
+            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
                 .expect("cross-crate fn sig");
             let name = symbol_mangling::mangle_function(
                 fx.db(), callee_func_id, generic_args, fx.ext_crate_disambiguators(),
@@ -2484,16 +2486,18 @@ fn codegen_direct_call(
     );
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
 
+    let interner = DbInterner::new_no_crate(fx.db());
+    let empty_args = GenericArgs::empty(interner);
     let (callee_sig, callee_name) = if is_extern {
         // Extern functions: build signature from type info, use raw symbol name
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
             .expect("extern fn sig");
         let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
         (sig, name)
     } else if is_cross_crate {
         // Cross-crate Rust functions: build signature from type info,
         // use v0 mangled name with real disambiguator from rlib
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id)
+        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
             .expect("cross-crate fn sig");
         let name = symbol_mangling::mangle_function(
             fx.db(),
@@ -3153,20 +3157,30 @@ pub fn build_fn_sig(
 }
 
 /// Build a Cranelift signature from a function's type information (via `callable_item_signature`)
-/// instead of from a MIR body. Needed for extern functions where we don't have MIR.
+/// instead of from a MIR body. Needed for extern and cross-crate functions where we don't have MIR.
+///
+/// For generic cross-crate functions, pass the concrete generic args to substitute
+/// type parameters. For non-generic functions, pass empty args.
 fn build_fn_sig_from_ty(
     isa: &dyn TargetIsa,
     db: &dyn HirDatabase,
     dl: &TargetDataLayout,
     env: &StoredParamEnvAndCrate,
     func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
 
-    let fn_sig = db
-        .callable_item_signature(func_id.into())
-        .skip_binder()
-        .skip_binder();
+    let interner = DbInterner::new_no_crate(db);
+    let fn_sig = if generic_args.is_empty() {
+        db.callable_item_signature(func_id.into())
+            .skip_binder()
+            .skip_binder()
+    } else {
+        db.callable_item_signature(func_id.into())
+            .instantiate(interner, generic_args)
+            .skip_binder()
+    };
 
     // Return type — skip if `!` (never) or ZST
     let output = *fn_sig.inputs_and_output.as_slice().split_last().unwrap().0;
@@ -3791,10 +3805,12 @@ fn compile_drop_in_place(
 /// Collect all non-extern, non-intrinsic, local monomorphized function instances
 /// reachable from `root` by walking MIR call terminators. Returns them in BFS
 /// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
-/// representing a specific monomorphization. Cross-crate functions are skipped.
+/// representing a specific monomorphization.
 ///
-/// Also returns any closures discovered via `AggregateKind::Closure` in statements,
-/// and types that need `drop_in_place` glue functions.
+/// Also returns:
+/// - closures discovered via `AggregateKind::Closure` in statements
+/// - types that need `drop_in_place` glue functions
+/// - cross-crate callees (functions from other crates discovered during scanning)
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
@@ -3804,6 +3820,7 @@ fn collect_reachable_fns(
     Vec<(hir_def::FunctionId, StoredGenericArgs)>,
     Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     Vec<StoredTy>,
+    Vec<(hir_def::FunctionId, StoredGenericArgs)>,
 ) {
     use std::collections::{HashSet, VecDeque};
 
@@ -3819,6 +3836,7 @@ fn collect_reachable_fns(
     let mut closure_result = Vec::new();
 
     let mut drop_types = HashSet::new();
+    let mut cross_crate_fns = Vec::new();
 
     queue.push_back((root, empty_args));
 
@@ -3837,8 +3855,9 @@ fn collect_reachable_fns(
             continue;
         }
 
-        // Skip cross-crate functions (already compiled in rlibs)
+        // Record cross-crate functions (compiled from rlibs/mirdata, not local MIR)
         if func_id.krate(db) != local_crate {
+            cross_crate_fns.push((func_id, generic_args));
             continue;
         }
 
@@ -3895,6 +3914,7 @@ fn collect_reachable_fns(
                 continue;
             }
             if func_id.krate(db) != local_crate {
+                cross_crate_fns.push((func_id, generic_args));
                 continue;
             }
             if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
@@ -3915,7 +3935,7 @@ fn collect_reachable_fns(
         }
     }
 
-    (result, closure_result, drop_types.into_iter().collect())
+    (result, closure_result, drop_types.into_iter().collect(), cross_crate_fns)
 }
 
 /// Transitively collect all types needing `drop_in_place` glue and their
@@ -4104,7 +4124,7 @@ pub fn compile_executable(
     let mut module = ObjectModule::new(builder);
 
     // Discover and compile all reachable local monomorphized function instances
-    let (reachable_fns, reachable_closures, drop_types) =
+    let (reachable_fns, reachable_closures, drop_types, _cross_crate) =
         collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 

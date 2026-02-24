@@ -261,6 +261,7 @@ name = "cg-clif"
 version = "0.1.0"
 dependencies = [
  "base-db",
+ "cfg",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
@@ -289,6 +290,7 @@ dependencies = [
  "test-fixture",
  "test-utils",
  "triomphe",
+ "vfs",
 ]
 
 [[package]]
