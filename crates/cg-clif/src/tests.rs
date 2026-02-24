@@ -2674,6 +2674,7 @@ fn fn_display_path(db: &dyn hir_ty::db::HirDatabase, func_id: hir_def::FunctionI
 /// Best-effort name for an impl self type, for path matching against mirdata.
 fn impl_self_ty_name(db: &dyn hir_ty::db::HirDatabase, impl_id: hir_def::ImplId) -> Option<String> {
     use hir_ty::next_solver::{IntoKind, TyKind};
+    use hir_ty::primitive::{FloatTy, IntTy, UintTy};
 
     let mut ty = db.impl_self_ty(impl_id).skip_binder();
     loop {
@@ -2687,6 +2688,25 @@ fn impl_self_ty_name(db: &dyn hir_ty::db::HirDatabase, impl_id: hir_def::ImplId)
                 };
                 return Some(name);
             }
+            TyKind::Bool => return Some("bool".to_owned()),
+            TyKind::Char => return Some("char".to_owned()),
+            TyKind::Str => return Some("str".to_owned()),
+            TyKind::Int(IntTy::I8) => return Some("i8".to_owned()),
+            TyKind::Int(IntTy::I16) => return Some("i16".to_owned()),
+            TyKind::Int(IntTy::I32) => return Some("i32".to_owned()),
+            TyKind::Int(IntTy::I64) => return Some("i64".to_owned()),
+            TyKind::Int(IntTy::I128) => return Some("i128".to_owned()),
+            TyKind::Int(IntTy::Isize) => return Some("isize".to_owned()),
+            TyKind::Uint(UintTy::U8) => return Some("u8".to_owned()),
+            TyKind::Uint(UintTy::U16) => return Some("u16".to_owned()),
+            TyKind::Uint(UintTy::U32) => return Some("u32".to_owned()),
+            TyKind::Uint(UintTy::U64) => return Some("u64".to_owned()),
+            TyKind::Uint(UintTy::U128) => return Some("u128".to_owned()),
+            TyKind::Uint(UintTy::Usize) => return Some("usize".to_owned()),
+            TyKind::Float(FloatTy::F32) => return Some("f32".to_owned()),
+            TyKind::Float(FloatTy::F64) => return Some("f64".to_owned()),
+            TyKind::Float(FloatTy::F16) => return Some("f16".to_owned()),
+            TyKind::Float(FloatTy::F128) => return Some("f128".to_owned()),
             TyKind::Ref(_, inner, _) => ty = inner,
             TyKind::RawPtr(inner, _) => ty = inner,
             _ => return None,
@@ -3579,7 +3599,127 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // str::len not in mirdata (always inlined by rustc) or libstd.so
+fn mirdata_jit_i32_wrapping_add() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 100;
+    a.wrapping_add(42)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 142);
+}
+
+#[test]
+fn mirdata_jit_i32_abs() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = -42;
+    a.abs()
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+#[ignore] // SIGILL — likely missing intrinsic
+fn mirdata_jit_i32_min_max() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 10;
+    let b: i32 = 20;
+    a.min(b) + a.max(b)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 30);
+}
+
+#[test]
+#[ignore] // SIGILL — likely missing intrinsic
+fn mirdata_jit_i32_pow() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 3;
+    a.pow(4)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 81);
+}
+
+#[test]
+fn mirdata_jit_i32_checked_add() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 100;
+    match a.checked_add(42) {
+        Some(v) => v,
+        None => -1,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 142);
+}
+
+#[test]
+#[ignore] // SIGILL — likely missing intrinsic
+fn mirdata_jit_i32_count_ones() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 0b1010_1010;
+    a.count_ones() as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 4);
+}
+
+#[test]
+#[ignore] // SIGILL — likely missing intrinsic
+fn mirdata_jit_i32_leading_zeros() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 1;
+    a.leading_zeros() as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 31);
+}
+
+#[test]
+#[ignore] // SIGILL — likely missing intrinsic
+fn mirdata_jit_i32_swap_bytes() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let a: i32 = 0x12345678_u32 as i32;
+    if a.swap_bytes() == 0x78563412_u32 as i32 { 1 } else { 0 }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn mirdata_jit_str_len() {
     let result: i32 = jit_run_with_std(
         r#"

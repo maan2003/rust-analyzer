@@ -140,6 +140,46 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
         }
     }
 
+    // Export methods on primitive types (i32, str, bool, etc.) which use
+    // "incoherent impls" and aren't discoverable via module_children traversal.
+    {
+        use rustc_middle::ty::{IntTy, UintTy, FloatTy};
+        use rustc_middle::ty::fast_reject::SimplifiedType;
+        let primitive_types = [
+            SimplifiedType::Bool,
+            SimplifiedType::Char,
+            SimplifiedType::Str,
+            SimplifiedType::Int(IntTy::Isize),
+            SimplifiedType::Int(IntTy::I8),
+            SimplifiedType::Int(IntTy::I16),
+            SimplifiedType::Int(IntTy::I32),
+            SimplifiedType::Int(IntTy::I64),
+            SimplifiedType::Int(IntTy::I128),
+            SimplifiedType::Uint(UintTy::Usize),
+            SimplifiedType::Uint(UintTy::U8),
+            SimplifiedType::Uint(UintTy::U16),
+            SimplifiedType::Uint(UintTy::U32),
+            SimplifiedType::Uint(UintTy::U64),
+            SimplifiedType::Uint(UintTy::U128),
+            SimplifiedType::Float(FloatTy::F32),
+            SimplifiedType::Float(FloatTy::F64),
+        ];
+        for simp in &primitive_types {
+            for &impl_def_id in tcx.incoherent_impls(*simp) {
+                visit_impl_or_trait(
+                    tcx,
+                    impl_def_id,
+                    &mut bodies,
+                    &mut generic_fn_lookup,
+                    &mut stats,
+                    &mut visited,
+                    &mut layout_table,
+                    &mut exported_def_ids,
+                );
+            }
+        }
+    }
+
     // Collect layouts for types that appear in monomorphized generic function instances.
     // When e.g. a monomorphic function calls Vec::<i32>::push, the monomorphized body
     // contains types like RawVec<i32, Global> that need layouts for codegen.

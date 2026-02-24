@@ -88,6 +88,13 @@ pub fn normalize_def_path(path: &str) -> String {
         }
     }
 
+    // Pre-process: convert `<impl TYPE>` qualifications to just `TYPE`.
+    // This preserves the self-type in inherent impl paths (e.g.
+    // `core::num::<impl i32>::wrapping_add` → `core::num::i32::wrapping_add`)
+    // while the general normalization below still strips generic args.
+    let preprocessed = preprocess_impl_qualifications(path);
+    let path = &preprocessed;
+
     let mut out = String::with_capacity(path.len());
     let mut depth = 0u32;
 
@@ -112,6 +119,30 @@ pub fn normalize_def_path(path: &str) -> String {
         }
     }
 
+    out
+}
+
+/// Convert `<impl TYPE>` to just `TYPE` in a path string.
+/// Only replaces when TYPE contains no nested `<>` (i.e. simple/primitive types).
+fn preprocess_impl_qualifications(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(pos) = rest.find("<impl ") {
+        out.push_str(&rest[..pos]);
+        let after_impl = &rest[pos + 6..]; // skip "<impl "
+        if let Some(close) = after_impl.find('>') {
+            let ty = &after_impl[..close];
+            if !ty.contains('<') {
+                out.push_str(ty);
+                rest = &after_impl[close + 1..];
+                continue;
+            }
+        }
+        // Couldn't process — keep the `<impl ` and continue
+        out.push_str("<impl ");
+        rest = after_impl;
+    }
+    out.push_str(rest);
     out
 }
 
