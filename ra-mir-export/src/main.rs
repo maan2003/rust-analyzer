@@ -186,6 +186,12 @@ fn visit_module<'tcx>(
             DefKind::Trait => {
                 visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table);
             }
+            DefKind::Struct | DefKind::Enum | DefKind::Union => {
+                // Discover inherent impl methods (e.g. Vec::push, Vec::new)
+                for impl_def_id in tcx.inherent_impls(child_def_id) {
+                    visit_impl_or_trait(tcx, *impl_def_id, out, stats, visited, layout_table);
+                }
+            }
             _ => {}
         }
     }
@@ -230,7 +236,7 @@ fn try_export_fn<'tcx>(
         let translated = translate::translate_body(tcx, body);
         let hash = translate::def_path_hash(tcx, def_id);
         let name = tcx.def_path_str(def_id);
-        let num_generic_params = tcx.generics_of(def_id).own_params.len();
+        let num_generic_params = tcx.generics_of(def_id).count();
 
         FnBody {
             def_path_hash: hash,
