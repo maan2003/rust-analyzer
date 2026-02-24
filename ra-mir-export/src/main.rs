@@ -29,7 +29,8 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
 
-use rustc_middle::ty;
+use rustc_middle::{mir, ty};
+use rustc_middle::ty::TypeVisitableExt;
 
 use ra_mir_types::{CrateInfo, FnBody, MirData, TypeLayoutEntry};
 
@@ -92,17 +93,53 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>) {
     let mut stats = ExportStats::default();
     let mut visited = HashSet::new();
     let mut layout_table = LayoutTable::new();
+    let mut exported_def_ids = Vec::new();
 
     for &cnum in tcx.crates(()) {
         let crate_def_id = cnum.as_def_id();
-        visit_module(tcx, crate_def_id, &mut bodies, &mut stats, &mut visited, &mut layout_table, 0);
+        visit_module(tcx, crate_def_id, &mut bodies, &mut stats, &mut visited, &mut layout_table, &mut exported_def_ids, 0);
     }
+
+    // Collect layouts for types that appear in monomorphized generic function instances.
+    // When e.g. a monomorphic function calls Vec::<i32>::push, the monomorphized body
+    // contains types like RawVec<i32, Global> that need layouts for codegen.
+    let layouts_before = layout_table.entries.len();
+    // Pass 1: recursively walk ALL exported function locals (monomorphic ones)
+    // to export layouts for field types, pointees, etc. that codegen needs during
+    // place projections but aren't direct locals.
+    {
+        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let mut visited_types: HashSet<ty::Ty<'_>> = HashSet::new();
+        for &def_id in &exported_def_ids {
+            if tcx.generics_of(def_id).count() > 0 {
+                continue;
+            }
+            let body = tcx.optimized_mir(def_id);
+            for local_decl in body.local_decls.iter() {
+                if local_decl.ty.has_param() {
+                    continue;
+                }
+                let normalized = tcx
+                    .try_normalize_erasing_regions(typing_env, local_decl.ty)
+                    .unwrap_or(local_decl.ty);
+                export_type_layout_recursive(tcx, normalized, &mut layout_table, &mut visited_types);
+            }
+        }
+    }
+    let mono_local_layouts = layout_table.entries.len() - layouts_before;
+
+    // Pass 2: collect layouts for monomorphized generic function instances
+    let mono_layouts_before = layout_table.entries.len();
+    collect_mono_layouts(tcx, &exported_def_ids, &mut layout_table);
+    let mono_inst_layouts = layout_table.entries.len() - mono_layouts_before;
 
     // Print stats
     eprintln!(
         "MIR export: {} functions found, {} with MIR available, {} translated, {} skipped",
         stats.total_fns, stats.mir_available, stats.translated, stats.skipped
     );
+    eprintln!("  Layout passes: +{} from local type walk, +{} from mono instances",
+        mono_local_layouts, mono_inst_layouts);
 
     (bodies, layout_table.entries)
 }
@@ -157,6 +194,7 @@ fn visit_module<'tcx>(
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
+    exported_def_ids: &mut Vec<DefId>,
     depth: usize,
 ) {
     if depth > MAX_MODULE_DEPTH {
@@ -175,21 +213,21 @@ fn visit_module<'tcx>(
         }
         match tcx.def_kind(child_def_id) {
             DefKind::Mod => {
-                visit_module(tcx, child_def_id, out, stats, visited, layout_table, depth + 1);
+                visit_module(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids, depth + 1);
             }
             DefKind::Fn | DefKind::AssocFn => {
-                try_export_fn(tcx, child_def_id, out, stats, visited, layout_table);
+                try_export_fn(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
             }
             DefKind::Impl { .. } => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table);
+                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
             }
             DefKind::Trait => {
-                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table);
+                visit_impl_or_trait(tcx, child_def_id, out, stats, visited, layout_table, exported_def_ids);
             }
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 // Discover inherent impl methods (e.g. Vec::push, Vec::new)
                 for impl_def_id in tcx.inherent_impls(child_def_id) {
-                    visit_impl_or_trait(tcx, *impl_def_id, out, stats, visited, layout_table);
+                    visit_impl_or_trait(tcx, *impl_def_id, out, stats, visited, layout_table, exported_def_ids);
                 }
             }
             _ => {}
@@ -204,12 +242,13 @@ fn visit_impl_or_trait<'tcx>(
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
+    exported_def_ids: &mut Vec<DefId>,
 ) {
     if !visited.insert(def_id) {
         return;
     }
     for &item in tcx.associated_item_def_ids(def_id) {
-        try_export_fn(tcx, item, out, stats, visited, layout_table);
+        try_export_fn(tcx, item, out, stats, visited, layout_table, exported_def_ids);
     }
 }
 
@@ -220,6 +259,7 @@ fn try_export_fn<'tcx>(
     stats: &mut ExportStats,
     visited: &mut HashSet<DefId>,
     layout_table: &mut LayoutTable<'tcx>,
+    exported_def_ids: &mut Vec<DefId>,
 ) {
     if !visited.insert(def_id) {
         return;
@@ -252,6 +292,7 @@ fn try_export_fn<'tcx>(
                 fn_body.body.locals[i].layout = layout_table.get_or_insert(tcx, decl.ty);
             }
             stats.translated += 1;
+            exported_def_ids.push(def_id);
             out.push(fn_body);
         }
         Err(_) => {
@@ -259,6 +300,126 @@ fn try_export_fn<'tcx>(
             let name = tcx.def_path_str(def_id);
             eprintln!("  warning: skipped {name} (translation panicked)");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monomorphized layout collection
+// ---------------------------------------------------------------------------
+
+/// Collect layouts for types that appear in monomorphized generic function instances.
+///
+/// Scans monomorphic functions' rustc MIR for calls to generic functions with concrete
+/// type args. For each such call, instantiates the callee's local types with the concrete
+/// args and recursively exports layouts for all component types (ADT fields, pointees, etc.).
+fn collect_mono_layouts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    exported_def_ids: &[DefId],
+    layout_table: &mut LayoutTable<'tcx>,
+) {
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    let mut visited_types: HashSet<ty::Ty<'tcx>> = HashSet::new();
+    let mut visited_instances: HashSet<(DefId, ty::GenericArgsRef<'tcx>)> = HashSet::new();
+
+    for &def_id in exported_def_ids {
+        // Only scan monomorphic functions
+        if tcx.generics_of(def_id).count() > 0 {
+            continue;
+        }
+        let body = tcx.optimized_mir(def_id);
+        for bb in body.basic_blocks.iter() {
+            let Some(term) = bb.terminator.as_ref() else { continue };
+            if let mir::TerminatorKind::Call { func, .. } = &term.kind {
+                if let mir::Operand::Constant(box c) = func {
+                    let func_ty = c.const_.ty();
+                    if let ty::TyKind::FnDef(callee_def_id, substs) = func_ty.kind() {
+                        // Skip non-generic callees
+                        if tcx.generics_of(*callee_def_id).count() == 0 {
+                            continue;
+                        }
+                        // Skip if any type arg still contains Param
+                        if func_ty.has_param() {
+                            continue;
+                        }
+                        // Deduplicate
+                        if !visited_instances.insert((*callee_def_id, substs)) {
+                            continue;
+                        }
+                        // Get callee's MIR
+                        if !tcx.is_mir_available(*callee_def_id) {
+                            continue;
+                        }
+                        let callee_body = tcx.optimized_mir(*callee_def_id);
+
+                        // Instantiate each local's type and export layouts recursively
+                        for local_decl in callee_body.local_decls.iter() {
+                            let mono_ty = ty::EarlyBinder::bind(local_decl.ty)
+                                .instantiate(tcx, substs);
+                            let normalized = tcx
+                                .try_normalize_erasing_regions(typing_env, mono_ty)
+                                .unwrap_or(mono_ty);
+                            export_type_layout_recursive(
+                                tcx,
+                                normalized,
+                                layout_table,
+                                &mut visited_types,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recursively export layouts for a type and all its component types.
+///
+/// Walks through ADT fields, ref/ptr pointees, array/slice elements, and tuple
+/// elements, computing and exporting layouts for each concrete type encountered.
+fn export_type_layout_recursive<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    layout_table: &mut LayoutTable<'tcx>,
+    visited: &mut HashSet<ty::Ty<'tcx>>,
+) {
+    if !visited.insert(ty) {
+        return;
+    }
+    // Skip types with unresolved params (can't compute layout)
+    if ty.has_param() {
+        return;
+    }
+
+    // Try to compute and export layout (best effort — unsized types will fail)
+    let _ = layout_table.get_or_insert(tcx, ty);
+
+    // Recurse into component types so codegen has layouts for field projections,
+    // derefs, array indexing, etc.
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    match ty.kind() {
+        ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => {
+            export_type_layout_recursive(tcx, *inner, layout_table, visited);
+        }
+        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+            export_type_layout_recursive(tcx, *elem, layout_table, visited);
+        }
+        ty::TyKind::Tuple(tys) => {
+            for t in tys.iter() {
+                export_type_layout_recursive(tcx, t, layout_table, visited);
+            }
+        }
+        ty::TyKind::Adt(adt_def, args) => {
+            for variant in adt_def.variants() {
+                for field in &variant.fields {
+                    let field_ty = field.ty(tcx, args);
+                    let normalized = tcx
+                        .try_normalize_erasing_regions(typing_env, field_ty)
+                        .unwrap_or(field_ty);
+                    export_type_layout_recursive(tcx, normalized, layout_table, visited);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
