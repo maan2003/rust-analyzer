@@ -27,3 +27,5 @@ devenv.local.yaml
 .pre-commit-config.yaml
 
 /rustc
+
+rustc-ice-*.txt

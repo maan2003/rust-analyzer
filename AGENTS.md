@@ -18,3 +18,9 @@ You are in a "vibe coding" setting, user doesn't review the code, so you have to
 you are doing a hack or something that will bite us in future.
 
 This is a new project, backward compatibility is never needed.
+
+Common commands:
+```bash
+# run crates/cg-clif tests
+just test-clif
+```
