@@ -2934,3 +2934,20 @@ fn foo() -> i32 {
     );
     assert_eq!(result, 42 + 99);
 }
+
+#[test]
+fn mirdata_jit_vec_push_len() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v.len() as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 3);
+}
