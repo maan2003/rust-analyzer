@@ -207,7 +207,25 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
     }
     let mono_local_layouts = layout_table.entries.len() - layouts_before;
 
-    // Pass 2: collect layouts for monomorphized generic function instances
+    // Pass 2: export ADT definitions from generic function bodies.
+    // Generic locals have type params so we can't compute layouts, but we need the
+    // ADT shapes so that at JIT time we can compute layouts after type substitution.
+    {
+        let adt_defs_before = adt_table.entries.len();
+        let mut visited_tys: HashSet<ty::Ty<'_>> = HashSet::new();
+        for &def_id in &exported_def_ids {
+            if tcx.generics_of(def_id).count() == 0 {
+                continue; // non-generic — already handled in pass 1
+            }
+            let body = tcx.optimized_mir(def_id);
+            for local_decl in body.local_decls.iter() {
+                collect_adt_defs_from_ty(tcx, local_decl.ty, &mut adt_table, &mut visited_tys);
+            }
+        }
+        eprintln!("  ADT defs from generic bodies: +{}", adt_table.entries.len() - adt_defs_before);
+    }
+
+    // Pass 3: collect layouts for monomorphized generic function instances
     let mono_layouts_before = layout_table.entries.len();
     collect_mono_layouts(tcx, &exported_def_ids, &mut layout_table, &mut adt_table);
     let mono_inst_layouts = layout_table.entries.len() - mono_layouts_before;
@@ -550,6 +568,44 @@ fn collect_mono_layouts<'tcx>(
                 }
             }
         }
+    }
+}
+
+/// Recursively collect ADT definitions from a type, even if it contains type params.
+/// This ensures that at JIT time we have the ADT shape to compute layouts after
+/// type substitution.
+fn collect_adt_defs_from_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    adt_table: &mut AdtTable<'tcx>,
+    visited: &mut HashSet<ty::Ty<'tcx>>,
+) {
+    if !visited.insert(ty) {
+        return;
+    }
+    match ty.kind() {
+        ty::TyKind::Adt(adt_def, args) => {
+            adt_table.get_or_insert(tcx, *adt_def);
+            // Recurse into field types to find nested ADTs
+            for variant in adt_def.variants() {
+                for field in &variant.fields {
+                    let field_ty = field.ty(tcx, args);
+                    collect_adt_defs_from_ty(tcx, field_ty, adt_table, visited);
+                }
+            }
+        }
+        ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => {
+            collect_adt_defs_from_ty(tcx, *inner, adt_table, visited);
+        }
+        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+            collect_adt_defs_from_ty(tcx, *elem, adt_table, visited);
+        }
+        ty::TyKind::Tuple(tys) => {
+            for t in tys.iter() {
+                collect_adt_defs_from_ty(tcx, t, adt_table, visited);
+            }
+        }
+        _ => {}
     }
 }
 

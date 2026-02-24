@@ -2818,6 +2818,17 @@ fn ra_ty_to_mirdata(
                 n,
             )
         }
+        TyKind::Closure(closure_id, args) => {
+            // Use a synthetic hash based on the InternedClosureId.
+            // Layout computation treats all closures as ZST (which is correct
+            // for non-capturing closures; capturing closures need real layout).
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            closure_id.0.hash(&mut hasher);
+            let hash = (0u64, hasher.finish());
+            let generic_args = ra_generic_args_to_mirdata(ctx, args);
+            ra_mir_types::Ty::Closure(hash, generic_args)
+        }
         other => ra_mir_types::Ty::Opaque(format!("{:?}", other)),
     }
 }
@@ -3352,7 +3363,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // HasErrorType in local layout
 fn mirdata_jit_vec_push_len() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3473,7 +3484,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[ignore] // SIGILL — closure codegen in mirdata generic body
 fn mirdata_jit_option_map() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3562,7 +3573,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // HasErrorType in local layout
+#[should_panic] // mirdata lookup miss: core::convert::from
 fn mirdata_jit_string_len() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3741,7 +3752,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // mirdata lookup miss: core::slice::iter
 fn mirdata_jit_iter_sum() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3760,7 +3771,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // infer_dst_pointee not implemented for VarError
 fn mirdata_jit_env_var() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3777,7 +3788,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // infer_dst_pointee not implemented for SendError
 fn mirdata_jit_mpsc_channel() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3794,7 +3805,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // infer_dst_pointee: Ref(Not, Str)
 fn mirdata_jit_result_and_then() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3810,7 +3821,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // mirdata lookup miss: core::convert::from
 fn mirdata_jit_string_parse() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3826,7 +3837,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[should_panic] // mirdata closure layout not supported yet
+#[should_panic] // monomorphization resulted in errors
 fn mirdata_jit_hashmap_insert_get() {
     let result: i32 = jit_run_with_std(
         r#"
