@@ -735,6 +735,81 @@ fn translate_generic_arg<'tcx>(
 }
 
 // ---------------------------------------------------------------------------
+// ADT definitions
+// ---------------------------------------------------------------------------
+
+pub fn translate_adt_def<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def: ty::AdtDef<'tcx>,
+) -> mir_types::AdtDefEntry {
+    let def_id = adt_def.did();
+    let kind = if adt_def.is_struct() {
+        mir_types::AdtKind::Struct
+    } else if adt_def.is_enum() {
+        mir_types::AdtKind::Enum
+    } else {
+        mir_types::AdtKind::Union
+    };
+
+    let identity_args = ty::GenericArgs::identity_for_item(tcx, def_id);
+
+    let variants = adt_def
+        .variants()
+        .iter()
+        .map(|variant| {
+            let fields = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    let field_ty = field.ty(tcx, identity_args);
+                    translate_ty(tcx, field_ty)
+                })
+                .collect();
+            mir_types::AdtVariantDef { fields }
+        })
+        .collect();
+
+    let repr = translate_repr_options(&adt_def.repr());
+    let is_special_no_niche = adt_def.is_unsafe_cell() || adt_def.is_unsafe_pinned();
+
+    mir_types::AdtDefEntry {
+        def_path_hash: def_path_hash(tcx, def_id),
+        kind,
+        repr,
+        variants,
+        is_special_no_niche,
+    }
+}
+
+fn translate_repr_options(repr: &rustc_abi::ReprOptions) -> mir_types::ExportedReprOptions {
+    mir_types::ExportedReprOptions {
+        c: repr.c(),
+        transparent: repr.transparent(),
+        packed: repr.pack.map(|a| a.bytes()),
+        align: repr.align.map(|a| a.bytes()),
+        int: repr.int.map(translate_integer_type),
+    }
+}
+
+fn translate_integer_type(ity: rustc_abi::IntegerType) -> mir_types::ExportedIntegerType {
+    match ity {
+        rustc_abi::IntegerType::Fixed(int, signed) => {
+            let size_bytes = match int {
+                rustc_abi::Integer::I8 => 1,
+                rustc_abi::Integer::I16 => 2,
+                rustc_abi::Integer::I32 => 4,
+                rustc_abi::Integer::I64 => 8,
+                rustc_abi::Integer::I128 => 16,
+            };
+            mir_types::ExportedIntegerType::Fixed { size_bytes, signed }
+        }
+        rustc_abi::IntegerType::Pointer(signed) => {
+            mir_types::ExportedIntegerType::Pointer(signed)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Layouts
 // ---------------------------------------------------------------------------
 

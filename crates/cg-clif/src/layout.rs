@@ -4,16 +4,20 @@
 //! This lets us use pre-computed layouts from `.mirdata` files without changing
 //! the existing codegen code that pattern-matches on `BackendRepr`, `Scalar`, etc.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 
 use ra_mir_types::{
-    ExportedBackendRepr, ExportedFieldsShape, ExportedNiche, ExportedPrimitive, ExportedScalar,
-    ExportedTagEncoding, ExportedVariants, LayoutInfo, TypeLayoutEntry,
+    AdtDefEntry, AdtKind, ExportedBackendRepr, ExportedFieldsShape, ExportedNiche,
+    ExportedPrimitive, ExportedScalar, ExportedTagEncoding, ExportedVariants, LayoutInfo,
+    TypeLayoutEntry,
 };
 use rac_abi::{FieldIdx, VariantIdx};
 use rustc_abi::{
-    AddressSpace, Align, BackendRepr, FieldsShape, Float, Integer, Niche, Primitive, Scalar, Size,
-    TagEncoding, Variants, WrappingRange,
+    AddressSpace, Align, BackendRepr, FieldsShape, Float, Integer, LayoutCalculator,
+    LayoutData, Niche, Primitive, ReprOptions, Scalar, Size, StructKind, TagEncoding,
+    TargetDataLayout, Variants, WrappingRange,
 };
 use rustc_hashes::Hash64;
 use rustc_index::IndexVec;
@@ -155,6 +159,511 @@ fn convert_niche(n: &ExportedNiche) -> Niche {
         panic!("niche scalar must be Initialized");
     };
     Niche { offset: Size::from_bytes(n.offset), value, valid_range }
+}
+
+// ---------------------------------------------------------------------------
+// Layout computation for monomorphized generic types
+// ---------------------------------------------------------------------------
+
+fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
+    Scalar::Initialized { value, valid_range: WrappingRange::full(value.size(dl)) }
+}
+
+/// Compute a layout for a given `ra_mir_types::Ty`, caching results in `ty_layouts`.
+/// Uses ADT definitions from `adt_defs` to compute layouts for struct/enum/union types
+/// that may not be in the pre-exported layout table (e.g. due to monomorphization).
+///
+/// Returns `None` if the type cannot be computed (e.g. unsupported Opaque types).
+pub fn try_compute_layout(
+    ty: &ra_mir_types::Ty,
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+) -> Option<TArc<Layout>> {
+    // Check cache first
+    if let Some(layout) = ty_layouts.get(ty) {
+        return Some(layout.clone());
+    }
+
+    let calc = LayoutCalculator::new(dl);
+    let result = compute_layout_inner(ty, adt_defs, ty_layouts, dl, &calc)?;
+    ty_layouts.insert(ty.clone(), result.clone());
+    Some(result)
+}
+
+/// Compute a layout, panicking if it can't be computed.
+pub fn compute_layout(
+    ty: &ra_mir_types::Ty,
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+) -> TArc<Layout> {
+    try_compute_layout(ty, adt_defs, ty_layouts, dl)
+        .unwrap_or_else(|| panic!("compute_layout failed for type: {:?}", ty))
+}
+
+fn compute_layout_inner(
+    ty: &ra_mir_types::Ty,
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+    calc: &LayoutCalculator<&TargetDataLayout>,
+) -> Option<TArc<Layout>> {
+    use ra_mir_types::Ty;
+
+    let layout = match ty {
+        Ty::Bool => Layout::scalar(
+            dl,
+            Scalar::Initialized {
+                value: Primitive::Int(Integer::I8, false),
+                valid_range: WrappingRange { start: 0, end: 1 },
+            },
+        ),
+        Ty::Char => Layout::scalar(
+            dl,
+            Scalar::Initialized {
+                value: Primitive::Int(Integer::I32, false),
+                valid_range: WrappingRange { start: 0, end: 0x10FFFF },
+            },
+        ),
+        Ty::Int(int_ty) => {
+            let int = match int_ty {
+                ra_mir_types::IntTy::Isize => dl.ptr_sized_integer(),
+                ra_mir_types::IntTy::I8 => Integer::I8,
+                ra_mir_types::IntTy::I16 => Integer::I16,
+                ra_mir_types::IntTy::I32 => Integer::I32,
+                ra_mir_types::IntTy::I64 => Integer::I64,
+                ra_mir_types::IntTy::I128 => Integer::I128,
+            };
+            Layout::scalar(dl, scalar_unit(dl, Primitive::Int(int, true)))
+        }
+        Ty::Uint(uint_ty) => {
+            let int = match uint_ty {
+                ra_mir_types::UintTy::Usize => dl.ptr_sized_integer(),
+                ra_mir_types::UintTy::U8 => Integer::I8,
+                ra_mir_types::UintTy::U16 => Integer::I16,
+                ra_mir_types::UintTy::U32 => Integer::I32,
+                ra_mir_types::UintTy::U64 => Integer::I64,
+                ra_mir_types::UintTy::U128 => Integer::I128,
+            };
+            Layout::scalar(dl, scalar_unit(dl, Primitive::Int(int, false)))
+        }
+        Ty::Float(float_ty) => {
+            let float = match float_ty {
+                ra_mir_types::FloatTy::F16 => Float::F16,
+                ra_mir_types::FloatTy::F32 => Float::F32,
+                ra_mir_types::FloatTy::F64 => Float::F64,
+                ra_mir_types::FloatTy::F128 => Float::F128,
+            };
+            Layout::scalar(dl, scalar_unit(dl, Primitive::Float(float)))
+        }
+        Ty::Never => LayoutData::never_type(dl),
+        Ty::Str => {
+            let element = scalar_unit(dl, Primitive::Int(Integer::I8, false));
+            calc.array_like::<_, _, ()>(&Layout::scalar(dl, element), None)
+                .expect("str layout")
+        }
+        Ty::Tuple(tys) => {
+            if tys.is_empty() {
+                LayoutData::unit(dl, true)
+            } else {
+                let fields: Vec<_> = tys
+                    .iter()
+                    .map(|t| try_compute_layout(t, adt_defs, ty_layouts, dl))
+                    .collect::<Option<Vec<_>>>()?;
+                let field_refs: Vec<&Layout> = fields.iter().map(|f| &**f).collect();
+                let field_iters: IndexVec<FieldIdx, &&Layout> = field_refs.iter().collect();
+                calc.univariant(&field_iters, &ReprOptions::default(), StructKind::AlwaysSized)
+                    .expect("tuple layout")
+            }
+        }
+        Ty::Array(elem, count) => {
+            let elem_layout = try_compute_layout(elem, adt_defs, ty_layouts, dl)?;
+            calc.array_like::<_, _, ()>(&*elem_layout, Some(*count))
+                .expect("array layout")
+        }
+        Ty::Slice(elem) => {
+            let elem_layout = try_compute_layout(elem, adt_defs, ty_layouts, dl)?;
+            calc.array_like::<_, _, ()>(&*elem_layout, None)
+                .expect("slice layout")
+        }
+        Ty::Ref(_, pointee) | Ty::RawPtr(_, pointee) => {
+            let is_ref = matches!(ty, Ty::Ref(..));
+            let mut data_ptr = scalar_unit(dl, Primitive::Pointer(AddressSpace::ZERO));
+            if is_ref {
+                data_ptr.valid_range_mut().start = 1;
+            }
+
+            // Check if pointee is unsized (slice, str, dyn)
+            match &**pointee {
+                Ty::Slice(_) | Ty::Str => {
+                    let metadata = scalar_unit(dl, Primitive::Int(dl.ptr_sized_integer(), false));
+                    LayoutData::scalar_pair(dl, data_ptr, metadata)
+                }
+                Ty::Dynamic(_) => {
+                    let mut vtable = scalar_unit(dl, Primitive::Pointer(AddressSpace::ZERO));
+                    vtable.valid_range_mut().start = 1;
+                    LayoutData::scalar_pair(dl, data_ptr, vtable)
+                }
+                _ => {
+                    // Sized pointee — thin pointer
+                    Layout::scalar(dl, data_ptr)
+                }
+            }
+        }
+        Ty::FnDef(_, _) => LayoutData::unit(dl, true),
+        Ty::FnPtr(_, _) => {
+            let mut ptr = scalar_unit(dl, Primitive::Pointer(dl.instruction_address_space));
+            ptr.valid_range_mut().start = 1;
+            Layout::scalar(dl, ptr)
+        }
+        Ty::Foreign(_) | Ty::Dynamic(_) => LayoutData::unit(dl, false),
+        Ty::Closure(_, _) => {
+            // Closures should have pre-computed layouts; fallback to ZST
+            LayoutData::unit(dl, true)
+        }
+        Ty::Adt(hash, _name, args) => {
+            return compute_adt_layout(hash, args, adt_defs, ty_layouts, dl, calc);
+        }
+        Ty::Param(_, _) | Ty::Opaque(_) => {
+            // Can't compute layout for unresolved params or opaque types.
+            // These should have pre-computed layouts in ty_layouts if needed.
+            return None;
+        }
+    };
+
+    Some(TArc::new(layout))
+}
+
+fn compute_adt_layout(
+    hash: &ra_mir_types::DefPathHash,
+    args: &[ra_mir_types::GenericArg],
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+    calc: &LayoutCalculator<&TargetDataLayout>,
+) -> Option<TArc<Layout>> {
+    let adt = adt_defs.get(hash)?;
+
+    // Compute layouts for each variant's fields after substitution
+    let variants: Vec<Vec<TArc<Layout>>> = adt
+        .variants
+        .iter()
+        .map(|variant| {
+            variant
+                .fields
+                .iter()
+                .map(|field_ty| {
+                    let substituted = field_ty.subst(args);
+                    try_compute_layout(&substituted, adt_defs, ty_layouts, dl)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let repr = convert_repr_options(&adt.repr, dl);
+
+    let variant_refs: Vec<Vec<&Layout>> = variants
+        .iter()
+        .map(|v| v.iter().map(|l| &**l).collect())
+        .collect();
+    let variant_index_vecs: IndexVec<VariantIdx, IndexVec<FieldIdx, &&Layout>> = variant_refs
+        .iter()
+        .map(|v| v.iter().collect())
+        .collect();
+
+    let result = match adt.kind {
+        AdtKind::Union => {
+            calc.layout_of_union(&repr, &variant_index_vecs)
+                .expect("union layout computation failed")
+        }
+        AdtKind::Struct | AdtKind::Enum => {
+            let is_enum = adt.kind == AdtKind::Enum;
+            calc.layout_of_struct_or_enum(
+                &repr,
+                &variant_index_vecs,
+                is_enum,
+                adt.is_special_no_niche,
+                (Bound::Unbounded, Bound::Unbounded), // scalar_valid_range
+                |min, max| {
+                    repr_discr(dl, &repr, min, max)
+                },
+                // Discriminant values — for enums, use 0, 1, 2, ...
+                if is_enum {
+                    variant_index_vecs
+                        .iter_enumerated()
+                        .map(|(id, _)| (id, id.as_u32() as i128))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                }
+                .into_iter(),
+                // always_sized: true for structs, check last field for enums
+                !is_enum
+                    && variant_index_vecs
+                        .iter()
+                        .next()
+                        .and_then(|it| it.iter().last().map(|it| !it.is_unsized()))
+                        .unwrap_or(true),
+            )
+            .expect("struct/enum layout computation failed")
+        }
+    };
+
+    Some(TArc::new(result))
+}
+
+fn convert_repr_options(
+    repr: &ra_mir_types::ExportedReprOptions,
+    dl: &TargetDataLayout,
+) -> ReprOptions {
+    use rustc_abi::{IntegerType, ReprFlags};
+
+    let mut flags = ReprFlags::empty();
+    if repr.c {
+        flags |= ReprFlags::IS_C;
+    }
+    if repr.transparent {
+        flags |= ReprFlags::IS_TRANSPARENT;
+    }
+
+    let int = repr.int.as_ref().map(|ity| match ity {
+        ra_mir_types::ExportedIntegerType::Fixed { size_bytes, signed } => {
+            let int = match size_bytes {
+                1 => Integer::I8,
+                2 => Integer::I16,
+                4 => Integer::I32,
+                8 => Integer::I64,
+                16 => Integer::I128,
+                _ => panic!("unsupported integer size: {size_bytes}"),
+            };
+            IntegerType::Fixed(int, *signed)
+        }
+        ra_mir_types::ExportedIntegerType::Pointer(signed) => {
+            IntegerType::Pointer(*signed)
+        }
+    });
+
+    let _ = dl; // dl used for pack/align validation if needed
+
+    ReprOptions {
+        int,
+        align: repr.align.map(|a| Align::from_bytes(a).expect("invalid repr align")),
+        pack: repr.packed.map(|p| Align::from_bytes(p).expect("invalid repr pack")),
+        flags,
+        field_shuffle_seed: Hash64::new(0),
+    }
+}
+
+/// Finds the appropriate Integer type and signedness for the given
+/// signed discriminant range and `#[repr]` attribute.
+fn repr_discr(
+    dl: &TargetDataLayout,
+    repr: &ReprOptions,
+    min: i128,
+    max: i128,
+) -> (Integer, bool) {
+    use std::cmp;
+
+    let unsigned_fit = Integer::fit_unsigned(cmp::max(min as u128, max as u128));
+    let signed_fit = cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+
+    if let Some(ity) = repr.int {
+        let discr = Integer::from_attr(dl, ity);
+        let fit = if ity.is_signed() { signed_fit } else { unsigned_fit };
+        if discr < fit {
+            return (discr, ity.is_signed());
+        }
+        return (discr, ity.is_signed());
+    }
+
+    let at_least = if repr.c() {
+        dl.c_enum_min_size
+    } else {
+        Integer::I8
+    };
+
+    if min >= 0 {
+        (cmp::max(unsigned_fit, at_least), false)
+    } else {
+        (cmp::max(signed_fit, at_least), true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Body type walker: ensure all body types have layouts
+// ---------------------------------------------------------------------------
+
+/// Walk a monomorphized body and ensure all types referenced in it
+/// have computed layouts in `ty_layouts`.
+pub fn ensure_body_layouts(
+    body: &ra_mir_types::Body,
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+) {
+    let mut types_to_process: Vec<ra_mir_types::Ty> = Vec::new();
+
+    // Collect all types from the body
+    for local in &body.locals {
+        types_to_process.push(local.ty.clone());
+    }
+
+    for bb in &body.blocks {
+        for stmt in &bb.stmts {
+            collect_stmt_types(stmt, &mut types_to_process);
+        }
+        collect_terminator_types(&bb.terminator, &mut types_to_process);
+    }
+
+    // Ensure layout for each collected type and its components
+    let mut visited = std::collections::HashSet::new();
+    for ty in types_to_process {
+        ensure_layout_recursive(&ty, adt_defs, ty_layouts, dl, &mut visited);
+    }
+}
+
+fn collect_stmt_types(stmt: &ra_mir_types::Statement, out: &mut Vec<ra_mir_types::Ty>) {
+    use ra_mir_types::Statement;
+    match stmt {
+        Statement::Assign(place, rvalue) => {
+            collect_place_types(place, out);
+            collect_rvalue_types(rvalue, out);
+        }
+        Statement::SetDiscriminant { place, .. } => {
+            collect_place_types(place, out);
+        }
+        Statement::Deinit(place) => {
+            collect_place_types(place, out);
+        }
+        Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Nop => {}
+    }
+}
+
+fn collect_terminator_types(term: &ra_mir_types::Terminator, out: &mut Vec<ra_mir_types::Ty>) {
+    use ra_mir_types::Terminator;
+    match term {
+        Terminator::Call { func, args, dest, .. } => {
+            collect_operand_types(func, out);
+            for arg in args {
+                collect_operand_types(arg, out);
+            }
+            collect_place_types(dest, out);
+        }
+        Terminator::SwitchInt { discr, .. } => {
+            collect_operand_types(discr, out);
+        }
+        Terminator::Drop { place, .. } => {
+            collect_place_types(place, out);
+        }
+        Terminator::Assert { cond, .. } => {
+            collect_operand_types(cond, out);
+        }
+        Terminator::Goto(_)
+        | Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::UnwindResume => {}
+    }
+}
+
+fn collect_operand_types(op: &ra_mir_types::Operand, out: &mut Vec<ra_mir_types::Ty>) {
+    match op {
+        ra_mir_types::Operand::Copy(p) | ra_mir_types::Operand::Move(p) => {
+            collect_place_types(p, out);
+        }
+        ra_mir_types::Operand::Constant(c) => {
+            out.push(c.ty.clone());
+        }
+    }
+}
+
+fn collect_place_types(place: &ra_mir_types::Place, out: &mut Vec<ra_mir_types::Ty>) {
+    for proj in &place.projections {
+        match proj {
+            ra_mir_types::Projection::Field(_, ty) => out.push(ty.clone()),
+            ra_mir_types::Projection::OpaqueCast(ty) => out.push(ty.clone()),
+            _ => {}
+        }
+    }
+}
+
+fn collect_rvalue_types(rv: &ra_mir_types::Rvalue, out: &mut Vec<ra_mir_types::Ty>) {
+    use ra_mir_types::Rvalue;
+    match rv {
+        Rvalue::Cast(_, op, ty) => {
+            collect_operand_types(op, out);
+            out.push(ty.clone());
+        }
+        Rvalue::Aggregate(kind, ops) => {
+            match kind {
+                ra_mir_types::AggregateKind::Array(ty) => out.push(ty.clone()),
+                _ => {}
+            }
+            for op in ops {
+                collect_operand_types(op, out);
+            }
+        }
+        Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::UnaryOp(_, op) => {
+            collect_operand_types(op, out);
+        }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            collect_operand_types(lhs, out);
+            collect_operand_types(rhs, out);
+        }
+        Rvalue::Ref(_, place) | Rvalue::RawPtr(_, place) | Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
+            collect_place_types(place, out);
+        }
+        Rvalue::ThreadLocalRef(_) => {}
+    }
+}
+
+/// Recursively ensure a type and all its component types have layouts.
+fn ensure_layout_recursive(
+    ty: &ra_mir_types::Ty,
+    adt_defs: &HashMap<ra_mir_types::DefPathHash, AdtDefEntry>,
+    ty_layouts: &mut HashMap<ra_mir_types::Ty, TArc<Layout>>,
+    dl: &TargetDataLayout,
+    visited: &mut std::collections::HashSet<ra_mir_types::Ty>,
+) {
+    if !visited.insert(ty.clone()) {
+        return;
+    }
+
+    // Skip types with unresolved params
+    if ty.has_param() {
+        return;
+    }
+
+    // Try to compute layout for this type (may fail for unsupported types like Opaque)
+    if try_compute_layout(ty, adt_defs, ty_layouts, dl).is_none() {
+        return; // Can't compute — stop recursion
+    }
+
+    // Recurse into component types
+    match ty {
+        ra_mir_types::Ty::Ref(_, pointee) | ra_mir_types::Ty::RawPtr(_, pointee) => {
+            ensure_layout_recursive(pointee, adt_defs, ty_layouts, dl, visited);
+        }
+        ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => {
+            ensure_layout_recursive(elem, adt_defs, ty_layouts, dl, visited);
+        }
+        ra_mir_types::Ty::Tuple(tys) => {
+            for t in tys {
+                ensure_layout_recursive(t, adt_defs, ty_layouts, dl, visited);
+            }
+        }
+        ra_mir_types::Ty::Adt(hash, _, args) => {
+            if let Some(adt) = adt_defs.get(hash) {
+                for variant in &adt.variants {
+                    for field_ty in &variant.fields {
+                        let substituted = field_ty.subst(args);
+                        ensure_layout_recursive(&substituted, adt_defs, ty_layouts, dl, visited);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ pub struct MirData {
     pub bodies: Vec<FnBody>,
     pub layouts: Vec<TypeLayoutEntry>,
     pub generic_fn_lookup: Vec<GenericFnLookupEntry>,
+    pub adt_defs: Vec<AdtDefEntry>,
 }
 
 /// Crate name + StableCrateId.
@@ -57,6 +58,36 @@ pub struct GenericFnLookupEntry {
 }
 
 pub fn normalize_def_path(path: &str) -> String {
+    // Handle trait impl methods: <SelfTy as Trait>::method → normalize(SelfTy)::method
+    if path.starts_with('<') {
+        let bytes = path.as_bytes();
+        let mut depth = 0u32;
+        let mut as_start = None;
+        let mut close_bracket = None;
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_bracket = Some(i);
+                        break;
+                    }
+                }
+                b' ' if depth == 1 && path.get(i..i + 4) == Some(" as ") => {
+                    as_start = Some(i);
+                }
+                _ => {}
+            }
+        }
+        if let (Some(as_start), Some(close_bracket)) = (as_start, close_bracket) {
+            let self_ty = &path[1..as_start];
+            let suffix = &path[close_bracket + 1..]; // e.g. "::drop"
+            let normalized_self = normalize_def_path(self_ty);
+            return format!("{}{}", normalized_self, suffix);
+        }
+    }
+
     let mut out = String::with_capacity(path.len());
     let mut depth = 0u32;
 
@@ -735,4 +766,45 @@ pub enum ExportedTagEncoding {
 pub struct ExportedNiche {
     pub offset: u64,
     pub scalar: ExportedScalar,
+}
+
+// ---------------------------------------------------------------------------
+// ADT definitions (for layout computation of monomorphized generics)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AdtDefEntry {
+    pub def_path_hash: DefPathHash,
+    pub kind: AdtKind,
+    pub repr: ExportedReprOptions,
+    pub variants: Vec<AdtVariantDef>,
+    pub is_special_no_niche: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdtKind {
+    Struct,
+    Enum,
+    Union,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AdtVariantDef {
+    /// Field types using identity substitution (may contain `Param` references).
+    pub fields: Vec<Ty>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExportedReprOptions {
+    pub c: bool,
+    pub transparent: bool,
+    pub packed: Option<u64>,
+    pub align: Option<u64>,
+    pub int: Option<ExportedIntegerType>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ExportedIntegerType {
+    Fixed { size_bytes: u8, signed: bool },
+    Pointer(bool),
 }

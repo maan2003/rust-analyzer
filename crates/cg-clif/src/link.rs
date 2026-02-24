@@ -182,6 +182,7 @@ mod tests {
             bodies: vec![],
             layouts: vec![],
             generic_fn_lookup: vec![],
+            adt_defs: vec![],
         };
         let data = postcard::to_allocvec(&mir_data).expect("serialize");
         let decoded: MirData = postcard::from_bytes(&data).expect("deserialize");

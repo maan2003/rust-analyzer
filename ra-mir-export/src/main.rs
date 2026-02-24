@@ -33,8 +33,8 @@ use rustc_middle::{mir, ty};
 use rustc_middle::ty::TypeVisitableExt;
 
 use ra_mir_types::{
-    CrateInfo, FnBody, GenericFnLookupEntry, GenericFnLookupKey, MirData, TypeLayoutEntry,
-    normalize_def_path,
+    AdtDefEntry, CrateInfo, FnBody, GenericFnLookupEntry, GenericFnLookupKey, MirData,
+    TypeLayoutEntry, normalize_def_path,
 };
 
 struct ExportCallbacks {
@@ -49,8 +49,8 @@ impl rustc_driver::Callbacks for ExportCallbacks {
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
         let crates = extract_crate_ids(tcx);
-        let (bodies, layouts, generic_fn_lookup) = extract_mir_bodies(tcx);
-        let mir_data = MirData { crates, bodies, layouts, generic_fn_lookup };
+        let (bodies, layouts, generic_fn_lookup, adt_defs) = extract_mir_bodies(tcx);
+        let mir_data = MirData { crates, bodies, layouts, generic_fn_lookup, adt_defs };
 
         // Write the mirdata file *inside* the callback, before rustc's delayed
         // ICE handler can kill the process.
@@ -91,12 +91,13 @@ fn extract_crate_ids(tcx: TyCtxt<'_>) -> Vec<CrateInfo> {
 // MIR body extraction
 // ---------------------------------------------------------------------------
 
-fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Vec<GenericFnLookupEntry>) {
+fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Vec<GenericFnLookupEntry>, Vec<AdtDefEntry>) {
     let mut bodies = Vec::new();
     let mut generic_fn_lookup = Vec::new();
     let mut stats = ExportStats::default();
     let mut visited = HashSet::new();
     let mut layout_table = LayoutTable::new();
+    let mut adt_table = AdtTable::new();
     let mut exported_def_ids = Vec::new();
 
     for &cnum in tcx.crates(()) {
@@ -112,6 +113,31 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
             &mut exported_def_ids,
             0,
         );
+    }
+
+    // Export methods from trait impls (e.g. Drop::drop, Clone::clone)
+    // which aren't visible as module children.
+    // Skip impls with const generic parameters to avoid rustc ICEs.
+    for &cnum in tcx.crates(()) {
+        for &impl_def_id in tcx.trait_impls_in_crate(cnum) {
+            let generics = tcx.generics_of(impl_def_id);
+            let has_const_param = generics.own_params.iter().any(|p| {
+                matches!(p.kind, rustc_middle::ty::GenericParamDefKind::Const { .. })
+            });
+            if has_const_param {
+                continue;
+            }
+            visit_impl_or_trait(
+                tcx,
+                impl_def_id,
+                &mut bodies,
+                &mut generic_fn_lookup,
+                &mut stats,
+                &mut visited,
+                &mut layout_table,
+                &mut exported_def_ids,
+            );
+        }
     }
 
     // Collect layouts for types that appear in monomorphized generic function instances.
@@ -135,7 +161,7 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
                 }
                 let normalized = tcx.try_normalize_erasing_regions(typing_env, local_decl.ty)
                     .unwrap_or(local_decl.ty);
-                export_type_layout_recursive(tcx, normalized, &mut layout_table, &mut visited_types);
+                export_type_layout_recursive(tcx, normalized, &mut layout_table, &mut adt_table, &mut visited_types);
             }
         }
     }
@@ -143,7 +169,7 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
 
     // Pass 2: collect layouts for monomorphized generic function instances
     let mono_layouts_before = layout_table.entries.len();
-    collect_mono_layouts(tcx, &exported_def_ids, &mut layout_table);
+    collect_mono_layouts(tcx, &exported_def_ids, &mut layout_table, &mut adt_table);
     let mono_inst_layouts = layout_table.entries.len() - mono_layouts_before;
 
     // Print stats
@@ -153,8 +179,9 @@ fn extract_mir_bodies(tcx: TyCtxt<'_>) -> (Vec<FnBody>, Vec<TypeLayoutEntry>, Ve
     );
     eprintln!("  Layout passes: +{} from local type walk, +{} from mono instances",
         mono_local_layouts, mono_inst_layouts);
+    eprintln!("  ADT defs exported: {}", adt_table.entries.len());
 
-    (bodies, layout_table.entries, generic_fn_lookup)
+    (bodies, layout_table.entries, generic_fn_lookup, adt_table.entries)
 }
 
 #[derive(Default)]
@@ -194,6 +221,31 @@ impl<'tcx> LayoutTable<'tcx> {
         });
         self.dedup.insert(ty, idx);
         Some(idx)
+    }
+}
+
+struct AdtTable<'tcx> {
+    entries: Vec<AdtDefEntry>,
+    dedup: HashSet<DefId>,
+    _marker: std::marker::PhantomData<&'tcx ()>,
+}
+
+impl<'tcx> AdtTable<'tcx> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            dedup: HashSet::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn get_or_insert(&mut self, tcx: TyCtxt<'tcx>, adt_def: ty::AdtDef<'tcx>) {
+        let def_id = adt_def.did();
+        if !self.dedup.insert(def_id) {
+            return;
+        }
+        let entry = translate::translate_adt_def(tcx, adt_def);
+        self.entries.push(entry);
     }
 }
 
@@ -400,6 +452,7 @@ fn collect_mono_layouts<'tcx>(
     tcx: TyCtxt<'tcx>,
     exported_def_ids: &[DefId],
     layout_table: &mut LayoutTable<'tcx>,
+    adt_table: &mut AdtTable<'tcx>,
 ) {
     let typing_env = ty::TypingEnv::fully_monomorphized();
     let mut visited_types: HashSet<ty::Ty<'tcx>> = HashSet::new();
@@ -449,6 +502,7 @@ fn collect_mono_layouts<'tcx>(
                                 tcx,
                                 normalized,
                                 layout_table,
+                                adt_table,
                                 &mut visited_types,
                             );
                         }
@@ -463,10 +517,12 @@ fn collect_mono_layouts<'tcx>(
 ///
 /// Walks through ADT fields, ref/ptr pointees, array/slice elements, and tuple
 /// elements, computing and exporting layouts for each concrete type encountered.
+/// Also collects ADT definitions into adt_table for codegen-time layout computation.
 fn export_type_layout_recursive<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     layout_table: &mut LayoutTable<'tcx>,
+    adt_table: &mut AdtTable<'tcx>,
     visited: &mut HashSet<ty::Ty<'tcx>>,
 ) {
     if !visited.insert(ty) {
@@ -485,17 +541,19 @@ fn export_type_layout_recursive<'tcx>(
     let typing_env = ty::TypingEnv::fully_monomorphized();
     match ty.kind() {
         ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => {
-            export_type_layout_recursive(tcx, *inner, layout_table, visited);
+            export_type_layout_recursive(tcx, *inner, layout_table, adt_table, visited);
         }
         ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
-            export_type_layout_recursive(tcx, *elem, layout_table, visited);
+            export_type_layout_recursive(tcx, *elem, layout_table, adt_table, visited);
         }
         ty::TyKind::Tuple(tys) => {
             for t in tys.iter() {
-                export_type_layout_recursive(tcx, t, layout_table, visited);
+                export_type_layout_recursive(tcx, t, layout_table, adt_table, visited);
             }
         }
         ty::TyKind::Adt(adt_def, args) => {
+            // Export ADT definition for codegen-time layout computation
+            adt_table.get_or_insert(tcx, *adt_def);
             for variant in adt_def.variants() {
                 for field in &variant.fields {
                     let field_ty = field.ty(tcx, args);
@@ -505,7 +563,7 @@ fn export_type_layout_recursive<'tcx>(
                         tcx.try_normalize_erasing_regions(typing_env, field_ty)
                             .unwrap_or(field_ty)
                     };
-                    export_type_layout_recursive(tcx, normalized, layout_table, visited);
+                    export_type_layout_recursive(tcx, normalized, layout_table, adt_table, visited);
                 }
             }
         }

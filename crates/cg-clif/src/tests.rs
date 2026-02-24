@@ -2709,14 +2709,25 @@ fn generic_lookup_key_for_fn(
     })
 }
 
-/// Convert an r-a type to a mirdata GenericArg.
-fn ra_ty_to_mirdata_arg(
-    ty: hir_ty::next_solver::Ty<'_>,
-) -> ra_mir_types::GenericArg {
-    ra_mir_types::GenericArg::Ty(ra_ty_to_mirdata(ty))
+/// Context for converting r-a types to mirdata types.
+struct TyConvertCtx<'a> {
+    db: &'a dyn hir_ty::db::HirDatabase,
+    ext_crate_disambiguators: &'a std::collections::HashMap<String, u64>,
+    adt_hash_lookup: &'a std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
 }
 
-fn ra_ty_to_mirdata(ty: hir_ty::next_solver::Ty<'_>) -> ra_mir_types::Ty {
+/// Convert an r-a type to a mirdata GenericArg.
+fn ra_ty_to_mirdata_arg(
+    ctx: &TyConvertCtx<'_>,
+    ty: hir_ty::next_solver::Ty<'_>,
+) -> ra_mir_types::GenericArg {
+    ra_mir_types::GenericArg::Ty(ra_ty_to_mirdata(ctx, ty))
+}
+
+fn ra_ty_to_mirdata(
+    ctx: &TyConvertCtx<'_>,
+    ty: hir_ty::next_solver::Ty<'_>,
+) -> ra_mir_types::Ty {
     use hir_ty::next_solver::{IntoKind, TyKind};
     use hir_ty::primitive::{FloatTy, IntTy, UintTy};
     match ty.kind() {
@@ -2745,22 +2756,272 @@ fn ra_ty_to_mirdata(ty: hir_ty::next_solver::Ty<'_>) -> ra_mir_types::Ty {
                 hir_ty::next_solver::Mutability::Not => ra_mir_types::Mutability::Not,
                 hir_ty::next_solver::Mutability::Mut => ra_mir_types::Mutability::Mut,
             };
-            ra_mir_types::Ty::Ref(m, Box::new(ra_ty_to_mirdata(inner)))
+            ra_mir_types::Ty::Ref(m, Box::new(ra_ty_to_mirdata(ctx, inner)))
         }
         TyKind::RawPtr(inner, mutbl) => {
             let m = match mutbl {
                 hir_ty::next_solver::Mutability::Not => ra_mir_types::Mutability::Not,
                 hir_ty::next_solver::Mutability::Mut => ra_mir_types::Mutability::Mut,
             };
-            ra_mir_types::Ty::RawPtr(m, Box::new(ra_ty_to_mirdata(inner)))
+            ra_mir_types::Ty::RawPtr(m, Box::new(ra_ty_to_mirdata(ctx, inner)))
         }
         TyKind::Tuple(tys) if tys.is_empty() => ra_mir_types::Ty::Tuple(vec![]),
         TyKind::Tuple(tys) => {
-            ra_mir_types::Ty::Tuple(tys.iter().map(|t| ra_ty_to_mirdata(t)).collect())
+            ra_mir_types::Ty::Tuple(tys.iter().map(|t| ra_ty_to_mirdata(ctx, t)).collect())
         }
-        TyKind::Slice(inner) => ra_mir_types::Ty::Slice(Box::new(ra_ty_to_mirdata(inner))),
-        other => panic!("ra_ty_to_mirdata: unsupported type kind: {:?}", other),
+        TyKind::Slice(inner) => ra_mir_types::Ty::Slice(Box::new(ra_ty_to_mirdata(ctx, inner))),
+        TyKind::Adt(def, args) => {
+            let adt_id = def.inner().id;
+            let path = adt_display_path(ctx.db, adt_id);
+            let krate = match adt_id {
+                hir_def::AdtId::StructId(id) => id.krate(ctx.db),
+                hir_def::AdtId::EnumId(id) => id.krate(ctx.db),
+                hir_def::AdtId::UnionId(id) => id.krate(ctx.db),
+            };
+            let crate_name = krate
+                .extra_data(ctx.db)
+                .display_name
+                .as_ref()
+                .map(|dn| dn.crate_name().to_string())
+                .unwrap_or_default();
+            let stable_crate_id = ctx.ext_crate_disambiguators
+                .get(&crate_name)
+                .copied()
+                .unwrap_or(0);
+
+            let short_name = match adt_id {
+                hir_def::AdtId::StructId(id) => ctx.db.struct_signature(id).name.as_str().to_owned(),
+                hir_def::AdtId::EnumId(id) => ctx.db.enum_signature(id).name.as_str().to_owned(),
+                hir_def::AdtId::UnionId(id) => ctx.db.union_signature(id).name.as_str().to_owned(),
+            };
+            let hash = ctx.adt_hash_lookup
+                .get(&(stable_crate_id, path.clone()))
+                .or_else(|| ctx.adt_hash_lookup.get(&(stable_crate_id, short_name.clone())))
+                .copied()
+                .unwrap_or_else(|| {
+                    eprintln!("warning: no mirdata hash for ADT {path} / {short_name} (crate_id={stable_crate_id:#x})");
+                    (stable_crate_id, 0)
+                });
+            let generic_args = ra_generic_args_to_mirdata(ctx, args);
+            ra_mir_types::Ty::Adt(hash, path, generic_args)
+        }
+        TyKind::FnDef(def, args) => {
+            // For FnDef, we just need a hash that's consistent. Since we don't
+            // use FnDef for layout lookup (it's a ZST), a placeholder hash is OK.
+            let hash = (0u64, 0u64);
+            let generic_args = ra_generic_args_to_mirdata(ctx, args);
+            ra_mir_types::Ty::FnDef(hash, generic_args)
+        }
+        TyKind::Array(elem, len) => {
+            let n = crate::const_to_u64(len);
+            ra_mir_types::Ty::Array(
+                Box::new(ra_ty_to_mirdata(ctx, elem)),
+                n,
+            )
+        }
+        other => ra_mir_types::Ty::Opaque(format!("{:?}", other)),
     }
+}
+
+fn ra_generic_args_to_mirdata(
+    ctx: &TyConvertCtx<'_>,
+    args: hir_ty::next_solver::GenericArgs<'_>,
+) -> Vec<ra_mir_types::GenericArg> {
+    use hir_ty::next_solver::GenericArgKind;
+    args.as_ref()
+        .iter()
+        .filter_map(|arg| match arg.kind() {
+            GenericArgKind::Type(ty) => Some(ra_mir_types::GenericArg::Ty(
+                ra_ty_to_mirdata(ctx, ty),
+            )),
+            GenericArgKind::Lifetime(_) => Some(ra_mir_types::GenericArg::Lifetime),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build a lookup table: (stable_crate_id, adt_path) → DefPathHash
+/// from mirdata's layout entries and function bodies. Used to translate
+/// r-a ADT types to the same DefPathHash that rustc uses.
+///
+/// The `adt_path` is the full def path string (e.g. "alloc::alloc::Global").
+fn build_adt_hash_lookup(
+    mirdata: &ra_mir_types::MirData,
+) -> std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash> {
+    let mut map = std::collections::HashMap::new();
+    // From layout entries
+    for entry in &mirdata.layouts {
+        collect_adt_hashes_from_ty(&entry.ty, &mut map);
+    }
+    // From function body types (locals, projections, etc.)
+    for fb in &mirdata.bodies {
+        for local in &fb.body.locals {
+            collect_adt_hashes_from_ty(&local.ty, &mut map);
+        }
+        for bb in &fb.body.blocks {
+            for stmt in &bb.stmts {
+                collect_adt_hashes_from_stmt(stmt, &mut map);
+            }
+            collect_adt_hashes_from_terminator(&bb.terminator, &mut map);
+        }
+    }
+    map
+}
+
+fn collect_adt_hashes_from_stmt(
+    stmt: &ra_mir_types::Statement,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    match stmt {
+        ra_mir_types::Statement::Assign(place, rvalue) => {
+            collect_adt_hashes_from_place(place, map);
+            collect_adt_hashes_from_rvalue(rvalue, map);
+        }
+        ra_mir_types::Statement::SetDiscriminant { place, .. } |
+        ra_mir_types::Statement::Deinit(place) => {
+            collect_adt_hashes_from_place(place, map);
+        }
+        _ => {}
+    }
+}
+
+fn collect_adt_hashes_from_place(
+    place: &ra_mir_types::Place,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    for proj in &place.projections {
+        match proj {
+            ra_mir_types::Projection::Field(_, ty) | ra_mir_types::Projection::OpaqueCast(ty) => {
+                collect_adt_hashes_from_ty(ty, map);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_adt_hashes_from_rvalue(
+    rv: &ra_mir_types::Rvalue,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    match rv {
+        ra_mir_types::Rvalue::Cast(_, op, ty) => {
+            collect_adt_hashes_from_operand(op, map);
+            collect_adt_hashes_from_ty(ty, map);
+        }
+        ra_mir_types::Rvalue::Aggregate(kind, ops) => {
+            if let ra_mir_types::AggregateKind::Array(ty) = kind {
+                collect_adt_hashes_from_ty(ty, map);
+            }
+            for op in ops { collect_adt_hashes_from_operand(op, map); }
+        }
+        ra_mir_types::Rvalue::Use(op) | ra_mir_types::Rvalue::Repeat(op, _) |
+        ra_mir_types::Rvalue::UnaryOp(_, op) => {
+            collect_adt_hashes_from_operand(op, map);
+        }
+        ra_mir_types::Rvalue::BinaryOp(_, l, r) => {
+            collect_adt_hashes_from_operand(l, map);
+            collect_adt_hashes_from_operand(r, map);
+        }
+        _ => {}
+    }
+}
+
+fn collect_adt_hashes_from_operand(
+    op: &ra_mir_types::Operand,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    if let ra_mir_types::Operand::Constant(c) = op {
+        collect_adt_hashes_from_ty(&c.ty, map);
+    }
+}
+
+fn collect_adt_hashes_from_terminator(
+    term: &ra_mir_types::Terminator,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    match term {
+        ra_mir_types::Terminator::Call { func, args, dest, .. } => {
+            collect_adt_hashes_from_operand(func, map);
+            for arg in args { collect_adt_hashes_from_operand(arg, map); }
+            collect_adt_hashes_from_place(dest, map);
+        }
+        ra_mir_types::Terminator::SwitchInt { discr, .. } => {
+            collect_adt_hashes_from_operand(discr, map);
+        }
+        _ => {}
+    }
+}
+
+fn collect_adt_hashes_from_ty(
+    ty: &ra_mir_types::Ty,
+    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
+) {
+    match ty {
+        ra_mir_types::Ty::Adt(hash, name, args) => {
+            map.entry((hash.0, name.clone())).or_insert(*hash);
+            // Also insert with alternative path formats for re-export matching.
+            // E.g. "std::alloc::Global" also gets indexed under the defining
+            // crate's module path. We do this by extracting the short name
+            // and inserting under all possible crate prefixes.
+            if let Some(short_name) = name.rsplit("::").next() {
+                // Insert with just the crate_id + short name as fallback
+                map.entry((hash.0, short_name.to_string())).or_insert(*hash);
+            }
+            for arg in args {
+                if let ra_mir_types::GenericArg::Ty(t) = arg {
+                    collect_adt_hashes_from_ty(t, map);
+                }
+            }
+        }
+        ra_mir_types::Ty::Ref(_, inner) | ra_mir_types::Ty::RawPtr(_, inner) => {
+            collect_adt_hashes_from_ty(inner, map);
+        }
+        ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => {
+            collect_adt_hashes_from_ty(elem, map);
+        }
+        ra_mir_types::Ty::Tuple(tys) => {
+            for t in tys { collect_adt_hashes_from_ty(t, map); }
+        }
+        ra_mir_types::Ty::FnPtr(params, ret) => {
+            for p in params { collect_adt_hashes_from_ty(p, map); }
+            collect_adt_hashes_from_ty(ret, map);
+        }
+        _ => {}
+    }
+}
+
+/// Build a display path for an ADT, e.g. "alloc::alloc::Global".
+fn adt_display_path(db: &dyn hir_ty::db::HirDatabase, adt_id: hir_def::AdtId) -> String {
+    let adt_name = match adt_id {
+        hir_def::AdtId::StructId(id) => db.struct_signature(id).name.as_str().to_owned(),
+        hir_def::AdtId::EnumId(id) => db.enum_signature(id).name.as_str().to_owned(),
+        hir_def::AdtId::UnionId(id) => db.union_signature(id).name.as_str().to_owned(),
+    };
+    let module = match adt_id {
+        hir_def::AdtId::StructId(id) => id.module(db),
+        hir_def::AdtId::EnumId(id) => id.module(db),
+        hir_def::AdtId::UnionId(id) => id.module(db),
+    };
+    let mut segments = vec![adt_name];
+    let mut current = module;
+    loop {
+        if let Some(name) = current.name(db) {
+            segments.push(name.as_str().to_owned());
+        }
+        match current.containing_module(db) {
+            Some(parent) => current = parent,
+            None => {
+                let krate = current.krate(db);
+                let extra = krate.extra_data(db);
+                if let Some(dn) = &extra.display_name {
+                    segments.push(dn.crate_name().to_string());
+                }
+                break;
+            }
+        }
+    }
+    segments.reverse();
+    segments.join("::")
 }
 
 /// Seamless JIT harness: compile user code that calls `std::` functions.
@@ -2776,9 +3037,12 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
     let (mirdata, layouts) = crate::link::load_mirdata_layouts(
         &mirdata_dir.path().join("sysroot.mirdata"),
     ).expect("failed to load mirdata");
-    let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
+    let mut ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
         &mirdata.layouts, &layouts,
     );
+    let adt_defs: std::collections::HashMap<ra_mir_types::DefPathHash, ra_mir_types::AdtDefEntry> =
+        mirdata.adt_defs.iter().map(|a| (a.def_path_hash, a.clone())).collect();
+    let adt_hash_lookup = build_adt_hash_lookup(&mirdata);
     let mut mirdata_by_hash: std::collections::HashMap<ra_mir_types::DefPathHash, &ra_mir_types::FnBody> =
         std::collections::HashMap::new();
     for fb in &mirdata.bodies {
@@ -2889,17 +3153,23 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             };
 
             // Convert r-a generic args to mirdata args
+            let ty_ctx = TyConvertCtx {
+                db: &db,
+                ext_crate_disambiguators: &ext_crate_disambiguators,
+                adt_hash_lookup: &adt_hash_lookup,
+            };
             let mirdata_args: Vec<_> = generic_args
                 .as_ref()
                 .iter()
                 .filter_map(|arg| match arg.kind() {
-                    GenericArgKind::Type(ty) => Some(ra_ty_to_mirdata_arg(ty)),
+                    GenericArgKind::Type(ty) => Some(ra_ty_to_mirdata_arg(&ty_ctx, ty)),
                     _ => None,
                 })
                 .collect();
 
             // Monomorphize and compile
             let mono_body = fb.body.subst(&mirdata_args);
+            crate::layout::ensure_body_layouts(&mono_body, &adt_defs, &mut ty_layouts, &dl);
             crate::mirdata_codegen::compile_mirdata_body(
                 &mut jit_module,
                 &*isa,
@@ -2927,7 +3197,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 cranelift_module::Linkage::Export, local_crate,
                 &ext_crate_disambiguators, &[],
             )
-            .unwrap_or_else(|e| panic!("compiling fn failed: {e}"));
+            .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"));
         }
         for (closure_id, closure_subst) in &reachable_closures {
             let body = db
