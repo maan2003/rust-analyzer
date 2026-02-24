@@ -287,6 +287,7 @@ dependencies = [
  "serde",
  "span",
  "target-lexicon",
+ "tempfile",
  "test-fixture",
  "test-utils",
  "triomphe",

@@ -2363,16 +2363,47 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 //
 // User code writes real Rust with `std::` calls. The harness:
-//   1. Loads real sysroot sources (core, alloc, std) into r-a's database
-//   2. Compiles user code via r-a MIR (collect_reachable_fns)
-//   3. Cross-crate generic calls → compiled from mirdata with matching v0 names
-//   4. Cross-crate non-generic calls → resolved via dlopen'd libstd.so
-//
-// Prerequisites:
-//   cd ra-mir-export && cargo run --release -- -o /tmp/sysroot.mirdata
+//   1. Generates mirdata by running ra-mir-export (cached across tests)
+//   2. Loads real sysroot sources (core, alloc, std) into r-a's database
+//   3. Compiles user code via r-a MIR (collect_reachable_fns)
+//   4. Cross-crate generic calls → compiled from mirdata with matching v0 names
+//   5. Cross-crate non-generic calls → resolved via dlopen'd libstd.so
 //
 // Run:
-//   RA_MIRDATA=/tmp/sysroot.mirdata cargo test -p cg-clif --lib mirdata_jit -- --ignored --nocapture
+//   cargo test -p cg-clif --lib mirdata_jit -- --nocapture
+
+/// Generate mirdata by running ra-mir-export into a temp directory.
+/// Returns a `TempDir` (cleaned up on drop). The mirdata file is at
+/// `<dir>/sysroot.mirdata`.
+fn generate_mirdata() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mirdata = dir.path().join("sysroot.mirdata");
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ra_mir_export_manifest = manifest_dir
+        .parent().unwrap()  // crates/
+        .parent().unwrap()  // repo root
+        .join("ra-mir-export/Cargo.toml");
+    assert!(ra_mir_export_manifest.exists(),
+        "ra-mir-export not found at {}", ra_mir_export_manifest.display());
+
+    let output = std::process::Command::new("cargo")
+        .args(["run", "--manifest-path"])
+        .arg(&ra_mir_export_manifest)
+        .arg("--")
+        .arg("-o")
+        .arg(&mirdata)
+        .output()
+        .expect("failed to run cargo");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprint!("{}", stderr);
+
+    assert!(mirdata.exists(),
+        "ra-mir-export did not produce {}", mirdata.display());
+
+    dir
+}
 
 unsafe extern "C" {
     fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
@@ -2695,13 +2726,11 @@ fn ra_ty_to_mirdata(ty: hir_ty::next_solver::Ty<'_>) -> ra_mir_types::Ty {
 fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
     use hir_ty::next_solver::{GenericArgKind, IntoKind};
 
-    // Load mirdata
-    let mirdata_path = std::env::var("RA_MIRDATA")
-        .unwrap_or_else(|_| "/tmp/sysroot.mirdata".to_string());
+    // Generate and load mirdata
+    let mirdata_dir = generate_mirdata();
     let (mirdata, layouts) = crate::link::load_mirdata_layouts(
-        std::path::Path::new(&mirdata_path),
-    )
-    .expect("mirdata not available — run ra-mir-export first");
+        &mirdata_dir.path().join("sysroot.mirdata"),
+    ).expect("failed to load mirdata");
     let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
         &mirdata.layouts, &layouts,
     );
@@ -2862,7 +2891,6 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
 }
 
 #[test]
-#[ignore]
 fn mirdata_jit_identity_i32() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2876,7 +2904,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore]
 fn mirdata_jit_ptr_write_read_i32() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2894,7 +2921,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore]
 fn mirdata_jit_mem_replace_i32() {
     let result: i32 = jit_run_with_std(
         r#"
