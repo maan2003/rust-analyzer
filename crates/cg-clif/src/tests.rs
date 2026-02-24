@@ -6,7 +6,7 @@ use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Nonce, RootQueryDb,
     SourceDatabase, SourceRoot, SourceRootId, SourceRootInput,
 };
-use hir_def::{HasModule, ModuleId, db::DefDatabase, nameres::crate_def_map};
+use hir_def::{HasModule, Lookup, ModuleId, db::DefDatabase, nameres::crate_def_map};
 use hir_expand::EditionedFileId;
 use rustc_abi::TargetDataLayout;
 use salsa::Durability;
@@ -2642,11 +2642,11 @@ fn load_sysroot_and_user_code(
 fn fn_display_path(db: &dyn hir_ty::db::HirDatabase, func_id: hir_def::FunctionId) -> String {
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
     let module = func_id.module(db);
-    let mut segments = vec![fn_name];
+    let mut module_segments = Vec::new();
     let mut current = module;
     loop {
         if let Some(name) = current.name(db) {
-            segments.push(name.as_str().to_owned());
+            module_segments.push(name.as_str().to_owned());
         }
         match current.containing_module(db) {
             Some(parent) => current = parent,
@@ -2654,14 +2654,73 @@ fn fn_display_path(db: &dyn hir_ty::db::HirDatabase, func_id: hir_def::FunctionI
                 let krate = current.krate(db);
                 let extra = krate.extra_data(db);
                 if let Some(dn) = &extra.display_name {
-                    segments.push(dn.crate_name().to_string());
+                    module_segments.push(dn.crate_name().to_string());
                 }
                 break;
             }
         }
     }
-    segments.reverse();
-    segments.join("::")
+    module_segments.reverse();
+
+    if let hir_def::ItemContainerId::ImplId(impl_id) = func_id.lookup(db).container {
+        if let Some(self_ty_name) = impl_self_ty_name(db, impl_id) {
+            return format!("{}::{}::{}", module_segments.join("::"), self_ty_name, fn_name);
+        }
+    }
+
+    format!("{}::{}", module_segments.join("::"), fn_name)
+}
+
+/// Best-effort name for an impl self type, for path matching against mirdata.
+fn impl_self_ty_name(db: &dyn hir_ty::db::HirDatabase, impl_id: hir_def::ImplId) -> Option<String> {
+    use hir_ty::next_solver::{IntoKind, TyKind};
+
+    let mut ty = db.impl_self_ty(impl_id).skip_binder();
+    loop {
+        match ty.kind() {
+            TyKind::Adt(adt_def, _) => {
+                let adt_id = adt_def.inner().id;
+                let name = match adt_id {
+                    hir_def::AdtId::StructId(id) => db.struct_signature(id).name.as_str().to_owned(),
+                    hir_def::AdtId::EnumId(id) => db.enum_signature(id).name.as_str().to_owned(),
+                    hir_def::AdtId::UnionId(id) => db.union_signature(id).name.as_str().to_owned(),
+                };
+                return Some(name);
+            }
+            TyKind::Ref(_, inner, _) => ty = inner,
+            TyKind::RawPtr(inner, _) => ty = inner,
+            _ => return None,
+        }
+    }
+}
+
+/// Remove generic argument lists (`::<...>` / `<...>`) from a def path.
+fn strip_generic_args(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut depth = 0u32;
+
+    for ch in path.chars() {
+        match ch {
+            '<' => {
+                if depth == 0 && out.ends_with("::") {
+                    out.pop();
+                    out.pop();
+                }
+                depth += 1;
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth == 0 => {
+                if !ch.is_whitespace() {
+                    out.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 /// Convert an r-a type to a mirdata GenericArg.
@@ -2724,7 +2783,7 @@ fn ra_ty_to_mirdata(ty: hir_ty::next_solver::Ty<'_>) -> ra_mir_types::Ty {
 /// generic calls are compiled from mirdata, non-generic calls resolved
 /// via libstd.so.
 fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
-    use hir_ty::next_solver::{GenericArgKind, IntoKind};
+    use hir_ty::next_solver::GenericArgKind;
 
     // Generate and load mirdata
     let mirdata_dir = generate_mirdata();
@@ -2734,6 +2793,14 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
     let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
         &mirdata.layouts, &layouts,
     );
+    let mut mirdata_by_name: std::collections::HashMap<String, Vec<&ra_mir_types::FnBody>> =
+        std::collections::HashMap::new();
+    for fb in &mirdata.bodies {
+        mirdata_by_name
+            .entry(strip_generic_args(&fb.name))
+            .or_default()
+            .push(fb);
+    }
 
     // Extract crate disambiguators from mirdata
     let mut ext_crate_disambiguators = std::collections::HashMap::new();
@@ -2797,12 +2864,36 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
 
             // Find the mirdata body by display path.
             let path = fn_display_path(&db, *func_id);
-            let fb = mirdata.bodies.iter()
-                .find(|fb| fb.name == path)
+            let normalized_path = strip_generic_args(&path);
+            let candidates = mirdata_by_name
+                .get(&normalized_path)
                 .unwrap_or_else(|| panic!(
-                    "mirdata body not found for cross-crate generic: {} (mangled: {})",
-                    path, mangled
+                    "mirdata body not found for cross-crate generic: {} (normalized: {}, mangled: {})",
+                    path, normalized_path, mangled
                 ));
+
+            let mut candidates = candidates.clone();
+            if candidates.len() > 1 {
+                let by_param_count: Vec<_> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|fb| fb.num_generic_params == mirdata_args_len(generic_args))
+                    .collect();
+                if by_param_count.len() == 1 {
+                    candidates = by_param_count;
+                }
+            }
+
+            let fb = match candidates.as_slice() {
+                [fb] => *fb,
+                _ => {
+                    let names: Vec<_> = candidates.iter().map(|fb| fb.name.as_str()).collect();
+                    panic!(
+                        "ambiguous mirdata body match for cross-crate generic: {} (normalized: {}, candidates: {:?})",
+                        path, normalized_path, names
+                    );
+                }
+            };
 
             // Convert r-a generic args to mirdata args
             let mirdata_args: Vec<_> = generic_args
@@ -2888,6 +2979,16 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             f()
         }
     })
+}
+
+fn mirdata_args_len(generic_args: &hir_ty::next_solver::StoredGenericArgs) -> usize {
+    use hir_ty::next_solver::GenericArgKind;
+
+    generic_args
+        .as_ref()
+        .iter()
+        .filter(|arg| matches!(arg.kind(), GenericArgKind::Type(_)))
+        .count()
 }
 
 #[test]

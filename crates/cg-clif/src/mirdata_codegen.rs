@@ -23,7 +23,7 @@ use hir_ty::layout::Layout;
 
 use crate::pointer::Pointer;
 use crate::value_and_place::{CPlace, CValue};
-use crate::{FunctionCx, MirSource, pointer_ty, scalar_to_clif_type};
+use crate::{FunctionCx, MirSource, lookup_mirdata_layout, pointer_ty, scalar_to_clif_type};
 
 type LayoutArc = TArc<Layout>;
 
@@ -55,8 +55,8 @@ fn resolve_local_layout(
         }
     }
     // Fall back to ty_layouts lookup
-    if let Some(layout) = ty_layouts.get(&local.ty) {
-        return Ok(layout.clone());
+    if let Some(layout) = lookup_mirdata_layout(ty_layouts, &local.ty) {
+        return Ok(layout);
     }
     Err(format!("no layout for type: {:?}", local.ty))
 }
