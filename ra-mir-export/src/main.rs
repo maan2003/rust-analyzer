@@ -274,7 +274,13 @@ fn try_export_fn<'tcx>(
         let body = tcx.optimized_mir(def_id);
         let translated = translate::translate_body(tcx, body);
         let hash = translate::def_path_hash(tcx, def_id);
-        let name = tcx.def_path_str(def_id);
+        // Use with_no_visible_paths to get the definition-site path
+        // (e.g. core::convert::identity) instead of the re-export path
+        // (e.g. std::convert::identity). This matches how r-a resolves
+        // functions to their defining crate.
+        let name = rustc_middle::ty::print::with_no_visible_paths!(
+            tcx.def_path_str(def_id)
+        );
         let num_generic_params = tcx.generics_of(def_id).count();
 
         FnBody {

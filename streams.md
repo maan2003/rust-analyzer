@@ -1,5 +1,4 @@
-- mir improvements
-- codegen improvement
-- rustc v0 mangler
-- mir exporter
-- salsa parallelism check
+- mir generation improvements
+- mircodegen improvement
+- mir exporter improvements
+- normal codegen improvement
