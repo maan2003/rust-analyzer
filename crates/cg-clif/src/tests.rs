@@ -2362,9 +2362,9 @@ fn foo() -> i32 {
 // Mirdata + JIT integration harness
 // ---------------------------------------------------------------------------
 //
-// Tests the full pipeline: load sysroot .mirdata → monomorphize generics →
-// compile via mirdata codegen → JIT-execute. Non-generic sysroot symbols
-// are resolved by dlopen'ing libstd.so into the process.
+// Combines r-a MIR compilation (user code) with mirdata-compiled sysroot
+// generics in the same JIT module. User code declares mirdata functions
+// via `extern "C"` and calls them normally.
 //
 // Prerequisites:
 //   cd ra-mir-export && cargo run --release -- -o /tmp/sysroot.mirdata
@@ -2376,332 +2376,217 @@ unsafe extern "C" {
     fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
 }
 
-/// Environment for JIT-executing mirdata sysroot functions.
-///
-/// Loads the `.mirdata` file and provides helpers for finding,
-/// monomorphizing, compiling, and executing specific sysroot functions.
-///
-/// Functions are compiled on demand — no upfront compilation of all 14k bodies.
-/// The fn_registry is empty initially; each compiled function is registered so
-/// that subsequent compilations can reference it as a callee.
-struct SysrootJitEnv {
-    module: cranelift_jit::JITModule,
-    isa: std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>,
-    dl: TargetDataLayout,
-    mirdata: ra_mir_types::MirData,
-    layouts: Vec<crate::LayoutArc>,
-    ty_layouts: std::collections::HashMap<ra_mir_types::Ty, crate::LayoutArc>,
-    fn_registry: std::collections::HashMap<(u64, u64), cranelift_module::FuncId>,
-    body_map: std::collections::HashMap<(u64, u64), usize>,
+fn load_libstd_global() {
+    let libdir = crate::link::find_target_libdir().expect("rustc not found");
+    let libstd = crate::link::find_libstd_so(&libdir).expect("libstd.so not found");
+    unsafe {
+        let path = std::ffi::CString::new(
+            libstd.to_str().expect("non-UTF8 libstd path"),
+        )
+        .unwrap();
+        let handle = dlopen(path.as_ptr(), 1 | 0x100); // RTLD_LAZY | RTLD_GLOBAL
+        assert!(!handle.is_null(), "dlopen({}) failed", libstd.display());
+    }
 }
 
-impl SysrootJitEnv {
-    /// Create a new environment. Returns `None` if mirdata is not available.
-    fn new() -> Option<Self> {
-        let mirdata_path = std::env::var("RA_MIRDATA")
-            .unwrap_or_else(|_| "/tmp/sysroot.mirdata".to_string());
-        let (mirdata, layouts) = crate::link::load_mirdata_layouts(
-            std::path::Path::new(&mirdata_path),
-        ).ok()?;
+/// A monomorphized sysroot function to compile from mirdata and link into
+/// the JIT module. The `symbol` must match the `extern "C"` declaration
+/// in user code.
+struct StdImport {
+    /// Mirdata function name, e.g. `"std::convert::identity"`
+    mirdata_name: &'static str,
+    /// Symbol name exposed in the JIT module — must match the `extern "C"`
+    /// declaration in the user source.
+    symbol: &'static str,
+    /// Generic type arguments for monomorphization.
+    type_args: Vec<ra_mir_types::GenericArg>,
+}
 
-        let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
-            &mirdata.layouts, &layouts,
-        );
+fn ty_i32() -> ra_mir_types::GenericArg {
+    ra_mir_types::GenericArg::Ty(ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32))
+}
 
-        // Load libstd.so into the process so the JIT can resolve non-generic symbols
-        Self::load_libstd();
+/// JIT-compile user code (via r-a) together with monomorphized sysroot
+/// generics (via mirdata) in a single module, then execute `entry`.
+///
+/// User code should declare the sysroot functions as `extern "C"` with
+/// the symbol names specified in `imports`.
+fn jit_run_with_mirdata<R: Copy>(src: &str, entry: &str, imports: &[StdImport]) -> R {
+    // --- Load mirdata ---
+    let mirdata_path = std::env::var("RA_MIRDATA")
+        .unwrap_or_else(|_| "/tmp/sysroot.mirdata".to_string());
+    let (mirdata, layouts) = crate::link::load_mirdata_layouts(
+        std::path::Path::new(&mirdata_path),
+    )
+    .expect("mirdata not available — run ra-mir-export first");
+    let ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
+        &mirdata.layouts, &layouts,
+    );
 
+    load_libstd_global();
+
+    // --- Build JIT module ---
+    let full_src = fixture_src(src);
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
         let isa = crate::build_host_isa(false);
-        let dl = TargetDataLayout::parse_from_llvm_datalayout_string(
-            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-            rustc_abi::AddressSpace(0),
-        )
-        .map_err(|_| "failed to parse data layout")
-        .unwrap();
-        let jit_builder = cranelift_jit::JITBuilder::with_isa(
+        let empty_map = std::collections::HashMap::new();
+
+        let mut jit_builder = cranelift_jit::JITBuilder::with_isa(
             isa.clone(),
             cranelift_module::default_libcall_names(),
         );
-        let module = cranelift_jit::JITModule::new(jit_builder);
+        jit_builder.symbol("fmodf", fmodf as *const u8);
+        jit_builder.symbol("fmod", fmod as *const u8);
+        let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
-        // Build body_map: def_path_hash → index
-        let mut body_map = std::collections::HashMap::new();
-        for (i, fb) in mirdata.bodies.iter().enumerate() {
-            body_map.insert(fb.def_path_hash, i);
-        }
-
+        // --- Compile mirdata imports ---
         let fn_registry = std::collections::HashMap::new();
-
-        eprintln!(
-            "SysrootJitEnv: {} bodies, {} layouts loaded",
-            mirdata.bodies.len(), mirdata.layouts.len(),
-        );
-
-        Some(Self { module, isa, dl, mirdata, layouts, ty_layouts, fn_registry, body_map })
-    }
-
-    fn load_libstd() {
-        let libdir = crate::link::find_target_libdir().expect("rustc not found");
-        let libstd = crate::link::find_libstd_so(&libdir).expect("libstd.so not found");
-        unsafe {
-            let path = std::ffi::CString::new(
-                libstd.to_str().expect("non-UTF8 libstd path"),
+        for imp in imports {
+            let (_, fb) = mirdata.bodies.iter().enumerate()
+                .find(|(_, fb)| fb.name == imp.mirdata_name)
+                .unwrap_or_else(|| panic!("{} not found in mirdata", imp.mirdata_name));
+            let mono_body = fb.body.subst(&imp.type_args);
+            crate::mirdata_codegen::compile_mirdata_body(
+                &mut jit_module, &*isa,
+                &TargetDataLayout::parse_from_llvm_datalayout_string(
+                    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+                    rustc_abi::AddressSpace(0),
+                ).map_err(|_| "dl").unwrap(),
+                &mono_body, &layouts, imp.symbol,
+                cranelift_module::Linkage::Export,
+                &fn_registry, &ty_layouts,
             )
-            .unwrap();
-            // RTLD_LAZY=1, RTLD_GLOBAL=0x100: load symbols into global namespace
-            // so the JIT's fallback dlsym(RTLD_DEFAULT, ...) can find them.
-            let handle = dlopen(path.as_ptr(), 1 | 0x100);
-            assert!(!handle.is_null(), "dlopen({}) failed", libstd.display());
+            .unwrap_or_else(|e| panic!("compiling {} failed: {e}", imp.mirdata_name));
         }
-    }
 
-    /// Find a function by exact name.
-    fn find_fn(&self, name: &str) -> Option<(usize, &ra_mir_types::FnBody)> {
-        self.mirdata.bodies.iter().enumerate().find(|(_, fb)| fb.name == name)
-    }
-
-    /// Find functions whose name contains the given pattern.
-    fn find_fns_containing(&self, pattern: &str) -> Vec<(usize, &ra_mir_types::FnBody)> {
-        self.mirdata.bodies.iter().enumerate()
-            .filter(|(_, fb)| fb.name.contains(pattern))
-            .collect()
-    }
-
-    /// Compile a non-generic mirdata function.
-    fn compile_nongeneric(&mut self, idx: usize) -> Result<cranelift_module::FuncId, String> {
-        let fb = &self.mirdata.bodies[idx];
-        let fn_name = format!(
-            "__mirdata_{}_{}",
-            idx,
-            fb.name.replace(|c: char| !c.is_alphanumeric(), "_"),
-        );
-        crate::mirdata_codegen::compile_mirdata_fn(
-            &mut self.module, &*self.isa, &self.dl,
-            fb, &self.layouts, &fn_name,
-            cranelift_module::Linkage::Local,
-            &self.fn_registry, &self.ty_layouts,
-        )
-    }
-
-    /// Monomorphize a generic function and compile it.
-    fn compile_mono(
-        &mut self,
-        idx: usize,
-        args: &[ra_mir_types::GenericArg],
-    ) -> Result<cranelift_module::FuncId, String> {
-        let fb = &self.mirdata.bodies[idx];
-        let mono_body = fb.body.subst(args);
-        let inst = crate::mirdata_codegen::MonoInstance {
-            def_path_hash: fb.def_path_hash,
-            args: args.to_vec(),
-        };
-        let mono_name = format!(
-            "__mono_test_{}_{:x}",
-            fb.name.replace(|c: char| !c.is_alphanumeric(), "_"),
-            inst.registry_key().0,
-        );
-
-        let func_id = crate::mirdata_codegen::compile_mirdata_body(
-            &mut self.module, &*self.isa, &self.dl,
-            &mono_body, &self.layouts, &mono_name,
-            cranelift_module::Linkage::Export,
-            &self.fn_registry, &self.ty_layouts,
-        )?;
-
-        self.fn_registry.insert(inst.registry_key(), func_id);
-        Ok(func_id)
-    }
-
-    /// Finalize all compiled code, making it executable.
-    fn finalize(&mut self) {
-        self.module.finalize_definitions().unwrap();
-    }
-
-    /// Get the native function pointer for a compiled function.
-    fn get_ptr(&self, func_id: cranelift_module::FuncId) -> *const u8 {
-        self.module.get_finalized_function(func_id)
-    }
-}
-
-#[test]
-#[ignore]
-fn mirdata_jit_list_simple_generics() {
-    // Discovery test: list generic functions with few type params and simple signatures.
-    let env = match SysrootJitEnv::new() {
-        Some(env) => env,
-        None => { eprintln!("skipping: mirdata not available"); return; }
-    };
-
-    // Search for specific patterns to find good test candidates
-    let patterns = &["ptr::read", "ptr::write", "convert::identity", "mem::swap",
-                     "mem::replace", "ManuallyDrop", "Option::unwrap", "cmp::min"];
-    for pat in patterns {
-        let matches = env.find_fns_containing(pat);
-        if matches.is_empty() {
-            eprintln!("  {pat}: NOT FOUND");
-        } else {
-            for (_, fb) in &matches {
-                eprintln!(
-                    "  {} (params={}, locals={}, blocks={})",
-                    fb.name, fb.num_generic_params, fb.body.locals.len(), fb.body.blocks.len(),
-                );
-            }
+        // --- Compile user code (r-a MIR) ---
+        let entry_func_id = find_fn(&db, file_id, entry);
+        let local_crate = entry_func_id.krate(&db);
+        let env = hir_ty::ParamEnvAndCrate {
+            param_env: db.trait_environment(entry_func_id.into()),
+            krate: local_crate,
         }
-    }
+        .store();
 
-    // Also show the simplest generics (1 block, 1-2 type params)
-    eprintln!("\n--- Simplest generics (1 block) ---");
-    let mut count = 0;
-    for (_, fb) in env.mirdata.bodies.iter().enumerate() {
-        if fb.num_generic_params == 0 || fb.num_generic_params > 2 {
-            continue;
+        let (reachable_fns, reachable_closures, drop_types) =
+            crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
+
+        let dl = get_target_data_layout(&db, entry_func_id);
+        for (func_id, generic_args) in &reachable_fns {
+            let fn_name = crate::symbol_mangling::mangle_function(
+                &db, *func_id, generic_args.as_ref(), &empty_map,
+            );
+            let body = db
+                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                .unwrap_or_else(|e| panic!("MIR error for {fn_name}: {:?}", e));
+            crate::compile_fn(
+                &mut jit_module, &*isa, &db, &dl, &env, &body, &fn_name,
+                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+            )
+            .unwrap_or_else(|e| panic!("compiling fn failed: {e}"));
         }
-        if fb.body.blocks.len() != 1 {
-            continue;
+        for (closure_id, closure_subst) in &reachable_closures {
+            let body = db
+                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
+                .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
+            let closure_name = crate::symbol_mangling::mangle_closure(&db, *closure_id, &empty_map);
+            crate::compile_fn(
+                &mut jit_module, &*isa, &db, &dl, &env, &body, &closure_name,
+                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+            )
+            .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
         }
-        eprintln!(
-            "  {} (params={}, locals={}, blocks={})",
-            fb.name, fb.num_generic_params, fb.body.locals.len(), fb.body.blocks.len(),
-        );
-        count += 1;
-        if count >= 30 { break; }
-    }
+        for ty in &drop_types {
+            crate::compile_drop_in_place(
+                &mut jit_module, &*isa, &db, &dl, &env, ty,
+                local_crate, &empty_map,
+            )
+            .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
+        }
+
+        // --- Finalize & execute ---
+        jit_module.finalize_definitions().unwrap();
+
+        let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
+        let entry_mangled = mangled_name(&db, entry_func_id);
+        let eid = jit_module
+            .declare_function(&entry_mangled, cranelift_module::Linkage::Import, &sig)
+            .expect("declare entry");
+        let code_ptr = jit_module.get_finalized_function(eid);
+        unsafe {
+            let f: extern "C" fn() -> R = std::mem::transmute(code_ptr);
+            f()
+        }
+    })
 }
 
 #[test]
 #[ignore]
 fn mirdata_jit_identity_i32() {
-    // Monomorphize core::convert::identity for i32 and call it.
-    let mut env = match SysrootJitEnv::new() {
-        Some(env) => env,
-        None => { eprintln!("skipping: mirdata not available"); return; }
-    };
-
-    let (idx, fb) = env.find_fn("std::convert::identity")
-        .expect("std::convert::identity not found in mirdata");
-    eprintln!("Found: {} (generic_params={})", fb.name, fb.num_generic_params);
-    assert!(fb.num_generic_params > 0, "identity should be generic");
-
-    // Monomorphize for T = i32
-    let args = vec![ra_mir_types::GenericArg::Ty(
-        ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32),
-    )];
-    let func_id = env.compile_mono(idx, &args)
-        .expect("compile_mono failed");
-
-    env.finalize();
-    let code = env.get_ptr(func_id);
-
-    // identity::<i32>(42) should return 42
-    unsafe {
-        let f: extern "C" fn(i32) -> i32 = std::mem::transmute(code);
-        let result = f(42);
-        eprintln!("identity::<i32>(42) = {result}");
-        assert_eq!(result, 42);
-    }
+    let result: i32 = jit_run_with_mirdata(
+        r#"
+extern "C" { fn identity(x: i32) -> i32; }
+fn foo() -> i32 {
+    unsafe { identity(42) }
 }
-
-#[test]
-#[ignore]
-fn mirdata_jit_ptr_read_i32() {
-    // Monomorphize core::ptr::read for i32: reads value from a pointer.
-    let mut env = match SysrootJitEnv::new() {
-        Some(env) => env,
-        None => { eprintln!("skipping: mirdata not available"); return; }
-    };
-
-    let (idx, fb) = env.find_fn("std::ptr::read")
-        .expect("std::ptr::read not found in mirdata");
-    eprintln!("Found: {} (generic_params={})", fb.name, fb.num_generic_params);
-
-    let args = vec![ra_mir_types::GenericArg::Ty(
-        ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32),
-    )];
-    let func_id = env.compile_mono(idx, &args)
-        .expect("compile_mono failed");
-
-    env.finalize();
-    let code = env.get_ptr(func_id);
-
-    // ptr::read::<i32>(&42) should return 42
-    unsafe {
-        let f: extern "C" fn(*const i32) -> i32 = std::mem::transmute(code);
-        let val: i32 = 42;
-        let result = f(&val as *const i32);
-        eprintln!("ptr::read::<i32>(&42) = {result}");
-        assert_eq!(result, 42);
-    }
+"#,
+        "foo",
+        &[StdImport {
+            mirdata_name: "std::convert::identity",
+            symbol: "identity",
+            type_args: vec![ty_i32()],
+        }],
+    );
+    assert_eq!(result, 42);
 }
 
 #[test]
 #[ignore]
 fn mirdata_jit_ptr_write_read_i32() {
-    // Monomorphize ptr::write and ptr::read for i32: write then read back.
-    let mut env = match SysrootJitEnv::new() {
-        Some(env) => env,
-        None => { eprintln!("skipping: mirdata not available"); return; }
-    };
-
-    // Compile ptr::write::<i32>
-    let (write_idx, _) = env.find_fn("std::ptr::write")
-        .expect("std::ptr::write not found");
-    let i32_arg = vec![ra_mir_types::GenericArg::Ty(
-        ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32),
-    )];
-    let write_fid = env.compile_mono(write_idx, &i32_arg)
-        .expect("compile ptr::write failed");
-
-    // Compile ptr::read::<i32>
-    let (read_idx, _) = env.find_fn("std::ptr::read")
-        .expect("std::ptr::read not found");
-    let read_fid = env.compile_mono(read_idx, &i32_arg)
-        .expect("compile ptr::read failed");
-
-    env.finalize();
-
+    let result: i32 = jit_run_with_mirdata(
+        r#"
+extern "C" {
+    fn ptr_write(dst: *mut i32, val: i32);
+    fn ptr_read(src: *const i32) -> i32;
+}
+fn foo() -> i32 {
+    let mut slot: i32 = 0;
     unsafe {
-        let write_fn: extern "C" fn(*mut i32, i32) =
-            std::mem::transmute(env.get_ptr(write_fid));
-        let read_fn: extern "C" fn(*const i32) -> i32 =
-            std::mem::transmute(env.get_ptr(read_fid));
-
-        let mut slot: i32 = 0;
-        write_fn(&mut slot as *mut i32, 99);
-        let result = read_fn(&slot as *const i32);
-        eprintln!("write(99) then read() = {result}");
-        assert_eq!(result, 99);
+        ptr_write(&mut slot as *mut i32, 99);
+        ptr_read(&slot as *const i32)
     }
+}
+"#,
+        "foo",
+        &[
+            StdImport { mirdata_name: "std::ptr::write", symbol: "ptr_write", type_args: vec![ty_i32()] },
+            StdImport { mirdata_name: "std::ptr::read", symbol: "ptr_read", type_args: vec![ty_i32()] },
+        ],
+    );
+    assert_eq!(result, 99);
 }
 
 #[test]
 #[ignore]
 fn mirdata_jit_mem_replace_i32() {
-    // Monomorphize mem::replace for i32: replace value at &mut, return old.
-    let mut env = match SysrootJitEnv::new() {
-        Some(env) => env,
-        None => { eprintln!("skipping: mirdata not available"); return; }
-    };
-
-    let (idx, fb) = env.find_fn("std::mem::replace")
-        .expect("std::mem::replace not found in mirdata");
-    eprintln!("Found: {} (generic_params={}, locals={})", fb.name, fb.num_generic_params, fb.body.locals.len());
-
-    let args = vec![ra_mir_types::GenericArg::Ty(
-        ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32),
-    )];
-    let func_id = env.compile_mono(idx, &args)
-        .expect("compile_mono failed");
-
-    env.finalize();
-    let code = env.get_ptr(func_id);
-
-    // mem::replace::<i32>(&mut slot, 99) should return old value and write new
-    unsafe {
-        let f: extern "C" fn(*mut i32, i32) -> i32 = std::mem::transmute(code);
-        let mut slot: i32 = 42;
-        let old = f(&mut slot as *mut i32, 99);
-        eprintln!("mem::replace(&mut 42, 99) = {old}, slot = {slot}");
-        assert_eq!(old, 42);
-        assert_eq!(slot, 99);
-    }
+    let result: i32 = jit_run_with_mirdata(
+        r#"
+extern "C" { fn mem_replace(dest: *mut i32, val: i32) -> i32; }
+fn foo() -> i32 {
+    let mut x: i32 = 42;
+    let old = unsafe { mem_replace(&mut x as *mut i32, 99) };
+    old + x
+}
+"#,
+        "foo",
+        &[StdImport {
+            mirdata_name: "std::mem::replace",
+            symbol: "mem_replace",
+            type_args: vec![ty_i32()],
+        }],
+    );
+    assert_eq!(result, 42 + 99);
 }
