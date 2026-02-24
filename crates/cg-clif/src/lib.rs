@@ -3112,6 +3112,7 @@ pub fn build_host_isa(is_pic: bool) -> Arc<dyn TargetIsa> {
     let mut flags_builder = settings::builder();
     flags_builder.set("is_pic", if is_pic { "true" } else { "false" }).unwrap();
     flags_builder.set("opt_level", "none").unwrap();
+    flags_builder.set("enable_llvm_abi_extensions", "true").unwrap();
     let flags = settings::Flags::new(flags_builder);
 
     let isa_builder = cranelift_native::builder().expect("host ISA not supported");
