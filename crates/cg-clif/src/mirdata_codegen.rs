@@ -239,7 +239,12 @@ fn codegen_md_place(
                         ra_mir_types::Ty::Array(_, len) => {
                             fx.bcx.ins().iconst(fx.pointer_type, *len as i64)
                         }
-                        _ => panic!("ConstantIndex from_end on non-array: {:?}", cur_ty),
+                        ra_mir_types::Ty::Slice(_) => {
+                            // For slices, get length from the place's metadata
+                            cplace.get_extra()
+                                .expect("slice place must have length metadata")
+                        }
+                        _ => panic!("ConstantIndex from_end on non-array/slice: {:?}", cur_ty),
                     };
                     fx.bcx.ins().iadd_imm(len, -(*offset as i64))
                 };
@@ -277,7 +282,13 @@ fn codegen_md_place(
                             let (p, l) = cval.load_scalar_pair(fx);
                             (Pointer::new(p), l)
                         }
-                        _ => panic!("Subslice from_end on non-ScalarPair: {:?}", cur_ty),
+                        _ => {
+                            // Unsized slice place (Addr with metadata from deref)
+                            let base_ptr = cplace.to_ptr_maybe_spill(fx);
+                            let len = cplace.get_extra()
+                                .expect("Subslice from_end requires slice length metadata");
+                            (base_ptr, len)
+                        }
                     };
                     let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, elem_layout.size.bytes() as i64 * (*from as i64));
                     let new_len = fx.bcx.ins().iadd_imm(len, -((*from as i64) + (*to as i64)));
@@ -565,7 +576,14 @@ fn codegen_md_cast(
         }
     }
 
-    let from_val = from_cval.load_scalar(fx);
+    // Fat → thin pointer cast: extract just the data pointer (first scalar)
+    let from_val = match from_cval.layout.backend_repr {
+        BackendRepr::ScalarPair(_, _) => {
+            let (data_ptr, _meta) = from_cval.load_scalar_pair(fx);
+            data_ptr
+        }
+        _ => from_cval.load_scalar(fx),
+    };
 
     let BackendRepr::Scalar(target_scalar) = dest_layout.backend_repr else {
         todo!("non-scalar cast target in mirdata: {:?}", kind);

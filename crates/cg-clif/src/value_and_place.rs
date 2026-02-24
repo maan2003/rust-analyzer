@@ -408,25 +408,43 @@ impl CPlace {
     ) -> CPlace {
         match self.inner {
             CPlaceInner::VarPair(var1, var2) => {
-                // ScalarPair: field 0 = first scalar, field 1 = second scalar
-                match field_idx {
-                    0 => CPlace { inner: CPlaceInner::Var(var1), layout: field_layout },
-                    1 => CPlace { inner: CPlaceInner::Var(var2), layout: field_layout },
-                    _ => panic!("field index {field_idx} out of range for VarPair"),
+                // Special case: if the field itself is ScalarPair (newtype wrapper),
+                // it encompasses the whole pair (e.g. Box<[u8]>.field(0) → Unique<[u8]>).
+                if matches!(field_layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
+                    return CPlace { inner: CPlaceInner::VarPair(var1, var2), layout: field_layout };
+                }
+                // ScalarPair: select first or second scalar based on field offset.
+                // Typically field 0 → var1, field 1 → var2, but unions may have
+                // field_idx > 1 still at offset 0.
+                let offset = self.layout.fields.offset(field_idx);
+                if offset == Size::ZERO {
+                    CPlace { inner: CPlaceInner::Var(var1), layout: field_layout }
+                } else {
+                    CPlace { inner: CPlaceInner::Var(var2), layout: field_layout }
                 }
             }
             CPlaceInner::Var(var) => {
-                // Scalar wrapper struct: field 0 is the scalar itself
-                assert_eq!(field_idx, 0, "field index {field_idx} out of range for single Var");
+                // Scalar place: field must be at offset 0 (struct field 0, or union field N).
+                debug_assert_eq!(
+                    self.layout.fields.offset(field_idx),
+                    Size::ZERO,
+                    "non-zero offset for Var field {field_idx}",
+                );
                 CPlace { inner: CPlaceInner::Var(var), layout: field_layout }
             }
-            CPlaceInner::Addr(ptr, _extra) => {
+            CPlaceInner::Addr(ptr, extra) => {
                 let offset = self.layout.fields.offset(field_idx);
                 let field_ptr = ptr.offset_i64(
                     &mut fx.bcx,
                     fx.pointer_type,
                     i64::try_from(offset.bytes()).unwrap(),
                 );
+                // Preserve metadata for unsized fields (e.g., [T] in ByteStr([u8]))
+                if matches!(field_layout.backend_repr, BackendRepr::Memory { sized: false }) {
+                    if let Some(extra) = extra {
+                        return CPlace::for_ptr_with_extra(field_ptr, extra, field_layout);
+                    }
+                }
                 CPlace::for_ptr(field_ptr, field_layout)
             }
         }
