@@ -65,7 +65,7 @@ fn resolve_local_layout(
 // Signature building
 // ---------------------------------------------------------------------------
 
-fn build_mirdata_fn_sig(
+pub(crate) fn build_mirdata_fn_sig(
     isa: &dyn TargetIsa,
     dl: &TargetDataLayout,
     body: &Body,
