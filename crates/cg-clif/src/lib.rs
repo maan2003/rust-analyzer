@@ -4092,6 +4092,19 @@ fn scan_body_for_callees(
                         ).is_some() {
                             continue;
                         }
+                        // Closure calls: Fn::call / FnMut::call_mut / FnOnce::call_once
+                        // where self type is a concrete closure — record the closure body,
+                        // not the trait method.
+                        if callee_args.len() > 0 {
+                            let self_ty = callee_args.type_at(0);
+                            if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
+                                let key = (closure_id.0, closure_subst.store());
+                                if closure_visited.insert(key.clone()) {
+                                    closure_result.push(key);
+                                }
+                                continue;
+                            }
+                        }
                     }
                     queue.push_back((callee_id, callee_args.store()));
                 }

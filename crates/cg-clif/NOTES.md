@@ -102,6 +102,31 @@ What works:
   as anonymous data sections via `DataDescription`. `MemoryMap::Empty`
   only (no embedded pointer relocations yet).
 
+## JIT test status (mirdata_jit_* tests)
+
+Tests use `jit_run_with_std` which compiles user code against the sysroot `.mirdata`.
+
+### Passing
+- **Simple Option**: `unwrap`, `match`, `is_some`/`is_none`, `unwrap_or`, nested `Option<Option<i32>>`
+- **Simple scalars**: `identity_i32`, `ptr_write_read_i32`, `mem_replace_i32`
+- **Scalar types in Option**: `bool`, `u8`, `i64` all work
+- **Function pointers**: `fn(i32) -> i32` via `ReifyFnPointer`
+- **User-defined generics**: `fn identity<T>(x: T) -> T { x }` works
+- **User closures**: non-capturing (`|x| x + 1`) and capturing (`let a = 10; |x| x + a`) work
+
+### Failing (should_panic)
+- **Cross-crate generics taking closures**: `Option::map`, `Result::and_then`, `for` loops (`iter_sum`) — mirdata body has closure types as generic params but layout system can't compute closure layouts from mirdata
+- **`String`/`Vec` basics**: `String::from`/`len`, `Vec::new`/`push`/`len` — `HasErrorType` in local layout computation
+- **Complex std APIs**: `String::parse`, `env::var`, `mpsc::channel`, `HashMap`
+
+### Ignored (SIGILL — generates bad codegen)
+- `box_i32` — `Box::new(42i32)` compiles but produces illegal instructions at runtime
+
+### Boundary
+User-defined closures, generics, and function pointers all work. The remaining blockers are:
+1. **Closure layouts in mirdata**: when a cross-crate generic (e.g. `Option::map`) is monomorphized with a user closure type, the mirdata codegen path can't compute the closure's layout
+2. **`HasErrorType` for some std types**: `String` and `Vec` hit layout errors even without closures involved
+
 ## Upstream comparison (`./cg_clif`)
 
 Recently aligned with upstream:
