@@ -25,6 +25,7 @@ The old blocker in this file is fixed:
 - `fn_display_path` now includes impl self-type names when available
   (`alloc::vec::Vec::new`).
 - mirdata name matching now strips generic segments (`::<...>` / `<...>`) before lookup.
+- Candidate selection also filters by expected `StableCrateId` before generic-count matching.
 - Lookup now reports ambiguity explicitly instead of silently picking a wrong body.
 
 This unblocked resolution of `Vec::new`/`Vec::push` bodies and moved failure to
@@ -49,13 +50,6 @@ not a function-body lookup problem.
 - We currently rely on the exported global layout table (`MirData.layouts`) to
   already contain every needed concrete instantiation.
 - For `Vec::<i32>::new` that assumption is false.
-
-## Additional hardening done
-
-`cg-clif` now performs a name-insensitive fallback when looking up mirdata type
-layouts (ignores ADT display path strings, keys by stable identity + args).
-This avoids `core::...` vs `std::...` spelling mismatches when the layout entry
-exists, but it does **not** solve truly missing layout entries.
 
 ## Next step (real fix)
 

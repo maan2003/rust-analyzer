@@ -2873,6 +2873,22 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 ));
 
             let mut candidates = candidates.clone();
+            let expected_stable_crate_id = stable_crate_id_for_fn(
+                &db,
+                *func_id,
+                &ext_crate_disambiguators,
+            );
+            if let Some(expected) = expected_stable_crate_id {
+                let by_crate: Vec<_> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|fb| fb.def_path_hash.0 == expected)
+                    .collect();
+                if !by_crate.is_empty() {
+                    candidates = by_crate;
+                }
+            }
+
             if candidates.len() > 1 {
                 let by_param_count: Vec<_> = candidates
                     .iter()
@@ -2989,6 +3005,20 @@ fn mirdata_args_len(generic_args: &hir_ty::next_solver::StoredGenericArgs) -> us
         .iter()
         .filter(|arg| matches!(arg.kind(), GenericArgKind::Type(_)))
         .count()
+}
+
+fn stable_crate_id_for_fn(
+    db: &dyn hir_ty::db::HirDatabase,
+    func_id: hir_def::FunctionId,
+    ext_crate_disambiguators: &std::collections::HashMap<String, u64>,
+) -> Option<u64> {
+    let krate = func_id.krate(db);
+    let crate_name = krate
+        .extra_data(db)
+        .display_name
+        .as_ref()
+        .map(|dn| dn.crate_name().to_string())?;
+    ext_crate_disambiguators.get(&crate_name).copied()
 }
 
 #[test]

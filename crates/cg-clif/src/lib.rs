@@ -45,96 +45,6 @@ use value_and_place::{CPlace, CValue};
 /// Layout Arc type alias (triomphe::Arc from hir-ty's layout_of_ty).
 type LayoutArc = TArc<Layout>;
 
-fn mir_ty_equivalent_for_layout(a: &ra_mir_types::Ty, b: &ra_mir_types::Ty) -> bool {
-    use ra_mir_types::{GenericArg, Ty};
-
-    fn generic_arg_eq_for_layout(a: &GenericArg, b: &GenericArg) -> bool {
-        match (a, b) {
-            (GenericArg::Ty(a), GenericArg::Ty(b)) => mir_ty_equivalent_for_layout(a, b),
-            (GenericArg::Const(a), GenericArg::Const(b)) => a == b,
-            (GenericArg::Lifetime, GenericArg::Lifetime) => true,
-            _ => false,
-        }
-    }
-
-    fn generic_args_eq_for_layout(a: &[GenericArg], b: &[GenericArg]) -> bool {
-        a.len() == b.len()
-            && a
-                .iter()
-                .zip(b.iter())
-                .all(|(a, b)| generic_arg_eq_for_layout(a, b))
-    }
-
-    match (a, b) {
-        (Ty::Bool, Ty::Bool)
-        | (Ty::Char, Ty::Char)
-        | (Ty::Str, Ty::Str)
-        | (Ty::Never, Ty::Never) => true,
-        (Ty::Int(a), Ty::Int(b)) => a == b,
-        (Ty::Uint(a), Ty::Uint(b)) => a == b,
-        (Ty::Float(a), Ty::Float(b)) => a == b,
-        (Ty::Tuple(a), Ty::Tuple(b)) => {
-            a.len() == b.len()
-                && a
-                    .iter()
-                    .zip(b.iter())
-                    .all(|(a, b)| mir_ty_equivalent_for_layout(a, b))
-        }
-        (Ty::Array(a_elem, a_len), Ty::Array(b_elem, b_len)) => {
-            a_len == b_len && mir_ty_equivalent_for_layout(a_elem, b_elem)
-        }
-        (Ty::Slice(a), Ty::Slice(b)) => mir_ty_equivalent_for_layout(a, b),
-        (Ty::Ref(a_mut, a), Ty::Ref(b_mut, b)) => {
-            a_mut == b_mut && mir_ty_equivalent_for_layout(a, b)
-        }
-        (Ty::RawPtr(a_mut, a), Ty::RawPtr(b_mut, b)) => {
-            a_mut == b_mut && mir_ty_equivalent_for_layout(a, b)
-        }
-        // Ignore display names; rely on DefPathHash + generic args.
-        (Ty::Adt(a_hash, _a_name, a_args), Ty::Adt(b_hash, _b_name, b_args)) => {
-            a_hash == b_hash && generic_args_eq_for_layout(a_args, b_args)
-        }
-        (Ty::FnDef(a_hash, a_args), Ty::FnDef(b_hash, b_args))
-        | (Ty::Closure(a_hash, a_args), Ty::Closure(b_hash, b_args)) => {
-            a_hash == b_hash && generic_args_eq_for_layout(a_args, b_args)
-        }
-        (Ty::FnPtr(a_params, a_ret), Ty::FnPtr(b_params, b_ret)) => {
-            a_params.len() == b_params.len()
-                && a_params
-                    .iter()
-                    .zip(b_params.iter())
-                    .all(|(a, b)| mir_ty_equivalent_for_layout(a, b))
-                && mir_ty_equivalent_for_layout(a_ret, b_ret)
-        }
-        // Ignore Param display names; index is the stable identity.
-        (Ty::Param(a_idx, _), Ty::Param(b_idx, _)) => a_idx == b_idx,
-        (Ty::Dynamic(a_preds), Ty::Dynamic(b_preds)) => {
-            a_preds.len() == b_preds.len()
-                && a_preds.iter().zip(b_preds.iter()).all(|(a, b)| match (&a.trait_ref, &b.trait_ref) {
-                    (None, None) => true,
-                    (Some((a_hash, a_args)), Some((b_hash, b_args))) => {
-                        a_hash == b_hash && generic_args_eq_for_layout(a_args, b_args)
-                    }
-                    _ => false,
-                })
-        }
-        (Ty::Foreign(a), Ty::Foreign(b)) => a == b,
-        (Ty::Opaque(a), Ty::Opaque(b)) => a == b,
-        _ => false,
-    }
-}
-
-pub(crate) fn lookup_mirdata_layout(
-    ty_layouts: &HashMap<ra_mir_types::Ty, LayoutArc>,
-    ty: &ra_mir_types::Ty,
-) -> Option<LayoutArc> {
-    ty_layouts.get(ty).cloned().or_else(|| {
-        ty_layouts
-            .iter()
-            .find_map(|(k, v)| mir_ty_equivalent_for_layout(k, ty).then(|| v.clone()))
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Type mapping: r-a Ty → Cranelift Type
 // ---------------------------------------------------------------------------
@@ -349,9 +259,9 @@ impl<'a, M: Module> FunctionCx<'a, M> {
     pub(crate) fn md_layout(&self, ty: &ra_mir_types::Ty) -> LayoutArc {
         match &self.mir {
             MirSource::Mirdata { ty_layouts, .. } => {
-                lookup_mirdata_layout(ty_layouts, ty).unwrap_or_else(|| {
+                ty_layouts.get(ty).unwrap_or_else(|| {
                     panic!("mirdata layout not found for type: {:?}", ty)
-                })
+                }).clone()
             }
             _ => panic!("md_layout() called on non-Mirdata FunctionCx"),
         }
