@@ -2159,6 +2159,35 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails in JIT import resolution: unresolved symbol core::str::len"]
+fn std_jit_str_len_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    ("hello".len() == 5) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails during codegen: const_to_i64 unsupported UnevaluatedConst in Vec::new path"]
+fn std_jit_vec_new_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let v: Vec<i32> = Vec::new();
+    (v.len() == 0) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails during codegen: non-value const in ScalarPair constant"]
 fn std_jit_env_var_roundtrip() {
     let result: i32 = jit_run_with_std(
