@@ -365,6 +365,22 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(Some((Operand { kind: OperandKind::Copy(p), span: Some(expr_id.into()) }, current)))
     }
 
+    fn lower_expr_to_some_operand_without_adjust(
+        &mut self,
+        expr_id: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
+        if let Expr::Literal(l) = &self.body[expr_id] {
+            let ty = self.expr_ty_without_adjust(expr_id);
+            return Ok(Some((self.lower_literal_to_operand(ty, l)?, current)));
+        }
+        let Some((p, current)) = self.lower_expr_as_place_without_adjust(current, expr_id, true)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((Operand { kind: OperandKind::Copy(p), span: Some(expr_id.into()) }, current)))
+    }
+
     fn lower_expr_to_place_with_adjust(
         &mut self,
         expr_id: ExprId,
@@ -1204,8 +1220,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.push_assignment(current, lhs_place, r_value, expr_id.into());
                     return Ok(Some(current));
                 }
-                let Some((lhs_op, current)) = self.lower_expr_to_some_operand(*lhs, current)?
-                else {
+                let Some((lhs_op, current)) = (if is_builtin {
+                    self.lower_expr_to_some_operand_without_adjust(*lhs, current)?
+                } else {
+                    self.lower_expr_to_some_operand(*lhs, current)?
+                }) else {
                     return Ok(None);
                 };
                 if let hir_def::hir::BinaryOp::LogicOp(op) = op {
@@ -1237,8 +1256,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     );
                     return Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()));
                 }
-                let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
-                else {
+                let Some((rhs_op, current)) = (if is_builtin {
+                    self.lower_expr_to_some_operand_without_adjust(*rhs, current)?
+                } else {
+                    self.lower_expr_to_some_operand(*rhs, current)?
+                }) else {
                     return Ok(None);
                 };
                 self.push_assignment(

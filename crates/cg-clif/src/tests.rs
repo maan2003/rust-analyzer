@@ -2178,7 +2178,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently flaky in JIT: repeated std::process::id() calls can diverge"]
 fn std_jit_process_id_is_stable_across_calls() {
     let result: i32 = jit_run_with_std(
         r#"
