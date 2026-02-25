@@ -1,4 +1,4 @@
-use std::{fmt, panic, sync::Mutex};
+use std::{alloc::Layout, fmt, panic, sync::Mutex};
 
 use cranelift_module::Module;
 
@@ -29,6 +29,39 @@ unsafe extern "C" {
         symbol: *const std::ffi::c_char,
     ) -> *mut std::ffi::c_void;
 }
+
+unsafe extern "C" fn jit_rust_alloc(size: usize, align: usize) -> *mut u8 {
+    let Ok(layout) = Layout::from_size_align(size, align) else { return std::ptr::null_mut() };
+    // SAFETY: We validated the layout above.
+    unsafe { std::alloc::alloc(layout) }
+}
+
+unsafe extern "C" fn jit_rust_dealloc(ptr: *mut u8, size: usize, align: usize) {
+    let Ok(layout) = Layout::from_size_align(size, align) else { return };
+    // SAFETY: Caller follows Rust allocator shim contract.
+    unsafe { std::alloc::dealloc(ptr, layout) }
+}
+
+unsafe extern "C" fn jit_rust_realloc(
+    ptr: *mut u8,
+    old_size: usize,
+    align: usize,
+    new_size: usize,
+) -> *mut u8 {
+    let Ok(old_layout) = Layout::from_size_align(old_size, align) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: Caller follows Rust allocator shim contract.
+    unsafe { std::alloc::realloc(ptr, old_layout, new_size) }
+}
+
+unsafe extern "C" fn jit_rust_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    let Ok(layout) = Layout::from_size_align(size, align) else { return std::ptr::null_mut() };
+    // SAFETY: We validated the layout above.
+    unsafe { std::alloc::alloc_zeroed(layout) }
+}
+
+unsafe extern "C" fn jit_rust_no_alloc_shim_is_unstable_v2() {}
 
 use crate::symbol_mangling;
 
@@ -330,6 +363,14 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         );
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
+        jit_builder.symbol("__rust_alloc", jit_rust_alloc as *const u8);
+        jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
+        jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
+        jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder.symbol(
+            "__rust_no_alloc_shim_is_unstable_v2",
+            jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
+        );
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         // Use the first function's crate as local_crate (all test fns are in same crate)
@@ -1652,6 +1693,14 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         );
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
+        jit_builder.symbol("__rust_alloc", jit_rust_alloc as *const u8);
+        jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
+        jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
+        jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder.symbol(
+            "__rust_no_alloc_shim_is_unstable_v2",
+            jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
+        );
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -1851,71 +1900,70 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 
     let cfg = rustc_cfg_options();
 
-    let mut load_source_crate =
-        |crate_name: &str,
-         crate_dir: &std::path::Path,
-         origin: CrateOrigin|
-         -> base_db::CrateBuilderId {
-            let src_dir = crate_dir.join("src");
-            let lib_rs = src_dir.join("lib.rs");
-            assert!(lib_rs.exists(), "{} not found", lib_rs.display());
+    let mut load_source_crate = |crate_name: &str,
+                                 crate_dir: &std::path::Path,
+                                 origin: CrateOrigin|
+     -> base_db::CrateBuilderId {
+        let src_dir = crate_dir.join("src");
+        let lib_rs = src_dir.join("lib.rs");
+        assert!(lib_rs.exists(), "{} not found", lib_rs.display());
 
-            let mut rs_files = Vec::new();
-            walk_rs_files(&src_dir, &mut rs_files);
+        let mut rs_files = Vec::new();
+        walk_rs_files(&src_dir, &mut rs_files);
 
-            let root_file_id = FileId::from_raw(next_file_raw);
-            next_file_raw += 1;
+        let root_file_id = FileId::from_raw(next_file_raw);
+        next_file_raw += 1;
 
-            let lib_rs_content = std::fs::read_to_string(&lib_rs)
-                .unwrap_or_else(|e| panic!("read {}: {e}", lib_rs.display()));
-            source_change.change_file(root_file_id, Some(lib_rs_content));
+        let lib_rs_content = std::fs::read_to_string(&lib_rs)
+            .unwrap_or_else(|e| panic!("read {}: {e}", lib_rs.display()));
+        source_change.change_file(root_file_id, Some(lib_rs_content));
 
-            let mut file_set = FileSet::default();
-            file_set.insert(
-                root_file_id,
-                base_db::VfsPath::new_virtual_path(format!("/sysroot/{crate_name}/src/lib.rs")),
-            );
+        let mut file_set = FileSet::default();
+        file_set.insert(
+            root_file_id,
+            base_db::VfsPath::new_virtual_path(format!("/sysroot/{crate_name}/src/lib.rs")),
+        );
 
-            for rs_path in rs_files {
-                if rs_path == lib_rs {
-                    continue;
-                }
-
-                let rel = rs_path
-                    .strip_prefix(&src_dir)
-                    .unwrap_or_else(|e| panic!("strip_prefix {}: {e}", rs_path.display()));
-                let file_id = FileId::from_raw(next_file_raw);
-                next_file_raw += 1;
-
-                let content = std::fs::read_to_string(&rs_path)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", rs_path.display()));
-                source_change.change_file(file_id, Some(content));
-                file_set.insert(
-                    file_id,
-                    base_db::VfsPath::new_virtual_path(format!(
-                        "/sysroot/{crate_name}/src/{}",
-                        rel.display()
-                    )),
-                );
+        for rs_path in rs_files {
+            if rs_path == lib_rs {
+                continue;
             }
 
-            roots.push(base_db::SourceRoot::new_library(file_set));
+            let rel = rs_path
+                .strip_prefix(&src_dir)
+                .unwrap_or_else(|e| panic!("strip_prefix {}: {e}", rs_path.display()));
+            let file_id = FileId::from_raw(next_file_raw);
+            next_file_raw += 1;
 
-            crate_graph.add_crate_root(
-                root_file_id,
-                Edition::Edition2021,
-                Some(CrateDisplayName::from_canonical_name(crate_name)),
-                None,
-                cfg.clone(),
-                Some(cfg.clone()),
-                Env::default(),
-                origin,
-                Vec::new(),
-                false,
-                proc_macro_cwd.clone(),
-                crate_ws_data.clone(),
-            )
-        };
+            let content = std::fs::read_to_string(&rs_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", rs_path.display()));
+            source_change.change_file(file_id, Some(content));
+            file_set.insert(
+                file_id,
+                base_db::VfsPath::new_virtual_path(format!(
+                    "/sysroot/{crate_name}/src/{}",
+                    rel.display()
+                )),
+            );
+        }
+
+        roots.push(base_db::SourceRoot::new_library(file_set));
+
+        crate_graph.add_crate_root(
+            root_file_id,
+            Edition::Edition2021,
+            Some(CrateDisplayName::from_canonical_name(crate_name)),
+            None,
+            cfg.clone(),
+            Some(cfg.clone()),
+            Env::default(),
+            origin,
+            Vec::new(),
+            false,
+            proc_macro_cwd.clone(),
+            crate_ws_data.clone(),
+        )
+    };
 
     let core_id = load_source_crate(
         "core",
@@ -1927,11 +1975,8 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
         &sysroot_src.join("alloc"),
         CrateOrigin::Lang(LangCrateOrigin::Alloc),
     );
-    let std_id = load_source_crate(
-        "std",
-        &sysroot_src.join("std"),
-        CrateOrigin::Lang(LangCrateOrigin::Std),
-    );
+    let std_id =
+        load_source_crate("std", &sysroot_src.join("std"), CrateOrigin::Lang(LangCrateOrigin::Std));
 
     crate_graph
         .add_dep(
@@ -2055,6 +2100,14 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         );
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
+        jit_builder.symbol("__rust_alloc", jit_rust_alloc as *const u8);
+        jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
+        jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
+        jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder.symbol(
+            "__rust_no_alloc_shim_is_unstable_v2",
+            jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
+        );
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -2096,6 +2149,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             );
 
         let dl = get_target_data_layout(&db, entry_func_id);
+        let mut compiled_fn_symbols = std::collections::HashSet::new();
 
         for (func_id, generic_args) in &reachable_fns {
             let is_cross_crate = func_id.krate(&db) != local_crate;
@@ -2123,12 +2177,18 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             if is_cross_crate && !should_compile_cross_crate {
                 continue;
             }
-            let body =  db
-                .monomorphized_mir_body(
-                (*func_id).into(),
-                generic_args.clone(),
-                env.clone(),
-            )
+
+            // Reachability can surface distinct fn instances that mangle to the same
+            // exported symbol. Avoid duplicate `define_function` attempts in one module.
+            if !compiled_fn_symbols.insert(fn_name.clone()) {
+                if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+                    eprintln!("std-jit: skipping duplicate symbol definition for {fn_name}");
+                }
+                continue;
+            }
+
+            let body = db
+                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
                 .unwrap_or_else(|e| {
                     panic!(
                         "MIR error for required compiled fn {fn_name} \
@@ -2314,7 +2374,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails during codegen: duplicate definition for core::alloc::layout::precondition_check"]
 fn std_jit_box_new_i32_smoke() {
     let result: i32 = jit_run_with_std(
         r#"

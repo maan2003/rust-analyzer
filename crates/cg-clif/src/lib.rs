@@ -336,6 +336,42 @@ fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
     ty
 }
 
+/// Walk to the structural unsized tail of a type.
+///
+/// For wrappers like `struct S<T: ?Sized>(u8, T)`, this returns `T`.
+fn unsized_tail_ty(db: &dyn HirDatabase, mut ty: StoredTy) -> StoredTy {
+    loop {
+        match ty.as_ref().kind() {
+            TyKind::Adt(adt_id, args) => {
+                let hir_def::AdtId::StructId(struct_id) = adt_id.inner().id else {
+                    return ty;
+                };
+                let field_types = db.field_types(struct_id.into());
+                let Some((_, field_ty)) = field_types.iter().last() else {
+                    return ty;
+                };
+                let interner = DbInterner::new_no_crate(db);
+                let next_ty = field_ty.get().instantiate(interner, args).store();
+                if next_ty == ty {
+                    return ty;
+                }
+                ty = next_ty;
+            }
+            TyKind::Tuple(tys) => {
+                let Some(last) = tys.as_slice().last() else {
+                    return ty;
+                };
+                let next_ty = last.store();
+                if next_ty == ty {
+                    return ty;
+                }
+                ty = next_ty;
+            }
+            _ => return ty,
+        }
+    }
+}
+
 pub(crate) fn bin_op_to_intcc(op: &BinOp, signed: bool) -> IntCC {
     match op {
         BinOp::Eq => IntCC::Equal,
@@ -1326,7 +1362,8 @@ fn codegen_aggregate(
         | AggregateKind::Closure(_)
         | AggregateKind::Coroutine(_)
         | AggregateKind::CoroutineClosure(_) => {
-            let field_vals: Vec<_> = operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
+            let field_vals: Vec<_> =
+                operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
 
             // For ScalarPair tuples, construct directly as a pair
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
@@ -2503,50 +2540,49 @@ fn codegen_direct_call(
         return;
     }
 
-    let (callee_func_id, generic_args) = if let ItemContainerId::TraitId(trait_id) =
-        callee_func_id.loc(fx.db()).container
-    {
-        // Check for virtual dispatch: trait method called on dyn Trait
-        let interner = DbInterner::new_no_crate(fx.db());
-        if hir_ty::method_resolution::is_dyn_method(
-            interner,
-            fx.env().param_env(),
-            callee_func_id,
-            generic_args,
-        )
-        .is_some()
-        {
-            codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
-            return;
-        }
-
-        // Check for closure call: Fn::call / FnMut::call_mut / FnOnce::call_once
-        // where self type is a closure — redirect to the closure's MIR body.
-        if generic_args.len() > 0 {
-            let self_ty = generic_args.type_at(0);
-            if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
-                codegen_closure_call(
-                    fx,
-                    closure_id.0,
-                    closure_subst.store(),
-                    args,
-                    destination,
-                    target,
-                );
+    let (callee_func_id, generic_args) =
+        if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db()).container {
+            // Check for virtual dispatch: trait method called on dyn Trait
+            let interner = DbInterner::new_no_crate(fx.db());
+            if hir_ty::method_resolution::is_dyn_method(
+                interner,
+                fx.env().param_env(),
+                callee_func_id,
+                generic_args,
+            )
+            .is_some()
+            {
+                codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
                 return;
             }
-        }
 
-        // Static trait dispatch: resolve to concrete impl method when possible.
-        hir_ty::method_resolution::lookup_impl_method(
-            fx.db(),
-            fx.env().as_ref(),
-            callee_func_id,
-            generic_args,
-        )
-    } else {
-        (callee_func_id, generic_args)
-    };
+            // Check for closure call: Fn::call / FnMut::call_mut / FnOnce::call_once
+            // where self type is a closure — redirect to the closure's MIR body.
+            if generic_args.len() > 0 {
+                let self_ty = generic_args.type_at(0);
+                if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
+                    codegen_closure_call(
+                        fx,
+                        closure_id.0,
+                        closure_subst.store(),
+                        args,
+                        destination,
+                        target,
+                    );
+                    return;
+                }
+            }
+
+            // Static trait dispatch: resolve to concrete impl method when possible.
+            hir_ty::method_resolution::lookup_impl_method(
+                fx.db(),
+                fx.env().as_ref(),
+                callee_func_id,
+                generic_args,
+            )
+        } else {
+            (callee_func_id, generic_args)
+        };
 
     // Check if this is an extern function (no MIR available)
     let is_extern =
@@ -2880,6 +2916,48 @@ fn codegen_intrinsic_call(
             let layout = generic_ty_layout.clone().expect("min_align_of_val: layout error");
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
         }
+        "align_of_val" => {
+            assert_eq!(args.len(), 1, "align_of_val expects 1 arg");
+
+            let pointee_ty = generic_ty.clone().expect("align_of_val requires a generic arg");
+            let pointee_layout = generic_ty_layout.clone().expect("align_of_val: layout error");
+            let static_align =
+                fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
+
+            let ptr = codegen_operand(fx, &args[0].kind);
+            let metadata = match ptr.layout.backend_repr {
+                BackendRepr::ScalarPair(_, _) => Some(ptr.load_scalar_pair(fx).1),
+                _ => None,
+            };
+
+            let tail_ty = unsized_tail_ty(fx.db(), pointee_ty);
+            let tail_align = match tail_ty.as_ref().kind() {
+                TyKind::Dynamic(..) => {
+                    let vtable = metadata.expect("align_of_val(dyn) requires metadata");
+                    let vtable_align_offset = (fx.dl.pointer_size().bytes() * 2) as i32;
+                    Some(fx.bcx.ins().load(
+                        fx.pointer_type,
+                        vtable_memflags(),
+                        vtable,
+                        vtable_align_offset,
+                    ))
+                }
+                TyKind::Slice(elem_ty) => {
+                    let elem_layout = fx
+                        .db()
+                        .layout_of_ty(elem_ty.store(), fx.env().clone())
+                        .expect("align_of_val(slice): elem layout error");
+                    Some(fx.bcx.ins().iconst(fx.pointer_type, elem_layout.align.abi.bytes() as i64))
+                }
+                TyKind::Str => Some(fx.bcx.ins().iconst(fx.pointer_type, 1)),
+                _ => None,
+            };
+
+            Some(match tail_align {
+                Some(tail_align) => fx.bcx.ins().umax(static_align, tail_align),
+                None => static_align,
+            })
+        }
         "needs_drop" => {
             let generic_ty = generic_ty.as_ref().expect("needs_drop requires a generic arg");
             let interner = DbInterner::new_with(fx.db(), fx.local_crate());
@@ -2898,10 +2976,185 @@ fn codegen_intrinsic_call(
                 _ => None,
             }
         }
+        "aggregate_raw_ptr" => {
+            assert_eq!(args.len(), 2, "aggregate_raw_ptr expects 2 args");
+
+            let data = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let dest = codegen_place(fx, destination);
+            match dest.layout.backend_repr {
+                BackendRepr::ScalarPair(_, _) => {
+                    let metadata = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+                    dest.write_cvalue(fx, CValue::by_val_pair(data, metadata, dest.layout.clone()));
+                }
+                BackendRepr::Scalar(_) => {
+                    dest.write_cvalue(fx, CValue::by_val(data, dest.layout.clone()));
+                }
+                _ if dest.layout.is_zst() => {}
+                _ => panic!("aggregate_raw_ptr destination has unexpected repr"),
+            }
+
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
         "type_id" | "type_name" => {
             // These are complex; fall through to let them be unresolved
             // (they need const eval or string allocation)
             return false;
+        }
+        "ub_checks" => {
+            // `cfg(ub_checks)` is unstable in this crate. For our std-JIT harness,
+            // treat this as disabled by default.
+            Some(fx.bcx.ins().iconst(types::I8, 0))
+        }
+        "overflow_checks" => {
+            // Mirrors `core::intrinsics::overflow_checks` semantics.
+            Some(fx.bcx.ins().iconst(types::I8, i64::from(cfg!(debug_assertions))))
+        }
+        "const_eval_select" => {
+            assert_eq!(args.len(), 3, "const_eval_select expects 3 args");
+
+            let runtime_ty = operand_ty(fx.db(), body, &args[2].kind);
+            let (runtime_func_id, runtime_generic_args) = match runtime_ty.as_ref().kind() {
+                TyKind::FnDef(def, runtime_generic_args) => {
+                    let CallableDefId::FunctionId(runtime_func_id) = def.0 else {
+                        panic!("const_eval_select runtime callable must be a function")
+                    };
+                    (runtime_func_id, runtime_generic_args)
+                }
+                _ => panic!("unsupported const_eval_select runtime callable: {:?}", runtime_ty),
+            };
+
+            // `const_eval_select` passes captured arguments as a tuple in `args[0]`.
+            // Runtime callables expect those as regular function parameters, so unpack.
+            let tuple_ty = operand_ty(fx.db(), body, &args[0].kind);
+            let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
+                panic!("const_eval_select ARG must be a tuple, got: {:?}", tuple_ty)
+            };
+            let tuple_fields: Vec<_> =
+                tuple_fields.iter().map(|field_ty| field_ty.store()).collect();
+
+            let tuple_cval = codegen_operand(fx, &args[0].kind);
+            let tuple_layout = tuple_cval.layout.clone();
+            let tuple_ptr = tuple_cval.force_stack(fx);
+            let mut runtime_args = Vec::with_capacity(tuple_fields.len());
+            for (idx, field_ty) in tuple_fields.iter().enumerate() {
+                let field_layout = fx
+                    .db()
+                    .layout_of_ty(field_ty.clone(), fx.env().clone())
+                    .expect("tuple field layout");
+                if field_layout.is_zst() {
+                    runtime_args.push(CValue::zst(field_layout));
+                    continue;
+                }
+                let field_offset = tuple_layout.fields.offset(idx).bytes() as i64;
+                let field_ptr = tuple_ptr.offset_i64(&mut fx.bcx, fx.pointer_type, field_offset);
+                runtime_args.push(CValue::by_ref(field_ptr, field_layout));
+            }
+
+            // Declare the runtime callable similarly to normal direct calls.
+            let is_extern =
+                matches!(runtime_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
+            let is_cross_crate = runtime_func_id.krate(fx.db()) != fx.local_crate();
+            let interner = DbInterner::new_no_crate(fx.db());
+            let empty_args = GenericArgs::empty(interner);
+            let (callee_sig, callee_name) = if is_extern {
+                let sig = build_fn_sig_from_ty(
+                    fx.isa,
+                    fx.db(),
+                    fx.dl,
+                    fx.env(),
+                    runtime_func_id,
+                    empty_args,
+                )
+                .expect("const_eval_select extern fn sig");
+                let name = fx.db().function_signature(runtime_func_id).name.as_str().to_owned();
+                (sig, name)
+            } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
+                runtime_func_id.into(),
+                runtime_generic_args.store(),
+                fx.env().clone(),
+            ) {
+                let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+                    .expect("callee sig");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    runtime_func_id,
+                    runtime_generic_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            } else if is_cross_crate {
+                let sig = build_fn_sig_from_ty(
+                    fx.isa,
+                    fx.db(),
+                    fx.dl,
+                    fx.env(),
+                    runtime_func_id,
+                    runtime_generic_args,
+                )
+                .expect("const_eval_select cross-crate fn sig");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    runtime_func_id,
+                    runtime_generic_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            } else {
+                panic!(
+                    "failed to get const_eval_select runtime callee MIR for {runtime_func_id:?}"
+                );
+            };
+
+            let callee_id = fx
+                .module
+                .declare_function(&callee_name, Linkage::Import, &callee_sig)
+                .expect("declare const_eval_select runtime callee");
+            let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+
+            let dest = codegen_place(fx, destination);
+            let is_sret_return = !dest.layout.is_zst()
+                && !matches!(
+                    dest.layout.backend_repr,
+                    BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+                );
+
+            let mut call_args = Vec::new();
+            let sret_slot = if is_sret_return {
+                let slot = CPlace::new_stack_slot(fx, dest.layout.clone());
+                let ptr = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+                call_args.push(ptr);
+                Some(slot)
+            } else {
+                None
+            };
+
+            for arg in runtime_args {
+                if arg.layout.is_zst() {
+                    continue;
+                }
+                match arg.layout.backend_repr {
+                    BackendRepr::ScalarPair(_, _) => {
+                        let (a, b) = arg.load_scalar_pair(fx);
+                        call_args.push(a);
+                        call_args.push(b);
+                    }
+                    BackendRepr::Scalar(_) => {
+                        call_args.push(arg.load_scalar(fx));
+                    }
+                    _ => {
+                        let ptr = arg.force_stack(fx);
+                        call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+                    }
+                }
+            }
+
+            let call = fx.bcx.ins().call(callee_ref, &call_args);
+            store_call_result_and_jump(fx, call, sret_slot, dest, target);
+            return true;
         }
 
         // --- memory operations ---
@@ -2946,6 +3199,31 @@ fn codegen_intrinsic_call(
             let tc = fx.module.target_config();
             fx.bcx.call_memset(tc, dst, val, byte_amount);
             None
+        }
+        "read_via_copy" => {
+            assert_eq!(args.len(), 1, "read_via_copy expects 1 arg");
+            let src_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let src_layout = generic_ty_layout.clone().expect("read_via_copy: layout error");
+            let src = CValue::by_ref(pointer::Pointer::new(src_ptr), src_layout);
+            let dest = codegen_place(fx, destination);
+            dest.write_cvalue(fx, src);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+        "write_via_move" => {
+            assert_eq!(args.len(), 2, "write_via_move expects 2 args");
+            let dst_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let value = codegen_operand(fx, &args[1].kind);
+            let dst = CPlace::for_ptr(pointer::Pointer::new(dst_ptr), value.layout.clone());
+            dst.write_cvalue(fx, value);
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
         }
         "volatile_load" | "unaligned_volatile_load" => {
             // Cranelift treats loads as volatile by default
@@ -3164,7 +3442,17 @@ fn codegen_intrinsic_call(
             None
         }
 
-        _ => return false,
+        _ => {
+            if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+                eprintln!(
+                    "std-jit: unhandled intrinsic `{}` (callee={:?}, generic_args={})",
+                    name,
+                    callee_func_id,
+                    generic_args.len(),
+                );
+            }
+            return false;
+        }
     };
 
     // Write result to destination
@@ -3543,7 +3831,9 @@ pub fn compile_fn(
 
     // Compile and define the function
     let mut ctx = Context::for_function(func);
-    module.define_function(func_id, &mut ctx).map_err(|e| format!("define_function: {e}"))?;
+    module.define_function(func_id, &mut ctx).map_err(|e| {
+        format!("define_function: {e}\n-- function: {fn_name} --\n{}", ctx.func.display(),)
+    })?;
 
     Ok(func_id)
 }
@@ -3998,7 +4288,8 @@ where
                 continue;
             }
             if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_))
-                && db.monomorphized_mir_body(func_id.into(), generic_args.clone(), env.clone())
+                && db
+                    .monomorphized_mir_body(func_id.into(), generic_args.clone(), env.clone())
                     .is_err()
             {
                 continue;
@@ -4178,10 +4469,27 @@ fn scan_body_for_callees(
 
         let Some(term) = &bb.terminator else { continue };
         match &term.kind {
-            TerminatorKind::Call { func, .. } => {
+            TerminatorKind::Call { func, args, .. } => {
                 let OperandKind::Constant { ty, .. } = &func.kind else { continue };
                 let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
                 if let CallableDefId::FunctionId(callee_id) = def.0 {
+                    if FunctionSignature::is_intrinsic(db, callee_id) {
+                        // Runtime lowering of `const_eval_select` calls its runtime-arm
+                        // function directly; ensure reachability includes that callee.
+                        if db.function_signature(callee_id).name.as_str() == "const_eval_select"
+                            && args.len() >= 3
+                        {
+                            let runtime_ty = operand_ty(db, body, &args[2].kind);
+                            if let TyKind::FnDef(runtime_def, runtime_args) =
+                                runtime_ty.as_ref().kind()
+                                && let CallableDefId::FunctionId(runtime_func_id) = runtime_def.0
+                            {
+                                queue.push_back((runtime_func_id, runtime_args.store()));
+                            }
+                        }
+                        continue;
+                    }
+
                     let mut resolved_id = callee_id;
                     let mut resolved_args = callee_args;
 
@@ -4212,12 +4520,13 @@ fn scan_body_for_callees(
                             }
                         }
 
-                        (resolved_id, resolved_args) = hir_ty::method_resolution::lookup_impl_method(
-                            db,
-                            env.as_ref(),
-                            callee_id,
-                            callee_args,
-                        );
+                        (resolved_id, resolved_args) =
+                            hir_ty::method_resolution::lookup_impl_method(
+                                db,
+                                env.as_ref(),
+                                callee_id,
+                                callee_args,
+                            );
                     }
                     queue.push_back((resolved_id, resolved_args.store()));
                 }
