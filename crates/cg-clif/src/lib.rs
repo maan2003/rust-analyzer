@@ -1228,19 +1228,19 @@ fn codegen_adt_fields(
     // Fast path: Scalar ADT with single variant (wrapper struct)
     if is_single_variant {
         if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
-            let non_zst: Vec<_> = field_vals.iter().filter(|cv| !cv.layout.is_zst()).collect();
-            assert_eq!(non_zst.len(), 1, "Scalar ADT expects 1 non-ZST field");
-            dest.write_cvalue(fx, non_zst[0].clone());
+            let lanes = collect_scalar_abi_lanes(fx, field_vals);
+            assert_eq!(lanes.len(), 1, "Scalar ADT expects 1 ABI scalar lane");
+            dest.write_cvalue(fx, CValue::by_val(lanes[0], dest.layout.clone()));
             codegen_set_discriminant(fx, &dest, variant_idx);
             return;
         }
 
         // Fast path: ScalarPair ADT with single variant (two-field struct)
         if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-            let non_zst: Vec<_> = field_vals.iter().filter(|cv| !cv.layout.is_zst()).collect();
-            assert_eq!(non_zst.len(), 2, "ScalarPair ADT expects 2 non-ZST fields");
-            let val0 = non_zst[0].load_scalar(fx);
-            let val1 = non_zst[1].load_scalar(fx);
+            let lanes = collect_scalar_abi_lanes(fx, field_vals);
+            assert_eq!(lanes.len(), 2, "ScalarPair ADT expects 2 ABI scalar lanes");
+            let val0 = lanes[0];
+            let val1 = lanes[1];
             dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
             codegen_set_discriminant(fx, &dest, variant_idx);
             return;
@@ -1281,6 +1281,38 @@ fn codegen_adt_fields(
     }
 }
 
+/// Collect ABI scalar lanes from aggregate fields.
+///
+/// For ABI scalar/scalar-pair destinations, source fields may be nested wrappers,
+/// including single non-ZST fields whose own representation is `ScalarPair`.
+/// This helper expands each non-ZST field into its scalar lanes so callers can
+/// validate lane count against destination ABI, instead of assuming one lane per field.
+fn collect_scalar_abi_lanes(fx: &mut FunctionCx<'_, impl Module>, fields: &[CValue]) -> Vec<Value> {
+    let mut lanes = Vec::new();
+
+    for field in fields {
+        if field.layout.is_zst() {
+            continue;
+        }
+        match field.layout.backend_repr {
+            BackendRepr::Scalar(_) => lanes.push(field.load_scalar(fx)),
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = field.load_scalar_pair(fx);
+                lanes.push(a);
+                lanes.push(b);
+            }
+            _ => {
+                panic!(
+                    "non-scalar field representation in scalar ABI aggregate: {:?}",
+                    field.layout.backend_repr
+                );
+            }
+        }
+    }
+
+    lanes
+}
+
 fn codegen_aggregate(
     fx: &mut FunctionCx<'_, impl Module>,
     kind: &hir_ty::mir::AggregateKind,
@@ -1294,29 +1326,31 @@ fn codegen_aggregate(
         | AggregateKind::Closure(_)
         | AggregateKind::Coroutine(_)
         | AggregateKind::CoroutineClosure(_) => {
+            let field_vals: Vec<_> = operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
+
             // For ScalarPair tuples, construct directly as a pair
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-                assert_eq!(operands.len(), 2, "ScalarPair aggregate expects 2 operands");
-                let val0 = codegen_operand(fx, &operands[0].kind).load_scalar(fx);
-                let val1 = codegen_operand(fx, &operands[1].kind).load_scalar(fx);
+                let lanes = collect_scalar_abi_lanes(fx, &field_vals);
+                assert_eq!(lanes.len(), 2, "ScalarPair aggregate expects 2 ABI scalar lanes");
+                let val0 = lanes[0];
+                let val1 = lanes[1];
                 dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
                 return;
             }
 
             // For single scalar, construct directly
             if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
-                assert_eq!(operands.len(), 1, "Scalar aggregate expects 1 operand");
-                let val = codegen_operand(fx, &operands[0].kind);
-                dest.write_cvalue(fx, val);
+                let lanes = collect_scalar_abi_lanes(fx, &field_vals);
+                assert_eq!(lanes.len(), 1, "Scalar aggregate expects 1 ABI scalar lane");
+                dest.write_cvalue(fx, CValue::by_val(lanes[0], dest.layout.clone()));
                 return;
             }
 
             // General case: write each field to the destination place
-            for (i, operand) in operands.iter().enumerate() {
-                let field_cval = codegen_operand(fx, &operand.kind);
+            for (i, field_cval) in field_vals.iter().enumerate() {
                 let field_layout = field_cval.layout.clone();
                 let field_place = dest.place_field(fx, i, field_layout);
-                field_place.write_cvalue(fx, field_cval);
+                field_place.write_cvalue(fx, field_cval.clone());
             }
         }
         AggregateKind::Adt(variant_id, _subst) => {

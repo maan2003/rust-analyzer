@@ -33,6 +33,13 @@ What is in place:
   - wide (`ScalarPair`) -> wide keeps data+metadata
   - wide (`ScalarPair`) -> thin drops metadata
   - this removed the `load_scalar on ByValPair` panic seen in `Vec::new` paths.
+- MIR lowering now supports const blocks in the mirdataless path:
+  - `Expr::Const` no longer returns `NotSupported("const block")`.
+  - the inner const-block expression is lowered under const scope in `crates/hir-ty/src/mir/lower.rs`.
+- ADT aggregate ScalarPair lowering now materializes ABI lanes from field representations
+  (Scalar / ScalarPair) instead of assuming "2 non-ZST fields".
+  - this fixes the `ScalarPair ADT expects 2 non-ZST fields` panic in `codegen_adt_fields`
+    and aligns behavior with upstream `cg_clif`'s field-wise aggregate writes.
 
 ## Tests Revived
 
@@ -44,11 +51,10 @@ What is in place:
   - `std_jit_process_id_is_stable_across_calls`
   - currently `#[ignore]` due to observed JIT flakiness where repeated calls can diverge.
   - `std_jit_vec_new_smoke`
+  - const-block lowering and ScalarPair ADT panic are fixed; failure moved forward.
   - currently `#[ignore]` due to unresolved symbol at JIT finalize:
-    `alloc::raw_vec::RawVec::<T, A>::new_in`.
-    The harness attempts to compile it, but MIR lowering currently returns
-    `NotSupported("const block")`, so it falls back to import linkage; this symbol is not
-    exported from `libstd.so` and cannot be resolved.
+    `_RINvNtNtCsi96gERPWvbJ_4core5alloc9Allocator10deallocateNtNtCs4qrWNytdlK1_5alloc5alloc6GlobalE`
+    (`core::alloc::Allocator::deallocate` for `alloc::alloc::Global`).
   - `std_jit_env_var_roundtrip`
   - currently `#[ignore]` due to `non-value const in ScalarPair constant` during codegen.
 
@@ -58,9 +64,9 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_process_id_nonzero)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_str_len_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture --run-ignored all`
-  now gets past previous codegen panics and fails at JIT finalize with unresolved symbol
-  `_R...alloc7raw_vec...RawVec...new_in...`; traced cause is
-  `fallback=import reason=mir_error error=NotSupported("const block")`.
+  now gets past `RawVec::new_in` const-block MIR lowering and the ScalarPair ADT panic,
+  then fails later at JIT finalize with unresolved symbol
+  `_RINvNtNtCsi96gERPWvbJ_4core5alloc9Allocator10deallocateNtNtCs4qrWNytdlK1_5alloc5alloc6GlobalE`.
 - `just test-clif -E 'test(std_jit_env_var_roundtrip)' --no-capture --run-ignored all`
   now reaches codegen and fails with `non-value const in ScalarPair constant` (previous `HasErrorType` gone).
 
@@ -69,9 +75,10 @@ Validation recently run:
 - Coverage is still narrow: only a small `std` smoke path is live.
 - We do not yet have a broader stable suite of std-JIT end-to-end tests (collections, env/thread/time, etc.).
 - The ignored repeated-call process-id test indicates a correctness/ABI/call-lowering issue that should be diagnosed.
-- `Vec::new` path is now blocked at cross-crate MIR lowering for `const { ... }`.
-  - `alloc::raw_vec::RawVec::<T, A>::new_in` lowering reports `NotSupported("const block")`.
-  - import fallback cannot save this case because the symbol is not exported from `libstd.so`.
+- `Vec::new` path now reaches JIT finalize and is blocked by unresolved allocator symbol
+  resolution for `core::alloc::Allocator::deallocate` (`Global`).
+  - this indicates a remaining gap in call target resolution / reachable compilation /
+    linkage for that trait-method instance.
 - `std::env::var` path is now blocked later in codegen by ScalarPair-constant lowering (`non-value const in ScalarPair constant`).
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
@@ -85,9 +92,12 @@ Validation recently run:
    - Repro target: `std_jit_process_id_is_stable_across_calls`.
    - Check call signature lowering, return handling, and import resolution consistency.
 
-3. Add MIR lowering support for const blocks in the mirdataless path.
-   - Repro target: `std_jit_vec_new_smoke` (`RawVec::new_in`).
-   - Goal: avoid fallback-to-import for non-exported cross-crate std helpers using `const { ... }`.
+3. Diagnose allocator trait-method symbol resolution in the Vec path.
+   - Repro target: `std_jit_vec_new_smoke`.
+   - Focus symbol:
+     `_RINvNtNtCsi96gERPWvbJ_4core5alloc9Allocator10deallocateNtNtCs4qrWNytdlK1_5alloc5alloc6GlobalE`.
+   - Goal: ensure this instance is either compiled from MIR with matching mangling,
+     or resolved as a valid import when available.
 
 4. Fix ScalarPair constant lowering for std flows (current blocker for `std_jit_env_var_roundtrip`).
    - Repro target: `std_jit_env_var_roundtrip`.
