@@ -1,8 +1,7 @@
 use std::{fmt, iter};
 
 use rustc_abi::{
-    AddressSpace, Align, BackendRepr, CanonAbi, ExternAbi, HasDataLayout, Primitive,
-    Scalar, Size,
+    AddressSpace, Align, BackendRepr, CanonAbi, ExternAbi, HasDataLayout, Primitive, Scalar, Size,
 };
 
 mod reg;
@@ -396,7 +395,6 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             ),
             BackendRepr::SimdVector { .. } => PassMode::Direct(ArgAttributes::new()),
             BackendRepr::Memory { .. } => Self::indirect_pass_mode(&layout),
-
         };
         ArgAbi { layout, mode }
     }

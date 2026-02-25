@@ -1,8 +1,8 @@
 // Reference: ELF Application Binary Interface s390x Supplement
 // https://github.com/IBM/s390x-abi
 
-use rustc_abi::{BackendRepr, HasDataLayout};
 use crate::layout_ty::TyAbiInterface;
+use rustc_abi::{BackendRepr, HasDataLayout};
 
 use crate::callconv::{ArgAbi, FnAbi, Reg, RegKind};
 use crate::spec::{Env, HasTargetSpec, Os};

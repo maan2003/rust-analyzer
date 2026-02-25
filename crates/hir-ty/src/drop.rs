@@ -82,37 +82,29 @@ fn has_drop_glue_mono_impl<'db>(
                     {
                         return false;
                     }
-                    db.field_types(id.into())
-                        .iter()
-                        .any(|(_, field_ty)| {
+                    db.field_types(id.into()).iter().any(|(_, field_ty)| {
+                        has_drop_glue_mono_impl(
+                            interner,
+                            field_ty.get().instantiate(interner, subst),
+                            visited,
+                        )
+                    })
+                }
+                AdtId::UnionId(_) => false,
+                AdtId::EnumId(id) => {
+                    id.enum_variants(db).variants.iter().any(|&(variant, _, _)| {
+                        db.field_types(variant.into()).iter().any(|(_, field_ty)| {
                             has_drop_glue_mono_impl(
                                 interner,
                                 field_ty.get().instantiate(interner, subst),
                                 visited,
                             )
                         })
+                    })
                 }
-                AdtId::UnionId(_) => false,
-                AdtId::EnumId(id) => id
-                    .enum_variants(db)
-                    .variants
-                    .iter()
-                    .any(|&(variant, _, _)| {
-                        db.field_types(variant.into())
-                            .iter()
-                            .any(|(_, field_ty)| {
-                                has_drop_glue_mono_impl(
-                                    interner,
-                                    field_ty.get().instantiate(interner, subst),
-                                    visited,
-                                )
-                            })
-                    }),
             }
         }
-        TyKind::Tuple(tys) => tys
-            .iter()
-            .any(|ty| has_drop_glue_mono_impl(interner, ty, visited)),
+        TyKind::Tuple(tys) => tys.iter().any(|ty| has_drop_glue_mono_impl(interner, ty, visited)),
         TyKind::Array(ty, len) => {
             if consteval::try_const_usize(db, len) == Some(0) {
                 return false;

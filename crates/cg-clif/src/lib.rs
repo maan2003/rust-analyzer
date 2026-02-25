@@ -7,34 +7,36 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Block, InstBuilder, MemFlags, Signature, Type, Value, types};
+use cranelift_codegen::ir::{
+    AbiParam, ArgumentPurpose, Block, InstBuilder, MemFlags, Signature, Type, Value, types,
+};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{AssocItemId, CallableDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId};
-use hir_def::signatures::FunctionSignature;
-use hir_ty::db::HirDatabase;
-use hir_ty::mir::{
-    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place,
-    ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
-};
 use either::Either;
+use hir_def::signatures::FunctionSignature;
+use hir_def::{AssocItemId, CallableDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId};
 use hir_ty::PointerCast;
+use hir_ty::db::HirDatabase;
 use hir_ty::method_resolution::TraitImpls;
-use hir_ty::next_solver::{Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind};
-use rustc_type_ir::inherent::GenericArgs as _;
+use hir_ty::mir::{
+    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
+    Rvalue, StatementKind, TerminatorKind, UnOp,
+};
+use hir_ty::next_solver::{
+    Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
+};
 use hir_ty::traits::StoredParamEnvAndCrate;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
+use rustc_type_ir::inherent::GenericArgs as _;
 use triomphe::Arc as TArc;
 
-pub mod layout;
 pub mod link;
-pub mod mirdata_codegen;
 mod pointer;
 pub mod symbol_mangling;
 mod value_and_place;
@@ -81,7 +83,11 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
 
 /// Append a return type to a Cranelift signature based on its layout.
 /// Returns `true` if the return is memory-repr and needs an sret pointer.
-pub(crate) fn append_ret_to_sig(sig: &mut Signature, dl: &TargetDataLayout, layout: &Layout) -> bool {
+pub(crate) fn append_ret_to_sig(
+    sig: &mut Signature,
+    dl: &TargetDataLayout,
+    layout: &Layout,
+) -> bool {
     match layout.backend_repr {
         BackendRepr::Scalar(scalar) => {
             sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
@@ -156,12 +162,6 @@ pub(crate) enum MirSource<'a> {
         local_crate: base_db::Crate,
         ext_crate_disambiguators: &'a HashMap<String, u64>,
     },
-    Mirdata {
-        body: &'a ra_mir_types::Body,
-        layouts: &'a [LayoutArc],
-        fn_registry: &'a HashMap<(u64, u64), FuncId>,
-        ty_layouts: &'a HashMap<ra_mir_types::Ty, LayoutArc>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -189,35 +189,30 @@ impl<'a, M: Module> FunctionCx<'a, M> {
     fn db(&self) -> &'a dyn HirDatabase {
         match &self.mir {
             MirSource::Ra { db, .. } => *db,
-            _ => panic!("db() called on non-Ra FunctionCx"),
         }
     }
 
     fn env(&self) -> &StoredParamEnvAndCrate {
         match &self.mir {
             MirSource::Ra { env, .. } => env,
-            _ => panic!("env() called on non-Ra FunctionCx"),
         }
     }
 
     fn ra_body(&self) -> &'a MirBody {
         match &self.mir {
             MirSource::Ra { body, .. } => body,
-            _ => panic!("ra_body() called on non-Ra FunctionCx"),
         }
     }
 
     fn local_crate(&self) -> base_db::Crate {
         match &self.mir {
             MirSource::Ra { local_crate, .. } => *local_crate,
-            _ => panic!("local_crate() called on non-Ra FunctionCx"),
         }
     }
 
     fn ext_crate_disambiguators(&self) -> &'a HashMap<String, u64> {
         match &self.mir {
             MirSource::Ra { ext_crate_disambiguators, .. } => ext_crate_disambiguators,
-            _ => panic!("ext_crate_disambiguators() called on non-Ra FunctionCx"),
         }
     }
 
@@ -225,16 +220,8 @@ impl<'a, M: Module> FunctionCx<'a, M> {
         self.block_map[bb.into_raw().into_u32() as usize]
     }
 
-    fn clif_block_idx(&self, idx: usize) -> Block {
-        self.block_map[idx]
-    }
-
     fn local_place(&self, local: LocalId) -> &CPlace {
         &self.local_map[local.into_raw().into_u32() as usize]
-    }
-
-    fn local_place_idx(&self, idx: usize) -> &CPlace {
-        &self.local_map[idx]
     }
 
     /// Set the drop flag for a local to "live" (1). Called on assignment.
@@ -252,18 +239,6 @@ impl<'a, M: Module> FunctionCx<'a, M> {
         if let Some(&var) = self.drop_flags.get(&idx) {
             let zero = self.bcx.ins().iconst(types::I8, 0);
             self.bcx.def_var(var, zero);
-        }
-    }
-
-    /// Look up a layout by `ra_mir_types::Ty` (mirdata path only).
-    pub(crate) fn md_layout(&self, ty: &ra_mir_types::Ty) -> LayoutArc {
-        match &self.mir {
-            MirSource::Mirdata { ty_layouts, .. } => {
-                ty_layouts.get(ty).unwrap_or_else(|| {
-                    panic!("mirdata layout not found for type: {:?}", ty)
-                }).clone()
-            }
-            _ => panic!("md_layout() called on non-Mirdata FunctionCx"),
         }
     }
 }
@@ -308,9 +283,7 @@ fn const_to_u64(konst: Const<'_>) -> u64 {
 fn operand_ty(db: &dyn HirDatabase, body: &MirBody, kind: &OperandKind) -> StoredTy {
     match kind {
         OperandKind::Constant { ty, .. } => ty.clone(),
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place_ty(db, body, place)
-        }
+        OperandKind::Copy(place) | OperandKind::Move(place) => place_ty(db, body, place),
         OperandKind::Static(_) => todo!("static operand type"),
     }
 }
@@ -368,7 +341,12 @@ fn ty_is_signed_int(ty: StoredTy) -> bool {
     matches!(ty.as_ref().kind(), TyKind::Int(_))
 }
 
-pub(crate) fn codegen_intcast(fx: &mut FunctionCx<'_, impl Module>, val: Value, to_ty: Type, signed: bool) -> Value {
+pub(crate) fn codegen_intcast(
+    fx: &mut FunctionCx<'_, impl Module>,
+    val: Value,
+    to_ty: Type,
+    signed: bool,
+) -> Value {
     let from_ty = fx.bcx.func.dfg.value_type(val);
     match (from_ty, to_ty) {
         (_, _) if from_ty == to_ty => val,
@@ -394,16 +372,13 @@ pub(crate) fn codegen_libcall1(
     sig.params.extend(params.iter().copied().map(AbiParam::new));
     sig.returns.push(AbiParam::new(ret));
 
-    let func_id = fx
-        .module
-        .declare_function(name, Linkage::Import, &sig)
-        .expect("declare libcall");
+    let func_id = fx.module.declare_function(name, Linkage::Import, &sig).expect("declare libcall");
     let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
     let call = fx.bcx.ins().call(func_ref, args);
     fx.bcx.inst_results(call)[0]
 }
 
-/// Type-system-agnostic scalar cast kinds, for sharing between Ra and mirdata paths.
+/// Type-system-agnostic scalar cast kinds.
 pub(crate) enum ScalarCastKind {
     IntToInt,
     FloatToInt,
@@ -411,7 +386,6 @@ pub(crate) enum ScalarCastKind {
     FloatToFloat,
     /// Thin pointer casts (PtrToPtr, FnPtrToPtr, expose/with provenance, MutToConst, etc.)
     PtrLike,
-    Transmute,
 }
 
 /// Shared scalar-to-scalar cast codegen.
@@ -453,17 +427,6 @@ pub(crate) fn codegen_scalar_cast(
             _ => unreachable!("invalid float cast from {from_clif_ty:?} to {target_clif_ty:?}"),
         },
         ScalarCastKind::PtrLike => codegen_intcast(fx, from_val, target_clif_ty, false),
-        ScalarCastKind::Transmute => {
-            if from_clif_ty == target_clif_ty {
-                from_val
-            } else if from_clif_ty.bits() == target_clif_ty.bits() {
-                fx.bcx.ins().bitcast(target_clif_ty, MemFlags::new(), from_val)
-            } else {
-                unreachable!(
-                    "transmute between mismatched clif types: {from_clif_ty:?} -> {target_clif_ty:?}"
-                );
-            }
-        }
     };
     CValue::by_val(val, dest_layout.clone())
 }
@@ -492,37 +455,55 @@ fn codegen_cast(
             panic!("ReifyFnPointer on non-function: {:?}", def);
         };
         // Declare the function in the module and get its address
-        let is_extern = matches!(
-            callee_func_id.loc(fx.db()).container,
-            ItemContainerId::ExternBlockId(_)
-        );
+        let is_extern =
+            matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
         let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
         let interner = DbInterner::new_no_crate(fx.db());
         let empty_args = GenericArgs::empty(interner);
         let (callee_sig, callee_name) = if is_extern {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
-                .expect("extern fn sig");
+            let sig =
+                build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
+                    .expect("extern fn sig");
             let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
             (sig, name)
         } else if is_cross_crate {
-            let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
-                .expect("cross-crate fn sig");
+            let sig = build_fn_sig_from_ty(
+                fx.isa,
+                fx.db(),
+                fx.dl,
+                fx.env(),
+                callee_func_id,
+                generic_args,
+            )
+            .expect("cross-crate fn sig");
             let name = symbol_mangling::mangle_function(
-                fx.db(), callee_func_id, generic_args, fx.ext_crate_disambiguators(),
+                fx.db(),
+                callee_func_id,
+                generic_args,
+                fx.ext_crate_disambiguators(),
             );
             (sig, name)
         } else {
-            let callee_body = fx.db()
-                .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env().clone())
+            let callee_body = fx
+                .db()
+                .monomorphized_mir_body(
+                    callee_func_id.into(),
+                    generic_args.store(),
+                    fx.env().clone(),
+                )
                 .expect("failed to get callee MIR for ReifyFnPointer");
-            let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body, &[])
-                .expect("callee sig");
+            let sig =
+                build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
             let name = symbol_mangling::mangle_function(
-                fx.db(), callee_func_id, generic_args, fx.ext_crate_disambiguators(),
+                fx.db(),
+                callee_func_id,
+                generic_args,
+                fx.ext_crate_disambiguators(),
             );
             (sig, name)
         };
-        let callee_id = fx.module
+        let callee_id = fx
+            .module
             .declare_function(&callee_name, Linkage::Import, &callee_sig)
             .expect("declare callee for ReifyFnPointer");
         let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
@@ -606,11 +587,7 @@ pub(crate) fn clif_bitcast(
     dst_ty: Type,
 ) -> Value {
     let src_ty = fx.bcx.func.dfg.value_type(val);
-    if src_ty == dst_ty {
-        val
-    } else {
-        fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val)
-    }
+    if src_ty == dst_ty { val } else { fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val) }
 }
 
 /// Handle `PointerCoercion(Unsize)`: `&T → &dyn Trait`.
@@ -627,14 +604,17 @@ fn codegen_unsize_coercion(
     let data_ptr = from_cval.load_scalar(fx);
 
     // Extract the trait from the target type (&dyn Trait → Dyn → trait_id)
-    let pointee_ty = target_ty.as_ref().builtin_deref(true)
+    let pointee_ty = target_ty
+        .as_ref()
+        .builtin_deref(true)
         .expect("Unsize target must be a pointer/reference type");
-    let trait_id = pointee_ty.dyn_trait()
-        .expect("Unsize target pointee must be dyn Trait");
+    let trait_id = pointee_ty.dyn_trait().expect("Unsize target pointee must be dyn Trait");
 
     // Extract the concrete source type (what's behind the thin pointer)
     let from_ty = operand_ty(fx.db(), body, &operand.kind);
-    let source_pointee = from_ty.as_ref().builtin_deref(true)
+    let source_pointee = from_ty
+        .as_ref()
+        .builtin_deref(true)
         .expect("Unsize source must be a pointer/reference type");
 
     let vtable_ptr = get_or_create_vtable(fx, source_pointee.store(), trait_id);
@@ -659,7 +639,8 @@ fn get_or_create_vtable(
     let ptr_size = fx.dl.pointer_size().bytes() as usize;
 
     // Get concrete type layout for size/align
-    let concrete_layout = fx.db()
+    let concrete_layout = fx
+        .db()
         .layout_of_ty(concrete_ty.clone(), fx.env().clone())
         .expect("layout error for vtable concrete type");
     let concrete_size = concrete_layout.size.bytes();
@@ -667,7 +648,9 @@ fn get_or_create_vtable(
 
     // Get trait methods in declaration order
     let trait_items = trait_id.trait_items(fx.db());
-    let method_func_ids: Vec<hir_def::FunctionId> = trait_items.items.iter()
+    let method_func_ids: Vec<hir_def::FunctionId> = trait_items
+        .items
+        .iter()
         .filter_map(|(_name, item)| match item {
             AssocItemId::FunctionId(fid) => Some(*fid),
             _ => None,
@@ -682,8 +665,9 @@ fn get_or_create_vtable(
 
     // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
     use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
-    let simplified = simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
-        .expect("cannot simplify concrete type for vtable lookup");
+    let simplified =
+        simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
+            .expect("cannot simplify concrete type for vtable lookup");
     let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
     assert!(!impl_ids.is_empty(), "no impl found for vtable");
     let impl_id = impl_ids[0]; // Take first matching impl
@@ -691,12 +675,18 @@ fn get_or_create_vtable(
     // Build unique vtable name
     let vtable_name = format!(
         "__vtable_{}_for_{:?}",
-        trait_id.trait_items(fx.db()).items.first().map(|(n, _)| n.as_str().to_string()).unwrap_or_default(),
+        trait_id
+            .trait_items(fx.db())
+            .items
+            .first()
+            .map(|(n, _)| n.as_str().to_string())
+            .unwrap_or_default(),
         simplified,
     );
 
     // Declare the vtable data object
-    let data_id = fx.module
+    let data_id = fx
+        .module
         .declare_data(&vtable_name, Linkage::Local, false, false)
         .expect("declare vtable data");
 
@@ -709,10 +699,12 @@ fn get_or_create_vtable(
     // (already zeroed)
 
     // Slot 1: size
-    vtable_bytes[ptr_size..ptr_size * 2].copy_from_slice(&(concrete_size as u64).to_le_bytes()[..ptr_size]);
+    vtable_bytes[ptr_size..ptr_size * 2]
+        .copy_from_slice(&(concrete_size as u64).to_le_bytes()[..ptr_size]);
 
     // Slot 2: alignment
-    vtable_bytes[ptr_size * 2..ptr_size * 3].copy_from_slice(&(concrete_align as u64).to_le_bytes()[..ptr_size]);
+    vtable_bytes[ptr_size * 2..ptr_size * 3]
+        .copy_from_slice(&(concrete_align as u64).to_le_bytes()[..ptr_size]);
 
     data.define(vtable_bytes.into_boxed_slice());
 
@@ -721,7 +713,9 @@ fn get_or_create_vtable(
     for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
         // Find the corresponding impl method by name
         let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
-        let impl_func_id = impl_items.items.iter()
+        let impl_func_id = impl_items
+            .items
+            .iter()
             .find_map(|(name, item)| {
                 if *name == trait_method_name {
                     match item {
@@ -732,17 +726,20 @@ fn get_or_create_vtable(
                     None
                 }
             })
-            .unwrap_or_else(|| panic!("impl method `{}` not found for vtable", trait_method_name.as_str()));
+            .unwrap_or_else(|| {
+                panic!("impl method `{}` not found for vtable", trait_method_name.as_str())
+            });
 
         // Declare/import the impl function
-        let impl_body = fx.db()
+        let impl_body = fx
+            .db()
             .monomorphized_mir_body(
                 impl_func_id.into(),
                 GenericArgs::empty(interner).store(),
                 fx.env().clone(),
             )
             .expect("failed to get impl method MIR for vtable");
-        let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body, &[])
+        let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
             .expect("impl method sig for vtable");
         let impl_fn_name = symbol_mangling::mangle_function(
             fx.db(),
@@ -751,7 +748,8 @@ fn get_or_create_vtable(
             fx.ext_crate_disambiguators(),
         );
 
-        let func_id = fx.module
+        let func_id = fx
+            .module
             .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
             .expect("declare vtable method");
         let func_ref = fx.module.declare_func_in_data(func_id, &mut data);
@@ -797,15 +795,14 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
         match proj {
             ProjectionElem::Field(field) => {
                 let field_idx = match field {
-                    Either::Left(field_id) => {
-                        field_id.local_id.into_raw().into_u32() as usize
-                    }
+                    Either::Left(field_id) => field_id.local_id.into_raw().into_u32() as usize,
                     Either::Right(tuple_field_id) => tuple_field_id.index as usize,
                 };
 
                 // Determine the field type from the current type
                 let field_ty = field_type(fx.db(), &cur_ty, field);
-                let field_layout = fx.db()
+                let field_layout = fx
+                    .db()
                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("field layout error");
 
@@ -813,11 +810,10 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 cur_ty = field_ty;
             }
             ProjectionElem::Deref => {
-                let inner_ty = cur_ty
-                    .as_ref()
-                    .builtin_deref(true)
-                    .expect("deref on non-pointer type");
-                let inner_layout = fx.db()
+                let inner_ty =
+                    cur_ty.as_ref().builtin_deref(true).expect("deref on non-pointer type");
+                let inner_layout = fx
+                    .db()
                     .layout_of_ty(inner_ty.store(), fx.env().clone())
                     .expect("deref layout error");
 
@@ -859,7 +855,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
             ProjectionElem::ClosureField(idx) => {
                 // Closure captures are stored as fields of the closure struct
                 let field_ty = closure_field_type(fx.db(), &cur_ty, *idx);
-                let field_layout = fx.db()
+                let field_layout = fx
+                    .db()
                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("closure field layout error");
                 cplace = cplace.place_field(fx, *idx, field_layout);
@@ -872,9 +869,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
                     _ => panic!("Index on non-array/slice type"),
                 };
-                let elem_layout = fx.db()
-                    .layout_of_ty(elem_ty.clone(), fx.env().clone())
-                    .expect("elem layout");
+                let elem_layout =
+                    fx.db().layout_of_ty(elem_ty.clone(), fx.env().clone()).expect("elem layout");
                 let offset = fx.bcx.ins().imul_imm(index_val, elem_layout.size.bytes() as i64);
                 // Arrays in registers → spill to memory
                 if cplace.is_register() {
@@ -893,9 +889,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
                     _ => panic!("ConstantIndex on non-array/slice type"),
                 };
-                let elem_layout = fx.db()
-                    .layout_of_ty(elem_ty.clone(), fx.env().clone())
-                    .expect("elem layout");
+                let elem_layout =
+                    fx.db().layout_of_ty(elem_ty.clone(), fx.env().clone()).expect("elem layout");
                 let index = if !*from_end {
                     fx.bcx.ins().iconst(fx.pointer_type, *offset as i64)
                 } else {
@@ -937,9 +932,7 @@ fn field_type(
         TyKind::Tuple(tys) => {
             let idx = match field {
                 Either::Right(tuple_field) => tuple_field.index as usize,
-                Either::Left(field_id) => {
-                    field_id.local_id.into_raw().into_u32() as usize
-                }
+                Either::Left(field_id) => field_id.local_id.into_raw().into_u32() as usize,
             };
             tys.as_slice()[idx].store()
         }
@@ -958,11 +951,7 @@ fn field_type(
 }
 
 /// Get the type of a closure field (captured variable).
-fn closure_field_type(
-    db: &dyn HirDatabase,
-    closure_ty: &StoredTy,
-    idx: usize,
-) -> StoredTy {
+fn closure_field_type(db: &dyn HirDatabase, closure_ty: &StoredTy, idx: usize) -> StoredTy {
     let TyKind::Closure(closure_id, args) = closure_ty.as_ref().kind() else {
         panic!("closure_field_type on non-closure: {:?}", closure_ty);
     };
@@ -1138,8 +1127,7 @@ fn codegen_rvalue(
                     // The place is behind a fat pointer; get the metadata
                     // that was stored during deref projection.
                     let cplace = codegen_place(fx, place);
-                    let meta = cplace.get_extra()
-                        .expect("slice Len requires fat pointer metadata");
+                    let meta = cplace.get_extra().expect("slice Len requires fat pointer metadata");
                     CValue::by_val(meta, result_layout.clone())
                 }
                 _ => todo!("Len on non-array/slice type: {:?}", place_ty),
@@ -1184,9 +1172,7 @@ fn codegen_adt_fields(
     // Fast path: Scalar ADT with single variant (wrapper struct)
     if is_single_variant {
         if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
-            let non_zst: Vec<_> = field_vals.iter()
-                .filter(|cv| !cv.layout.is_zst())
-                .collect();
+            let non_zst: Vec<_> = field_vals.iter().filter(|cv| !cv.layout.is_zst()).collect();
             assert_eq!(non_zst.len(), 1, "Scalar ADT expects 1 non-ZST field");
             dest.write_cvalue(fx, non_zst[0].clone());
             codegen_set_discriminant(fx, &dest, variant_idx);
@@ -1195,9 +1181,7 @@ fn codegen_adt_fields(
 
         // Fast path: ScalarPair ADT with single variant (two-field struct)
         if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-            let non_zst: Vec<_> = field_vals.iter()
-                .filter(|cv| !cv.layout.is_zst())
-                .collect();
+            let non_zst: Vec<_> = field_vals.iter().filter(|cv| !cv.layout.is_zst()).collect();
             assert_eq!(non_zst.len(), 2, "ScalarPair ADT expects 2 non-ZST fields");
             let val0 = non_zst[0].load_scalar(fx);
             let val1 = non_zst[1].load_scalar(fx);
@@ -1209,8 +1193,7 @@ fn codegen_adt_fields(
 
     // General case: for multi-variant enums on register places,
     // spill to memory so field projections use correct offsets.
-    let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. })
-        && dest.is_register();
+    let use_temp = matches!(&dest.layout.variants, Variants::Multiple { .. }) && dest.is_register();
     let (work_dest, original_dest) = if use_temp {
         let tmp = CPlace::new_stack_slot(fx, dest.layout.clone());
         (tmp, Some(dest))
@@ -1250,16 +1233,17 @@ fn codegen_aggregate(
 ) {
     use hir_ty::mir::AggregateKind;
     match kind {
-        AggregateKind::Tuple(_) | AggregateKind::Array(_) | AggregateKind::Closure(_) | AggregateKind::Coroutine(_) | AggregateKind::CoroutineClosure(_) => {
+        AggregateKind::Tuple(_)
+        | AggregateKind::Array(_)
+        | AggregateKind::Closure(_)
+        | AggregateKind::Coroutine(_)
+        | AggregateKind::CoroutineClosure(_) => {
             // For ScalarPair tuples, construct directly as a pair
             if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
                 assert_eq!(operands.len(), 2, "ScalarPair aggregate expects 2 operands");
                 let val0 = codegen_operand(fx, &operands[0].kind).load_scalar(fx);
                 let val1 = codegen_operand(fx, &operands[1].kind).load_scalar(fx);
-                dest.write_cvalue(
-                    fx,
-                    CValue::by_val_pair(val0, val1, dest.layout.clone()),
-                );
+                dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
                 return;
             }
 
@@ -1281,9 +1265,8 @@ fn codegen_aggregate(
         }
         AggregateKind::Adt(variant_id, _subst) => {
             let variant_idx = variant_id_to_idx(fx.db(), *variant_id);
-            let field_vals: Vec<_> = operands.iter()
-                .map(|op| codegen_operand(fx, &op.kind))
-                .collect();
+            let field_vals: Vec<_> =
+                operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
             codegen_adt_fields(fx, variant_idx, &field_vals, dest);
         }
         AggregateKind::Union(_, _) => {
@@ -1334,9 +1317,7 @@ pub(crate) fn codegen_get_discriminant(
 
             // Read the tag value — handle register and memory places
             let tag_val = match place.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    place.to_cvalue(fx).load_scalar(fx)
-                }
+                BackendRepr::Scalar(_) => place.to_cvalue(fx).load_scalar(fx),
                 BackendRepr::ScalarPair(_, _) => {
                     let (a, b) = place.to_cvalue(fx).load_scalar_pair(fx);
                     if tag_field.as_usize() == 0 { a } else { b }
@@ -1377,24 +1358,18 @@ pub(crate) fn codegen_get_discriminant(
 
                     let (is_niche, tagged_discr, delta) = if relative_max == 0 {
                         // Single niche variant: just compare tag == niche_start
-                        let is_niche = codegen_icmp_imm(
-                            fx,
-                            IntCC::Equal,
-                            tag_val,
-                            *niche_start as i128,
-                        );
-                        let tagged_discr = fx.bcx.ins().iconst(
-                            dest_clif_ty,
-                            niche_variants.start().as_u32() as i64,
-                        );
+                        let is_niche =
+                            codegen_icmp_imm(fx, IntCC::Equal, tag_val, *niche_start as i128);
+                        let tagged_discr = fx
+                            .bcx
+                            .ins()
+                            .iconst(dest_clif_ty, niche_variants.start().as_u32() as i64);
                         (is_niche, tagged_discr, 0)
                     } else {
                         // General case: compute relative_tag, check range
-                        let niche_start_val =
-                            fx.bcx.ins().iconst(tag_clif_ty, *niche_start as i64);
+                        let niche_start_val = fx.bcx.ins().iconst(tag_clif_ty, *niche_start as i64);
                         let relative_discr = fx.bcx.ins().isub(tag_val, niche_start_val);
-                        let cast_tag =
-                            codegen_intcast(fx, relative_discr, dest_clif_ty, false);
+                        let cast_tag = codegen_intcast(fx, relative_discr, dest_clif_ty, false);
                         let is_niche = codegen_icmp_imm(
                             fx,
                             IntCC::UnsignedLessThanOrEqual,
@@ -1411,10 +1386,8 @@ pub(crate) fn codegen_get_discriminant(
                         fx.bcx.ins().iadd(tagged_discr, delta_val)
                     };
 
-                    let untagged_variant_val = fx.bcx.ins().iconst(
-                        dest_clif_ty,
-                        i64::from(untagged_variant.as_u32()),
-                    );
+                    let untagged_variant_val =
+                        fx.bcx.ins().iconst(dest_clif_ty, i64::from(untagged_variant.as_u32()));
                     fx.bcx.ins().select(is_niche, tagged_discr, untagged_variant_val)
                 }
             }
@@ -1454,15 +1427,10 @@ pub(crate) fn codegen_set_discriminant(
                     if variant_index != *untagged_variant {
                         let niche = place.place_field(fx, tag_field.as_usize(), tag_layout);
                         let niche_type = scalar_to_clif_type(fx.dl, tag);
-                        let niche_value =
-                            variant_index.as_u32() - niche_variants.start().as_u32();
+                        let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
                         let niche_value = (niche_value as u128).wrapping_add(*niche_start);
-                        let niche_value =
-                            fx.bcx.ins().iconst(niche_type, niche_value as i64);
-                        niche.write_cvalue(
-                            fx,
-                            CValue::by_val(niche_value, niche.layout.clone()),
-                        );
+                        let niche_value = fx.bcx.ins().iconst(niche_type, niche_value as i64);
+                        niche.write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
                     }
                 }
             }
@@ -1507,7 +1475,8 @@ fn codegen_binop(
                     .as_ref()
                     .builtin_deref(true)
                     .expect("Offset lhs must be a pointer/reference");
-                let pointee_layout = fx.db()
+                let pointee_layout = fx
+                    .db()
                     .layout_of_ty(pointee_ty.store(), fx.env().clone())
                     .expect("layout error for pointee type");
                 let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
@@ -1648,11 +1617,8 @@ pub(crate) fn codegen_checked_int_binop(
                     let lhs_w = b.ins().sextend(wide, lhs);
                     let rhs_w = b.ins().sextend(wide, rhs);
                     let val_w = b.ins().imul(lhs_w, rhs_w);
-                    let has_underflow = b.ins().icmp_imm(
-                        IntCC::SignedLessThan,
-                        val_w,
-                        -(1i64 << (ty.bits() - 1)),
-                    );
+                    let has_underflow =
+                        b.ins().icmp_imm(IntCC::SignedLessThan, val_w, -(1i64 << (ty.bits() - 1)));
                     let has_overflow = b.ins().icmp_imm(
                         IntCC::SignedGreaterThan,
                         val_w,
@@ -1755,13 +1721,11 @@ fn codegen_unop(
     CValue::by_val(result, result_layout.clone())
 }
 
-fn codegen_operand(
-    fx: &mut FunctionCx<'_, impl Module>,
-    kind: &OperandKind,
-) -> CValue {
+fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> CValue {
     match kind {
         OperandKind::Constant { konst, ty } => {
-            let layout = fx.db()
+            let layout = fx
+                .db()
                 .layout_of_ty(ty.clone(), fx.env().clone())
                 .expect("layout error for constant type");
             if layout.is_zst() {
@@ -1792,7 +1756,8 @@ fn codegen_operand(
                     let const_bytes = val.value.inner();
                     let bytes = &const_bytes.memory;
                     let a_size = a_scalar.size(fx.dl).bytes() as usize;
-                    let b_offset = a_scalar.size(fx.dl).align_to(b_scalar.align(fx.dl).abi).bytes() as usize;
+                    let b_offset =
+                        a_scalar.size(fx.dl).align_to(b_scalar.align(fx.dl).abi).bytes() as usize;
                     let b_size = b_scalar.size(fx.dl).bytes() as usize;
 
                     let a_raw = {
@@ -1810,16 +1775,10 @@ fn codegen_operand(
 
                     // Create data sections for allocations in the memory_map,
                     // building a mapping of old addresses → GlobalValues.
-                    let addr_to_gv = create_const_data_sections(
-                        fx, &const_bytes.memory_map,
-                    );
+                    let addr_to_gv = create_const_data_sections(fx, &const_bytes.memory_map);
 
-                    let a_val = codegen_scalar_const(
-                        fx, &a_scalar, a_raw, &addr_to_gv,
-                    );
-                    let b_val = codegen_scalar_const(
-                        fx, &b_scalar, b_raw, &addr_to_gv,
-                    );
+                    let a_val = codegen_scalar_const(fx, &a_scalar, a_raw, &addr_to_gv);
+                    let b_val = codegen_scalar_const(fx, &b_scalar, b_raw, &addr_to_gv);
                     CValue::by_val_pair(a_val, b_val, layout)
                 }
                 _ => {
@@ -1839,9 +1798,7 @@ fn codegen_operand(
                 }
             }
         }
-        OperandKind::Copy(place) => {
-            codegen_place(fx, place).to_cvalue(fx)
-        }
+        OperandKind::Copy(place) => codegen_place(fx, place).to_cvalue(fx),
         OperandKind::Move(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
             // Clear drop flag: the value has been moved out.
@@ -2005,11 +1962,7 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKin
 /// no-op jump to the target block.
 ///
 /// Reference: cg_clif/src/abi/mod.rs `codegen_drop`
-fn codegen_drop(
-    fx: &mut FunctionCx<'_, impl Module>,
-    place: &Place,
-    target: BasicBlockId,
-) {
+fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: BasicBlockId) {
     let target_block = fx.clif_block(target);
     let body = fx.ra_body();
     let ty = place_ty(fx.db(), body, place);
@@ -2045,9 +1998,9 @@ fn codegen_drop(
     // recursive dropping, call Drop::drop directly (avoiding the
     // drop_in_place wrapper). Otherwise, call drop_in_place::<T>.
     let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
-    let direct_drop = lang_items.Drop.and_then(|drop_trait| {
-        resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, &ty)
-    });
+    let direct_drop = lang_items
+        .Drop
+        .and_then(|drop_trait| resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, &ty));
     let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), &ty);
 
     let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
@@ -2059,18 +2012,18 @@ fn codegen_drop(
         let interner = DbInterner::new_no_crate(fx.db());
         let generic_args = adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
         symbol_mangling::mangle_function(
-            fx.db(), drop_func_id, generic_args.as_ref(), fx.ext_crate_disambiguators(),
+            fx.db(),
+            drop_func_id,
+            generic_args.as_ref(),
+            fx.ext_crate_disambiguators(),
         )
     } else {
         // Needs recursive field drops — use drop_in_place glue
-        symbol_mangling::mangle_drop_in_place(
-            fx.db(), ty.as_ref(), fx.ext_crate_disambiguators(),
-        )
+        symbol_mangling::mangle_drop_in_place(fx.db(), ty.as_ref(), fx.ext_crate_disambiguators())
     };
 
-    let callee_id = fx.module
-        .declare_function(&fn_name, Linkage::Import, &drop_sig)
-        .expect("declare drop fn");
+    let callee_id =
+        fx.module.declare_function(&fn_name, Linkage::Import, &drop_sig).expect("declare drop fn");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
     fx.bcx.ins().call(callee_ref, &[ptr]);
 
@@ -2081,11 +2034,7 @@ fn codegen_drop(
 /// Returns true if any field (struct fields, tuple elements, enum variant
 /// fields, closure captures) has drop glue, requiring a `drop_in_place`
 /// wrapper rather than a simple `Drop::drop` call.
-fn type_has_droppable_fields(
-    db: &dyn HirDatabase,
-    krate: base_db::Crate,
-    ty: &StoredTy,
-) -> bool {
+fn type_has_droppable_fields(db: &dyn HirDatabase, krate: base_db::Crate, ty: &StoredTy) -> bool {
     let interner = DbInterner::new_with(db, krate);
     match ty.as_ref().kind() {
         TyKind::Adt(adt_def, subst) => {
@@ -2093,9 +2042,11 @@ fn type_has_droppable_fields(
             match adt_id {
                 hir_def::AdtId::StructId(id) => {
                     use hir_def::signatures::StructFlags;
-                    if db.struct_signature(id).flags.intersects(
-                        StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA,
-                    ) {
+                    if db
+                        .struct_signature(id)
+                        .flags
+                        .intersects(StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA)
+                    {
                         return false;
                     }
                     db.field_types(id.into()).iter().any(|(_, field_ty)| {
@@ -2125,9 +2076,9 @@ fn type_has_droppable_fields(
             let owner = db.lookup_intern_closure(closure_id.0).0;
             let infer = hir_ty::InferenceResult::for_body(db, owner);
             let (captures, _) = infer.closure_info(closure_id.0);
-            captures.iter().any(|capture| {
-                hir_ty::drop::has_drop_glue_mono(interner, capture.ty(db, subst))
-            })
+            captures
+                .iter()
+                .any(|capture| hir_ty::drop::has_drop_glue_mono(interner, capture.ty(db, subst)))
         }
         _ => false,
     }
@@ -2218,14 +2169,22 @@ fn codegen_call(
                 }
                 CallableDefId::StructId(struct_id) => {
                     codegen_adt_constructor_call(
-                        fx, VariantId::StructId(struct_id), generic_args,
-                        args, destination, target,
+                        fx,
+                        VariantId::StructId(struct_id),
+                        generic_args,
+                        args,
+                        destination,
+                        target,
                     );
                 }
                 CallableDefId::EnumVariantId(variant_id) => {
                     codegen_adt_constructor_call(
-                        fx, VariantId::EnumVariantId(variant_id), generic_args,
-                        args, destination, target,
+                        fx,
+                        VariantId::EnumVariantId(variant_id),
+                        generic_args,
+                        args,
+                        destination,
+                        target,
                     );
                 }
             }
@@ -2250,9 +2209,7 @@ fn codegen_adt_constructor_call(
     let dest = codegen_place(fx, destination);
     if !dest.layout.is_zst() {
         let variant_idx = variant_id_to_idx(fx.db(), variant_id);
-        let field_vals: Vec<_> = args.iter()
-            .map(|op| codegen_operand(fx, &op.kind))
-            .collect();
+        let field_vals: Vec<_> = args.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
         codegen_adt_fields(fx, variant_idx, &field_vals, dest);
     }
 
@@ -2306,8 +2263,8 @@ fn codegen_fn_ptr_call(
 
     // Parameter types in signature
     for &param_ty in sig_tys_inner.inputs() {
-        let param_layout = fx.db().layout_of_ty(param_ty.store(), fx.env().clone())
-            .expect("fn ptr param layout");
+        let param_layout =
+            fx.db().layout_of_ty(param_ty.store(), fx.env().clone()).expect("fn ptr param layout");
         match param_layout.backend_repr {
             BackendRepr::Scalar(scalar) => {
                 sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
@@ -2377,21 +2334,19 @@ fn codegen_closure_call(
     target: &Option<BasicBlockId>,
 ) {
     // Get closure MIR body to build the signature
-    let closure_body = fx.db()
+    let closure_body = fx
+        .db()
         .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
         .expect("closure MIR");
-    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body, &[])
-        .expect("closure sig");
+    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
 
     // Generate mangled name
-    let closure_name = symbol_mangling::mangle_closure(
-        fx.db(), closure_id, fx.ext_crate_disambiguators(),
-    );
+    let closure_name =
+        symbol_mangling::mangle_closure(fx.db(), closure_id, fx.ext_crate_disambiguators());
 
     // Declare in module (Import linkage — defined elsewhere in same module)
-    let callee_id = fx.module
-        .declare_function(&closure_name, Linkage::Import, &sig)
-        .expect("declare closure");
+    let callee_id =
+        fx.module.declare_function(&closure_name, Linkage::Import, &sig).expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
     // Destination
@@ -2460,7 +2415,9 @@ fn codegen_direct_call(
             fx.env().param_env(),
             callee_func_id,
             generic_args,
-        ).is_some() {
+        )
+        .is_some()
+        {
             codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
             return;
         }
@@ -2471,8 +2428,12 @@ fn codegen_direct_call(
             let self_ty = generic_args.type_at(0);
             if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
                 codegen_closure_call(
-                    fx, closure_id.0, closure_subst.store(),
-                    args, destination, target,
+                    fx,
+                    closure_id.0,
+                    closure_subst.store(),
+                    args,
+                    destination,
+                    target,
                 );
                 return;
             }
@@ -2480,25 +2441,38 @@ fn codegen_direct_call(
     }
 
     // Check if this is an extern function (no MIR available)
-    let is_extern = matches!(
-        callee_func_id.loc(fx.db()).container,
-        ItemContainerId::ExternBlockId(_)
-    );
+    let is_extern =
+        matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
 
     let interner = DbInterner::new_no_crate(fx.db());
     let empty_args = GenericArgs::empty(interner);
     let (callee_sig, callee_name) = if is_extern {
         // Extern functions: build signature from type info, use raw symbol name
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
-            .expect("extern fn sig");
+        let sig =
+            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
+                .expect("extern fn sig");
         let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
         (sig, name)
+    } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
+        callee_func_id.into(),
+        generic_args.store(),
+        fx.env().clone(),
+    ) {
+        // Prefer r-a MIR whenever available, including cross-crate bodies.
+        let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
+        let name = symbol_mangling::mangle_function(
+            fx.db(),
+            callee_func_id,
+            generic_args,
+            fx.ext_crate_disambiguators(),
+        );
+        (sig, name)
     } else if is_cross_crate {
-        // Cross-crate Rust functions: build signature from type info,
-        // use v0 mangled name with real disambiguator from rlib
-        let sig = build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
-            .expect("cross-crate fn sig");
+        // Fall back to symbol-only cross-crate calls when MIR lowering is unavailable.
+        let sig =
+            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
+                .expect("cross-crate fn sig");
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
@@ -2507,19 +2481,7 @@ fn codegen_direct_call(
         );
         (sig, name)
     } else {
-        // Local functions: build signature from MIR, use v0 mangled name
-        let callee_body = fx.db()
-            .monomorphized_mir_body(callee_func_id.into(), generic_args.store(), fx.env().clone())
-            .expect("failed to get callee MIR");
-        let sig =
-            build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body, &[]).expect("callee sig");
-        let name = symbol_mangling::mangle_function(
-            fx.db(),
-            callee_func_id,
-            generic_args,
-            fx.ext_crate_disambiguators(),
-        );
-        (sig, name)
+        panic!("failed to get local callee MIR for {:?}", callee_func_id);
     };
 
     // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
@@ -2618,12 +2580,8 @@ fn codegen_virtual_call(
     let (data_ptr, vtable_ptr) = self_cval.load_scalar_pair(fx);
 
     // Load fn ptr from vtable
-    let fn_ptr = fx.bcx.ins().load(
-        fx.pointer_type,
-        vtable_memflags(),
-        vtable_ptr,
-        vtable_offset as i32,
-    );
+    let fn_ptr =
+        fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), vtable_ptr, vtable_offset as i32);
 
     // Build the indirect call signature:
     // - self param is a thin pointer (data_ptr)
@@ -2745,7 +2703,8 @@ fn codegen_intrinsic_call(
                 .as_ref()
                 .builtin_deref(true)
                 .expect("offset intrinsic first argument must be a pointer");
-            let pointee_layout = fx.db()
+            let pointee_layout = fx
+                .db()
                 .layout_of_ty(pointee_ty.store(), fx.env().clone())
                 .expect("layout error for offset intrinsic pointee");
 
@@ -2780,7 +2739,8 @@ fn codegen_intrinsic_call(
                 .as_ref()
                 .builtin_deref(true)
                 .expect("ptr_offset_from first argument must be a pointer");
-            let pointee_layout = fx.db()
+            let pointee_layout = fx
+                .db()
                 .layout_of_ty(pointee_ty.store(), fx.env().clone())
                 .expect("layout error for ptr_offset_from intrinsic pointee");
             let pointee_size = pointee_layout.size.bytes();
@@ -2833,11 +2793,8 @@ fn codegen_intrinsic_call(
 
             let layout = generic_ty_layout.clone().expect("copy_nonoverlapping: layout error");
             let elem_size = layout.size.bytes();
-            let byte_amount = if elem_size != 1 {
-                fx.bcx.ins().imul_imm(count, elem_size as i64)
-            } else {
-                count
-            };
+            let byte_amount =
+                if elem_size != 1 { fx.bcx.ins().imul_imm(count, elem_size as i64) } else { count };
             let tc = fx.module.target_config();
             fx.bcx.call_memcpy(tc, dst, src, byte_amount);
             None
@@ -2850,11 +2807,8 @@ fn codegen_intrinsic_call(
 
             let layout = generic_ty_layout.clone().expect("copy: layout error");
             let elem_size = layout.size.bytes();
-            let byte_amount = if elem_size != 1 {
-                fx.bcx.ins().imul_imm(count, elem_size as i64)
-            } else {
-                count
-            };
+            let byte_amount =
+                if elem_size != 1 { fx.bcx.ins().imul_imm(count, elem_size as i64) } else { count };
             let tc = fx.module.target_config();
             fx.bcx.call_memmove(tc, dst, src, byte_amount);
             None
@@ -2867,11 +2821,8 @@ fn codegen_intrinsic_call(
 
             let layout = generic_ty_layout.clone().expect("write_bytes: layout error");
             let elem_size = layout.size.bytes();
-            let byte_amount = if elem_size != 1 {
-                fx.bcx.ins().imul_imm(count, elem_size as i64)
-            } else {
-                count
-            };
+            let byte_amount =
+                if elem_size != 1 { fx.bcx.ins().imul_imm(count, elem_size as i64) } else { count };
             let tc = fx.module.target_config();
             fx.bcx.call_memset(tc, dst, val, byte_amount);
             None
@@ -3081,9 +3032,13 @@ fn codegen_intrinsic_call(
         }
 
         // --- atomic fence (no-op for single-threaded JIT) ---
-        "atomic_fence_seqcst" | "atomic_fence_acquire" | "atomic_fence_release"
-        | "atomic_fence_acqrel" | "atomic_singlethreadfence_seqcst"
-        | "atomic_singlethreadfence_acquire" | "atomic_singlethreadfence_release"
+        "atomic_fence_seqcst"
+        | "atomic_fence_acquire"
+        | "atomic_fence_release"
+        | "atomic_fence_acqrel"
+        | "atomic_singlethreadfence_seqcst"
+        | "atomic_singlethreadfence_acquire"
+        | "atomic_singlethreadfence_release"
         | "atomic_singlethreadfence_acqrel" => {
             fx.bcx.ins().fence();
             None
@@ -3124,17 +3079,12 @@ pub fn build_host_isa(is_pic: bool) -> Arc<dyn TargetIsa> {
 }
 
 /// Build a Cranelift signature from a MIR body's locals (return type + params).
-///
-/// `mirdata_layouts` is a pre-computed layout table from `.mirdata` files.
-/// Currently unused (r-a MIR locals don't carry layout indices), but threaded
-/// through for future mirdata body compilation.
 pub fn build_fn_sig(
     isa: &dyn TargetIsa,
     db: &dyn HirDatabase,
     dl: &TargetDataLayout,
     env: &StoredParamEnvAndCrate,
     body: &MirBody,
-    _mirdata_layouts: &[LayoutArc],
 ) -> Result<Signature, String> {
     let mut sig = Signature::new(isa.default_call_conv());
 
@@ -3174,13 +3124,9 @@ fn build_fn_sig_from_ty(
 
     let interner = DbInterner::new_no_crate(db);
     let fn_sig = if generic_args.is_empty() {
-        db.callable_item_signature(func_id.into())
-            .skip_binder()
-            .skip_binder()
+        db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
     } else {
-        db.callable_item_signature(func_id.into())
-            .instantiate(interner, generic_args)
-            .skip_binder()
+        db.callable_item_signature(func_id.into()).instantiate(interner, generic_args).skip_binder()
     };
 
     // Return type — skip if `!` (never) or ZST
@@ -3223,9 +3169,6 @@ fn address_taken_locals(body: &MirBody) -> std::collections::HashSet<LocalId> {
 }
 
 /// Compile a single MIR body to a named function in a Module (ObjectModule or JITModule).
-///
-/// `mirdata_layouts` is a pre-computed layout table from `.mirdata` files.
-/// Pass `&[]` when compiling r-a MIR bodies (all layouts come from `db.layout_of_ty()`).
 pub fn compile_fn(
     module: &mut impl Module,
     isa: &dyn TargetIsa,
@@ -3237,10 +3180,9 @@ pub fn compile_fn(
     linkage: Linkage,
     local_crate: base_db::Crate,
     ext_crate_disambiguators: &HashMap<String, u64>,
-    mirdata_layouts: &[LayoutArc],
 ) -> Result<FuncId, String> {
     let pointer_type = pointer_ty(dl);
-    let sig = build_fn_sig(isa, db, dl, env, body, mirdata_layouts)?;
+    let sig = build_fn_sig(isa, db, dl, env, body)?;
 
     // Declare function in module
     let func_id = module
@@ -3288,20 +3230,19 @@ pub fn compile_fn(
             let place = match local_layout.backend_repr {
                 BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _) if force_stack => {
                     // Address-taken scalar: allocate as stack slot
-                    let size = u32::try_from(local_layout.size.bytes())
-                        .expect("stack slot too large");
+                    let size =
+                        u32::try_from(local_layout.size.bytes()).expect("stack slot too large");
                     let align_shift = {
                         let a = local_layout.align.abi.bytes();
                         assert!(a.is_power_of_two());
                         a.trailing_zeros() as u8
                     };
-                    let slot = bcx.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
+                    let slot =
+                        bcx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             size,
                             align_shift,
-                        ),
-                    );
+                        ));
                     CPlace::for_ptr(pointer::Pointer::stack_slot(slot), local_layout)
                 }
                 BackendRepr::Scalar(scalar) => {
@@ -3316,28 +3257,25 @@ pub fn compile_fn(
                     let var2 = bcx.declare_var(b_clif);
                     CPlace::new_var_pair_raw(var1, var2, local_layout)
                 }
-                _ if local_layout.is_zst() => {
-                    CPlace::for_ptr(
-                        pointer::Pointer::dangling(local_layout.align.abi),
-                        local_layout,
-                    )
-                }
+                _ if local_layout.is_zst() => CPlace::for_ptr(
+                    pointer::Pointer::dangling(local_layout.align.abi),
+                    local_layout,
+                ),
                 _ => {
                     // Non-scalar, non-ZST: allocate stack slot
-                    let size = u32::try_from(local_layout.size.bytes())
-                        .expect("stack slot too large");
+                    let size =
+                        u32::try_from(local_layout.size.bytes()).expect("stack slot too large");
                     let align_shift = {
                         let a = local_layout.align.abi.bytes();
                         assert!(a.is_power_of_two());
                         a.trailing_zeros() as u8
                     };
-                    let slot = bcx.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
+                    let slot =
+                        bcx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             size,
                             align_shift,
-                        ),
-                    );
+                        ));
                     CPlace::for_ptr(pointer::Pointer::stack_slot(slot), local_layout)
                 }
             };
@@ -3364,8 +3302,7 @@ pub fn compile_fn(
             let sret_ptr = block_params[param_idx];
             param_idx += 1;
             let ret_idx = hir_ty::mir::return_slot().into_raw().into_u32() as usize;
-            local_map[ret_idx] =
-                CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout);
+            local_map[ret_idx] = CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout);
         }
 
         for &param_local in &body.param_locals {
@@ -3397,10 +3334,15 @@ pub fn compile_fn(
                         let ptr = place.to_ptr();
                         ptr.store(&mut bcx, block_params[param_idx], flags);
                         let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr
-                        else { unreachable!() };
+                        else {
+                            unreachable!()
+                        };
                         let b_off = value_and_place::scalar_pair_b_offset(dl, *a, *b);
-                        ptr.offset_i64(&mut bcx, pointer_type, b_off)
-                            .store(&mut bcx, block_params[param_idx + 1], flags);
+                        ptr.offset_i64(&mut bcx, pointer_type, b_off).store(
+                            &mut bcx,
+                            block_params[param_idx + 1],
+                            flags,
+                        );
                     }
                     param_idx += 2;
                 }
@@ -3410,10 +3352,7 @@ pub fn compile_fn(
                     param_idx += 1;
                     let layout = place.layout.clone();
                     local_map[param_idx_local] =
-                        CPlace::for_ptr(
-                            pointer::Pointer::new(ptr_val),
-                            layout,
-                        );
+                        CPlace::for_ptr(pointer::Pointer::new(ptr_val), layout);
                 }
             }
         }
@@ -3484,9 +3423,7 @@ pub fn compile_fn(
 
     // Compile and define the function
     let mut ctx = Context::for_function(func);
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| format!("define_function: {e}"))?;
+    module.define_function(func_id, &mut ctx).map_err(|e| format!("define_function: {e}"))?;
 
     Ok(func_id)
 }
@@ -3509,8 +3446,16 @@ pub fn compile_to_object(
     let mut module = ObjectModule::new(builder);
 
     compile_fn(
-        &mut module, &*isa, db, dl, env, body, fn_name, Linkage::Export,
-        local_crate, &empty_map, &[],
+        &mut module,
+        &*isa,
+        db,
+        dl,
+        env,
+        body,
+        fn_name,
+        Linkage::Export,
+        local_crate,
+        &empty_map,
     )?;
 
     let product = module.finish();
@@ -3561,9 +3506,7 @@ pub fn emit_entry_point(
     }
 
     let mut ctx = Context::for_function(func);
-    module
-        .define_function(cmain_func_id, &mut ctx)
-        .map_err(|e| format!("define main: {e}"))?;
+    module.define_function(cmain_func_id, &mut ctx).map_err(|e| format!("define main: {e}"))?;
 
     Ok(())
 }
@@ -3592,7 +3535,11 @@ fn collect_vtable_methods(
     let interner = DbInterner::new_no_crate(db);
     let trait_impls = TraitImpls::for_crate(db, local_crate);
     use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
-    let Some(simplified) = simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer) else { return };
+    let Some(simplified) =
+        simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer)
+    else {
+        return;
+    };
     let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
     let Some(&impl_id) = impl_ids.first() else { return };
 
@@ -3638,9 +3585,7 @@ fn compile_drop_in_place(
     let mut sig = Signature::new(isa.default_call_conv());
     sig.params.push(AbiParam::new(pointer_type));
 
-    let fn_name = symbol_mangling::mangle_drop_in_place(
-        db, ty.as_ref(), ext_crate_disambiguators,
-    );
+    let fn_name = symbol_mangling::mangle_drop_in_place(db, ty.as_ref(), ext_crate_disambiguators);
     let func_id = module
         .declare_function(&fn_name, Linkage::Local, &sig)
         .map_err(|e| format!("declare drop_in_place: {e}"))?;
@@ -3671,7 +3616,10 @@ fn compile_drop_in_place(
                 let generic_args =
                     adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
                 let drop_fn_name = symbol_mangling::mangle_function(
-                    db, drop_func_id, generic_args.as_ref(), ext_crate_disambiguators,
+                    db,
+                    drop_func_id,
+                    generic_args.as_ref(),
+                    ext_crate_disambiguators,
                 );
 
                 let callee_id = module
@@ -3699,16 +3647,12 @@ fn compile_drop_in_place(
                                 .layout_of_ty(ty.clone(), env.clone())
                                 .map_err(|e| format!("layout error: {:?}", e))?;
                             let field_types = db.field_types(id.into());
-                            for (field_idx, (_, field_ty_binder)) in
-                                field_types.iter().enumerate()
+                            for (field_idx, (_, field_ty_binder)) in field_types.iter().enumerate()
                             {
-                                let field_ty =
-                                    field_ty_binder.get().instantiate(interner, subst);
+                                let field_ty = field_ty_binder.get().instantiate(interner, subst);
                                 if hir_ty::drop::has_drop_glue_mono(interner, field_ty) {
-                                    let offset =
-                                        layout.fields.offset(field_idx).bytes() as i64;
-                                    let field_ptr =
-                                        bcx.ins().iadd_imm(self_ptr, offset);
+                                    let offset = layout.fields.offset(field_idx).bytes() as i64;
+                                    let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
                                     let field_ty_stored = field_ty.store();
                                     let name = symbol_mangling::mangle_drop_in_place(
                                         db,
@@ -3716,14 +3660,9 @@ fn compile_drop_in_place(
                                         ext_crate_disambiguators,
                                     );
                                     let callee = module
-                                        .declare_function(
-                                            &name,
-                                            Linkage::Import,
-                                            &field_drop_sig,
-                                        )
+                                        .declare_function(&name, Linkage::Import, &field_drop_sig)
                                         .expect("declare field drop_in_place");
-                                    let callee_ref =
-                                        module.declare_func_in_func(callee, bcx.func);
+                                    let callee_ref = module.declare_func_in_func(callee, bcx.func);
                                     bcx.ins().call(callee_ref, &[field_ptr]);
                                 }
                             }
@@ -3796,14 +3735,12 @@ fn compile_drop_in_place(
 
     let mut ctx = Context::new();
     ctx.func = func;
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| format!("define drop_in_place: {e}"))?;
+    module.define_function(func_id, &mut ctx).map_err(|e| format!("define drop_in_place: {e}"))?;
 
     Ok(func_id)
 }
 
-/// Collect all non-extern, non-intrinsic, local monomorphized function instances
+/// Collect all non-extern, non-intrinsic monomorphized function instances
 /// reachable from `root` by walking MIR call terminators. Returns them in BFS
 /// order with `root` first. Each entry is a `(FunctionId, StoredGenericArgs)` pair
 /// representing a specific monomorphization.
@@ -3811,7 +3748,6 @@ fn compile_drop_in_place(
 /// Also returns:
 /// - closures discovered via `AggregateKind::Closure` in statements
 /// - types that need `drop_in_place` glue functions
-/// - cross-crate callees (functions from other crates discovered during scanning)
 fn collect_reachable_fns(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
@@ -3821,7 +3757,6 @@ fn collect_reachable_fns(
     Vec<(hir_def::FunctionId, StoredGenericArgs)>,
     Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     Vec<StoredTy>,
-    Vec<(hir_def::FunctionId, StoredGenericArgs)>,
 ) {
     use std::collections::{HashSet, VecDeque};
 
@@ -3837,8 +3772,6 @@ fn collect_reachable_fns(
     let mut closure_result = Vec::new();
 
     let mut drop_types = HashSet::new();
-    let mut cross_crate_fns = Vec::new();
-
     queue.push_back((root, empty_args));
 
     while let Some((func_id, generic_args)) = queue.pop_front() {
@@ -3856,12 +3789,6 @@ fn collect_reachable_fns(
             continue;
         }
 
-        // Record cross-crate functions (compiled from rlibs/mirdata, not local MIR)
-        if func_id.krate(db) != local_crate {
-            cross_crate_fns.push((func_id, generic_args));
-            continue;
-        }
-
         // Skip abstract trait method definitions (they have no MIR body;
         // only their impl methods are compiled)
         if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
@@ -3871,18 +3798,20 @@ fn collect_reachable_fns(
         result.push((func_id, generic_args.clone()));
 
         // Get monomorphized MIR and scan for direct callees
-        let Ok(body) = db.monomorphized_mir_body(
-            func_id.into(),
-            generic_args,
-            env.clone(),
-        ) else {
+        let Ok(body) = db.monomorphized_mir_body(func_id.into(), generic_args, env.clone()) else {
             continue;
         };
 
         scan_body_for_callees(
-            db, env, &body, interner, local_crate,
-            &empty_args_stored, &mut queue,
-            &mut closure_visited, &mut closure_result,
+            db,
+            env,
+            &body,
+            interner,
+            local_crate,
+            &empty_args_stored,
+            &mut queue,
+            &mut closure_visited,
+            &mut closure_result,
             &mut drop_types,
         );
     }
@@ -3892,15 +3821,21 @@ fn collect_reachable_fns(
     while i < closure_result.len() {
         let (closure_id, closure_subst) = closure_result[i].clone();
         i += 1;
-        let Ok(closure_body) = db.monomorphized_mir_body_for_closure(
-            closure_id, closure_subst, env.clone(),
-        ) else {
+        let Ok(closure_body) =
+            db.monomorphized_mir_body_for_closure(closure_id, closure_subst, env.clone())
+        else {
             continue;
         };
         scan_body_for_callees(
-            db, env, &closure_body, interner, local_crate,
-            &empty_args_stored, &mut queue,
-            &mut closure_visited, &mut closure_result,
+            db,
+            env,
+            &closure_body,
+            interner,
+            local_crate,
+            &empty_args_stored,
+            &mut queue,
+            &mut closure_visited,
+            &mut closure_result,
             &mut drop_types,
         );
         // Process any newly discovered functions from closure bodies
@@ -3914,29 +3849,30 @@ fn collect_reachable_fns(
             if FunctionSignature::is_intrinsic(db, func_id) {
                 continue;
             }
-            if func_id.krate(db) != local_crate {
-                cross_crate_fns.push((func_id, generic_args));
-                continue;
-            }
             if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
                 continue;
             }
             result.push((func_id, generic_args.clone()));
-            let Ok(body) = db.monomorphized_mir_body(
-                func_id.into(), generic_args, env.clone(),
-            ) else {
+            let Ok(body) = db.monomorphized_mir_body(func_id.into(), generic_args, env.clone())
+            else {
                 continue;
             };
             scan_body_for_callees(
-                db, env, &body, interner, local_crate,
-                &empty_args_stored, &mut queue,
-                &mut closure_visited, &mut closure_result,
+                db,
+                env,
+                &body,
+                interner,
+                local_crate,
+                &empty_args_stored,
+                &mut queue,
+                &mut closure_visited,
+                &mut closure_result,
                 &mut drop_types,
             );
         }
     }
 
-    (result, closure_result, drop_types.into_iter().collect(), cross_crate_fns)
+    (result, closure_result, drop_types.into_iter().collect())
 }
 
 /// Transitively collect all types needing `drop_in_place` glue and their
@@ -3979,9 +3915,11 @@ fn collect_drop_info(
             match adt_id {
                 hir_def::AdtId::StructId(id) => {
                     use hir_def::signatures::StructFlags;
-                    if db.struct_signature(id).flags.intersects(
-                        StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA,
-                    ) {
+                    if db
+                        .struct_signature(id)
+                        .flags
+                        .intersects(StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA)
+                    {
                         return;
                     }
                     let field_types = db.field_types(id.into());
@@ -4031,7 +3969,10 @@ fn scan_body_for_callees(
     local_crate: base_db::Crate,
     empty_args_stored: &StoredGenericArgs,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
-    closure_visited: &mut std::collections::HashSet<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
     closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
@@ -4046,8 +3987,14 @@ fn scan_body_for_callees(
                         // Unsizing coercions → discover vtable impl methods
                         CastKind::PointerCoercion(PointerCast::Unsize) => {
                             collect_vtable_methods(
-                                db, env, body, operand, target_ty, local_crate,
-                                empty_args_stored, queue,
+                                db,
+                                env,
+                                body,
+                                operand,
+                                target_ty,
+                                local_crate,
+                                empty_args_stored,
+                                queue,
                             );
                         }
                         // ReifyFnPointer: fn item → fn pointer. The target fn needs compilation.
@@ -4089,7 +4036,9 @@ fn scan_body_for_callees(
                             env.param_env(),
                             callee_id,
                             callee_args,
-                        ).is_some() {
+                        )
+                        .is_some()
+                        {
                             continue;
                         }
                         // Closure calls: Fn::call / FnMut::call_mut / FnOnce::call_once
@@ -4137,8 +4086,8 @@ pub fn compile_executable(
             .map_err(|e| format!("ObjectBuilder: {e}"))?;
     let mut module = ObjectModule::new(builder);
 
-    // Discover and compile all reachable local monomorphized function instances
-    let (reachable_fns, reachable_closures, drop_types, _cross_crate) =
+    // Discover and compile all reachable monomorphized function instances.
+    let (reachable_fns, reachable_closures, drop_types) =
         collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
 
@@ -4147,11 +4096,22 @@ pub fn compile_executable(
             .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
             .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
         let fn_name = symbol_mangling::mangle_function(
-            db, *func_id, generic_args.as_ref(), ext_crate_disambiguators,
+            db,
+            *func_id,
+            generic_args.as_ref(),
+            ext_crate_disambiguators,
         );
         let func_clif_id = compile_fn(
-            &mut module, &*isa, db, dl, env, &body, &fn_name, Linkage::Export,
-            local_crate, ext_crate_disambiguators, &[],
+            &mut module,
+            &*isa,
+            db,
+            dl,
+            env,
+            &body,
+            &fn_name,
+            Linkage::Export,
+            local_crate,
+            ext_crate_disambiguators,
         )?;
 
         if *func_id == main_func_id {
@@ -4164,18 +4124,33 @@ pub fn compile_executable(
         let body = db
             .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
             .map_err(|e| format!("MIR error for closure: {:?}", e))?;
-        let closure_name = symbol_mangling::mangle_closure(db, *closure_id, ext_crate_disambiguators);
+        let closure_name =
+            symbol_mangling::mangle_closure(db, *closure_id, ext_crate_disambiguators);
         compile_fn(
-            &mut module, &*isa, db, dl, env, &body, &closure_name, Linkage::Export,
-            local_crate, ext_crate_disambiguators, &[],
+            &mut module,
+            &*isa,
+            db,
+            dl,
+            env,
+            &body,
+            &closure_name,
+            Linkage::Export,
+            local_crate,
+            ext_crate_disambiguators,
         )?;
     }
 
     // Compile drop_in_place glue functions
     for ty in &drop_types {
         compile_drop_in_place(
-            &mut module, &*isa, db, dl, env, ty,
-            local_crate, ext_crate_disambiguators,
+            &mut module,
+            &*isa,
+            db,
+            dl,
+            env,
+            ty,
+            local_crate,
+            ext_crate_disambiguators,
         )?;
     }
 

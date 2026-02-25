@@ -37,8 +37,8 @@ mod target_feature;
 mod utils;
 mod variance;
 
-pub mod codegen_abi;
 pub mod autoderef;
+pub mod codegen_abi;
 pub mod consteval;
 pub mod db;
 pub mod diagnostics;

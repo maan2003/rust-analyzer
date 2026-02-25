@@ -6,7 +6,7 @@ use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Nonce, RootQueryDb,
     SourceDatabase, SourceRoot, SourceRootId, SourceRootInput,
 };
-use hir_def::{HasModule, Lookup, ModuleId, db::DefDatabase, nameres::crate_def_map};
+use hir_def::{HasModule, ModuleId, db::DefDatabase, nameres::crate_def_map};
 use hir_expand::EditionedFileId;
 use rustc_abi::TargetDataLayout;
 use salsa::Durability;
@@ -15,8 +15,7 @@ use test_fixture::WithFixture;
 use triomphe::Arc;
 
 use hir_ty::{
-    ParamEnvAndCrate,
-    attach_db,
+    ParamEnvAndCrate, attach_db,
     db::HirDatabase,
     next_solver::{DbInterner, GenericArgs},
 };
@@ -176,19 +175,16 @@ fn find_fn(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Functi
     let scope = &def_map[module_id].scope;
 
     // First try module-level declarations
-    if let Some(func) = scope
-        .declarations()
-        .find_map(|x| match x {
-            hir_def::ModuleDefId::FunctionId(x) => {
-                if db.function_signature(x).name.display(db, Edition::CURRENT).to_string() == name {
-                    Some(x)
-                } else {
-                    None
-                }
+    if let Some(func) = scope.declarations().find_map(|x| match x {
+        hir_def::ModuleDefId::FunctionId(x) => {
+            if db.function_signature(x).name.display(db, Edition::CURRENT).to_string() == name {
+                Some(x)
+            } else {
+                None
             }
-            _ => None,
-        })
-    {
+        }
+        _ => None,
+    }) {
         return func;
     }
 
@@ -210,10 +206,7 @@ fn find_fn(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Functi
 fn get_mir_and_env(
     db: &TestDB,
     func_id: hir_def::FunctionId,
-) -> (
-    triomphe::Arc<hir_ty::mir::MirBody>,
-    hir_ty::traits::StoredParamEnvAndCrate,
-) {
+) -> (triomphe::Arc<hir_ty::mir::MirBody>, hir_ty::traits::StoredParamEnvAndCrate) {
     let interner = DbInterner::new_no_crate(db);
     let env = ParamEnvAndCrate {
         param_env: db.trait_environment(func_id.into()),
@@ -226,7 +219,10 @@ fn get_mir_and_env(
     (body, env)
 }
 
-fn get_target_data_layout(db: &TestDB, func_id: hir_def::FunctionId) -> triomphe::Arc<TargetDataLayout> {
+fn get_target_data_layout(
+    db: &TestDB,
+    func_id: hir_def::FunctionId,
+) -> triomphe::Arc<TargetDataLayout> {
     db.target_data_layout(func_id.krate(db)).expect("no target data layout")
 }
 
@@ -269,10 +265,7 @@ fn foo() -> i32 {
         // Parse the object file and verify it contains the symbol
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
         use object::{Object, ObjectSymbol};
-        let symbols: Vec<_> = obj
-            .symbols()
-            .filter(|s| s.name() == Ok(fn_name.as_str()))
-            .collect();
+        let symbols: Vec<_> = obj.symbols().filter(|s| s.name() == Ok(fn_name.as_str())).collect();
         assert!(!symbols.is_empty(), "symbol '{fn_name}' not found in object file");
     });
 }
@@ -295,7 +288,10 @@ fn compile_fn_to_object(src: &str) -> Vec<u8> {
 
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
         use object::{Object, ObjectSymbol};
-        assert!(obj.symbols().any(|s| s.name() == Ok(fn_name.as_str())), "symbol '{fn_name}' not found");
+        assert!(
+            obj.symbols().any(|s| s.name() == Ok(fn_name.as_str())),
+            "symbol '{fn_name}' not found"
+        );
 
         obj_bytes
     })
@@ -323,8 +319,10 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         let isa = crate::build_host_isa(false);
         let empty_map = std::collections::HashMap::new();
 
-        let mut jit_builder =
-            cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        let mut jit_builder = cranelift_jit::JITBuilder::with_isa(
+            isa.clone(),
+            cranelift_module::default_libcall_names(),
+        );
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
@@ -350,7 +348,6 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
                 cranelift_module::Linkage::Export,
                 local_crate,
                 &empty_map,
-                &[],
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
         }
@@ -362,7 +359,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         let entry_func_id = find_fn(&db, file_id, entry);
         let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
         let dl = get_target_data_layout(&db, entry_func_id);
-        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
         let entry_mangled = mangled_name(&db, entry_func_id);
 
         let entry_id = jit_module
@@ -418,7 +415,6 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
                 cranelift_module::Linkage::Export,
                 local_crate,
                 &empty_map,
-                &[],
             )
             .unwrap_or_else(|e| panic!("compiling `{name}` failed: {e}"));
             mangled_names.push(fn_name);
@@ -431,7 +427,10 @@ fn compile_fns_to_object(src: &str, fn_names: &[&str]) -> Vec<u8> {
         let obj = object::read::File::parse(&*obj_bytes).expect("failed to parse object file");
         use object::{Object, ObjectSymbol};
         for mangled in &mangled_names {
-            assert!(obj.symbols().any(|s| s.name() == Ok(mangled.as_str())), "symbol '{mangled}' not found");
+            assert!(
+                obj.symbols().any(|s| s.name() == Ok(mangled.as_str())),
+                "symbol '{mangled}' not found"
+            );
         }
 
         obj_bytes
@@ -1051,9 +1050,7 @@ fn foo() -> i32 {
 
 /// Helper: compile source to an executable, run it, return the exit code.
 ///
-/// Uses disambiguators from `.mirdata` if available (via `RA_MIRDATA` env var
-/// or default sysroot location). Falls back to an empty map for tests that
-/// don't make cross-crate calls.
+/// Uses crate disambiguators from `link::extract_crate_disambiguators()`.
 fn compile_and_run_legacy(src: &str, test_name: &str) -> i32 {
     let full_src = fixture_src(src);
     let (db, file_ids) = TestDB::with_many_files(&full_src);
@@ -1063,16 +1060,15 @@ fn compile_and_run_legacy(src: &str, test_name: &str) -> i32 {
         let (_, env) = get_mir_and_env(&db, func_id);
         let dl = get_target_data_layout(&db, func_id);
 
-        let tmp_dir = std::env::temp_dir().join(format!("rac_test_{}_{}", test_name, std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rac_test_{}_{}", test_name, std::process::id()));
         std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
         let output_path = tmp_dir.join(test_name);
 
-        // Try to load .mirdata; fall back to empty map for non-cross-crate tests.
-        let disambiguators = crate::link::extract_crate_disambiguators()
-            .unwrap_or_default();
-        let result = crate::compile_executable(
-            &db, &dl, &env, func_id, &output_path, &disambiguators,
-        );
+        // Current hard-cutover path returns an empty map.
+        let disambiguators = crate::link::extract_crate_disambiguators().unwrap_or_default();
+        let result =
+            crate::compile_executable(&db, &dl, &env, func_id, &output_path, &disambiguators);
 
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1280,8 +1276,7 @@ fn foo() -> i32 {
     assert_eq!(result, 42);
 }
 
-// Cross-crate compile_and_run tests with fake fixture std were removed —
-// they broke when disambiguator extraction moved to mirdata (ra-mir-export).
+// Cross-crate compile_and_run tests with fake fixture std were removed.
 // The same functionality is covered by JIT tests above.
 
 // ---------------------------------------------------------------------------
@@ -1646,8 +1641,10 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         let isa = crate::build_host_isa(false);
         let empty_map = std::collections::HashMap::new();
 
-        let mut jit_builder =
-            cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+        let mut jit_builder = cranelift_jit::JITBuilder::with_isa(
+            isa.clone(),
+            cranelift_module::default_libcall_names(),
+        );
         jit_builder.symbol("fmodf", fmodf as *const u8);
         jit_builder.symbol("fmod", fmod as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
@@ -1661,21 +1658,32 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         .store();
 
         // Discover all reachable functions, closures, and drop types
-        let (reachable_fns, reachable_closures, drop_types, _cross_crate) =
+        let (reachable_fns, reachable_closures, drop_types) =
             crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
 
         // Compile all reachable functions
         let dl = get_target_data_layout(&db, entry_func_id);
         for (func_id, generic_args) in &reachable_fns {
             let fn_name = crate::symbol_mangling::mangle_function(
-                &db, *func_id, generic_args.as_ref(), &empty_map,
+                &db,
+                *func_id,
+                generic_args.as_ref(),
+                &empty_map,
             );
             let body = db
                 .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("MIR error for {fn_name}: {:?}", e));
             crate::compile_fn(
-                &mut jit_module, &*isa, &db, &dl, &env, &body, &fn_name,
-                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+                &mut jit_module,
+                &*isa,
+                &db,
+                &dl,
+                &env,
+                &body,
+                &fn_name,
+                cranelift_module::Linkage::Export,
+                local_crate,
+                &empty_map,
             )
             .unwrap_or_else(|e| panic!("compiling fn failed: {e}"));
         }
@@ -1687,8 +1695,16 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name = crate::symbol_mangling::mangle_closure(&db, *closure_id, &empty_map);
             crate::compile_fn(
-                &mut jit_module, &*isa, &db, &dl, &env, &body, &closure_name,
-                cranelift_module::Linkage::Export, local_crate, &empty_map, &[],
+                &mut jit_module,
+                &*isa,
+                &db,
+                &dl,
+                &env,
+                &body,
+                &closure_name,
+                cranelift_module::Linkage::Export,
+                local_crate,
+                &empty_map,
             )
             .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
         }
@@ -1696,8 +1712,14 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         // Compile drop_in_place glue functions
         for ty in &drop_types {
             crate::compile_drop_in_place(
-                &mut jit_module, &*isa, &db, &dl, &env, ty,
-                local_crate, &empty_map,
+                &mut jit_module,
+                &*isa,
+                &db,
+                &dl,
+                &env,
+                ty,
+                local_crate,
+                &empty_map,
             )
             .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
         }
@@ -1707,7 +1729,7 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Look up the entry function pointer
         let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
-        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
+        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
         let entry_mangled = mangled_name(&db, entry_func_id);
 
         let entry_id = jit_module
@@ -2127,78 +2149,6 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Layout conversion roundtrip tests (db.layout_of_ty → export → convert back)
-// ---------------------------------------------------------------------------
-
-/// Roundtrip test: compute real layouts via `db.layout_of_ty()`, export them
-/// using the same logic as ra-mir-export, convert back, and verify codegen-
-/// relevant fields match.
-#[test]
-fn layout_roundtrip_via_db() {
-    let (db, file_ids) = TestDB::with_many_files(
-        r#"
-//- /main.rs
-struct Pair { a: i32, b: i32 }
-struct Triple { x: i32, y: i32, z: i32 }
-enum AB { A(i32), B(i32) }
-fn foo(
-    _a: i32,
-    _b: bool,
-    _c: f64,
-    _d: (i32, i32),
-    _e: Pair,
-    _f: Triple,
-    _g: AB,
-    _h: *const i32,
-) {}
-"#,
-    );
-    attach_db(&db, || {
-        let file_id = *file_ids.last().unwrap();
-        let func_id = find_fn(&db, file_id, "foo");
-        let (body, env) = get_mir_and_env(&db, func_id);
-
-        for (_, local) in body.locals.iter() {
-            let layout = db
-                .layout_of_ty(local.ty.clone(), env.clone())
-                .expect("layout_of_ty failed");
-            // Export → convert back
-            let exported = crate::layout::export_layout(&layout);
-            let converted =
-                crate::layout::convert_mirdata_layouts(&[ra_mir_types::TypeLayoutEntry {
-                    ty: ra_mir_types::Ty::Opaque("test".to_string()),
-                    layout: exported,
-                }]);
-            let converted = &converted[0];
-
-            // Compare codegen-relevant fields
-            assert_eq!(layout.size, converted.size, "size mismatch for local");
-            assert_eq!(layout.align, converted.align, "align mismatch for local");
-            assert_eq!(
-                layout.backend_repr, converted.backend_repr,
-                "backend_repr mismatch for local"
-            );
-            assert_eq!(
-                layout.largest_niche, converted.largest_niche,
-                "niche mismatch for local"
-            );
-            assert_eq!(
-                layout.fields.count(),
-                converted.fields.count(),
-                "field count mismatch for local"
-            );
-            for i in 0..layout.fields.count() {
-                assert_eq!(
-                    layout.fields.offset(i),
-                    converted.fields.offset(i),
-                    "field offset mismatch at {i}"
-                );
-            }
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Essential intrinsics tests (M11c)
 // ---------------------------------------------------------------------------
 
@@ -2359,1497 +2309,3 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Seamless mirdata + JIT integration harness
-// ---------------------------------------------------------------------------
-//
-// User code writes real Rust with `std::` calls. The harness:
-//   1. Loads mirdata from `RA_MIRDATA` (prepared by `just test-clif`)
-//   2. Loads real sysroot sources (core, alloc, std) into r-a's database
-//   3. Compiles user code via r-a MIR (collect_reachable_fns)
-//   4. Cross-crate generic calls → compiled from mirdata with matching v0 names
-//   5. Cross-crate non-generic calls → resolved via dlopen'd libstd.so
-//
-// Run:
-//   cargo test -p cg-clif --lib mirdata_jit -- --nocapture
-
-/// Locate the `.mirdata` test input path from the environment.
-///
-/// `just test-clif` sets `RA_MIRDATA` and generates this file up front.
-fn mirdata_path_from_env() -> std::path::PathBuf {
-    let path = std::env::var("RA_MIRDATA")
-        .expect("RA_MIRDATA env var is not set; run tests via `just test-clif`");
-
-    let path = std::path::PathBuf::from(path);
-    assert!(path.exists(), "RA_MIRDATA points to missing file: {}", path.display());
-    path
-}
-
-unsafe extern "C" {
-    fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
-}
-
-fn load_libstd_global() {
-    let libdir = crate::link::find_target_libdir().expect("rustc not found");
-    let libstd = crate::link::find_libstd_so(&libdir).expect("libstd.so not found");
-    unsafe {
-        let path = std::ffi::CString::new(
-            libstd.to_str().expect("non-UTF8 libstd path"),
-        )
-        .unwrap();
-        let handle = dlopen(path.as_ptr(), 1 | 0x100); // RTLD_LAZY | RTLD_GLOBAL
-        assert!(!handle.is_null(), "dlopen({}) failed", libstd.display());
-    }
-}
-
-/// Find the sysroot library source directory.
-/// Returns e.g. `~/.rustup/toolchains/nightly-.../lib/rustlib/src/rust/library`
-fn find_sysroot_src_dir() -> std::path::PathBuf {
-    let output = std::process::Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .expect("failed to run `rustc --print sysroot`");
-    assert!(output.status.success(), "rustc --print sysroot failed");
-    let sysroot = String::from_utf8(output.stdout).expect("non-UTF8 sysroot path");
-    let src_dir = std::path::PathBuf::from(sysroot.trim())
-        .join("lib/rustlib/src/rust/library");
-    assert!(src_dir.exists(), "sysroot sources not found at {}", src_dir.display());
-    src_dir
-}
-
-/// Recursively collect all `.rs` files under a directory.
-fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.is_dir() {
-            walk_rs_files(&path, out);
-        } else if path.extension().map_or(false, |e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// Load real sysroot (core, alloc, std) + user source into a TestDB.
-/// Returns (db, user_file_id, user_crate).
-fn load_sysroot_and_user_code(
-    user_src: &str,
-) -> (TestDB, EditionedFileId, base_db::Crate) {
-    use base_db::{
-        CrateDisplayName, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData,
-        DependencyBuilder, Env, FileChange, FileSet, LangCrateOrigin,
-    };
-    use cfg::CfgOptions;
-    use vfs::AbsPathBuf;
-
-    let sysroot_src = find_sysroot_src_dir();
-    let mut source_change = FileChange::default();
-    let mut crate_graph = CrateGraphBuilder::default();
-    let mut roots = Vec::new();
-    let mut next_file_raw: u32 = 0;
-
-    let proc_macro_cwd = Arc::new(AbsPathBuf::assert_utf8(std::env::current_dir().unwrap()));
-    let crate_ws_data = Arc::new(CrateWorkspaceData {
-        target: Ok(base_db::target::TargetData {
-            arch: base_db::target::Arch::Other,
-            data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),
-        }),
-        toolchain: None,
-    });
-
-    // Build cfg options for sysroot crates (matching host)
-    let sym = intern::Symbol::intern;
-    let mut cfg = CfgOptions::default();
-    cfg.insert_atom(sym("unix"));
-    cfg.insert_key_value(sym("target_os"), sym("linux"));
-    cfg.insert_key_value(sym("target_arch"), sym("x86_64"));
-    cfg.insert_key_value(sym("target_pointer_width"), sym("64"));
-    cfg.insert_key_value(sym("target_endian"), sym("little"));
-    cfg.insert_key_value(sym("target_env"), sym("gnu"));
-    cfg.insert_key_value(sym("target_family"), sym("unix"));
-    cfg.insert_atom(sym("target_has_atomic_load_store"));
-    cfg.insert_key_value(sym("target_has_atomic"), sym("8"));
-    cfg.insert_key_value(sym("target_has_atomic"), sym("16"));
-    cfg.insert_key_value(sym("target_has_atomic"), sym("32"));
-    cfg.insert_key_value(sym("target_has_atomic"), sym("64"));
-    cfg.insert_key_value(sym("target_has_atomic"), sym("ptr"));
-
-    // Helper: load all .rs files from a crate dir into the DB
-    let mut load_sysroot_crate = |crate_name: &str,
-                                   sub_path: &str,
-                                   origin: LangCrateOrigin|
-     -> base_db::CrateBuilderId {
-        let crate_dir = sysroot_src.join(sub_path);
-        let lib_rs = crate_dir.join("src/lib.rs");
-        assert!(lib_rs.exists(), "{} not found", lib_rs.display());
-
-        // Collect all .rs files
-        let mut rs_files = Vec::new();
-        walk_rs_files(&crate_dir.join("src"), &mut rs_files);
-
-        let root_file_id = FileId::from_raw(next_file_raw);
-        let mut file_set = FileSet::default();
-
-        // Load lib.rs first as the root file
-        let lib_rs_content = std::fs::read_to_string(&lib_rs)
-            .unwrap_or_else(|e| panic!("read {}: {e}", lib_rs.display()));
-        source_change.change_file(root_file_id, Some(lib_rs_content));
-        let vfs_root = format!("/sysroot/{}/src/lib.rs", crate_name);
-        file_set.insert(root_file_id, base_db::VfsPath::new_virtual_path(vfs_root));
-        next_file_raw += 1;
-
-        // Load remaining .rs files
-        let src_dir = crate_dir.join("src");
-        for rs_path in &rs_files {
-            if *rs_path == lib_rs {
-                continue; // already loaded
-            }
-            let rel = rs_path.strip_prefix(&src_dir).unwrap();
-            let file_id = FileId::from_raw(next_file_raw);
-            next_file_raw += 1;
-
-            let content = std::fs::read_to_string(rs_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", rs_path.display()));
-            source_change.change_file(file_id, Some(content));
-            let vfs_path = format!("/sysroot/{}/src/{}", crate_name, rel.display());
-            file_set.insert(file_id, base_db::VfsPath::new_virtual_path(vfs_path));
-        }
-
-        roots.push(base_db::SourceRoot::new_library(file_set));
-
-        crate_graph.add_crate_root(
-            root_file_id,
-            Edition::Edition2021,
-            Some(CrateDisplayName::from_canonical_name(crate_name)),
-            None,
-            cfg.clone(),
-            Some(cfg.clone()),
-            Env::default(),
-            CrateOrigin::Lang(origin),
-            Vec::new(),
-            false,
-            proc_macro_cwd.clone(),
-            crate_ws_data.clone(),
-        )
-    };
-
-    // Load sysroot crates in dependency order
-    let core_id = load_sysroot_crate("core", "core", LangCrateOrigin::Core);
-    let alloc_id = load_sysroot_crate("alloc", "alloc", LangCrateOrigin::Alloc);
-    let std_id = load_sysroot_crate("std", "std", LangCrateOrigin::Std);
-
-    // Wire up dependencies: alloc→core, std→core+alloc
-    crate_graph
-        .add_dep(alloc_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("core").unwrap(), core_id, true, true,
-        ))
-        .unwrap();
-    crate_graph
-        .add_dep(std_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("core").unwrap(), core_id, true, true,
-        ))
-        .unwrap();
-    crate_graph
-        .add_dep(std_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("alloc").unwrap(), alloc_id, true, true,
-        ))
-        .unwrap();
-
-    // Add user crate
-    let user_file_id = FileId::from_raw(next_file_raw);
-    next_file_raw += 1;
-    let _ = next_file_raw;
-
-    let mut user_file_set = FileSet::default();
-    source_change.change_file(user_file_id, Some(user_src.to_owned()));
-    user_file_set.insert(
-        user_file_id,
-        base_db::VfsPath::new_virtual_path("/main.rs".to_owned()),
-    );
-    roots.push(base_db::SourceRoot::new_local(user_file_set));
-
-    let user_crate_id = crate_graph.add_crate_root(
-        user_file_id,
-        Edition::Edition2021,
-        Some(CrateDisplayName::from_canonical_name("test")),
-        None,
-        CfgOptions::default(),
-        None,
-        Env::default(),
-        CrateOrigin::Local { repo: None, name: None },
-        Vec::new(),
-        false,
-        proc_macro_cwd,
-        crate_ws_data,
-    );
-
-    // user depends on std, core, alloc
-    crate_graph
-        .add_dep(user_crate_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("std").unwrap(), std_id, true, true,
-        ))
-        .unwrap();
-    crate_graph
-        .add_dep(user_crate_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("core").unwrap(), core_id, true, true,
-        ))
-        .unwrap();
-    crate_graph
-        .add_dep(user_crate_id, DependencyBuilder::with_prelude(
-            base_db::CrateName::new("alloc").unwrap(), alloc_id, true, true,
-        ))
-        .unwrap();
-
-    source_change.set_roots(roots);
-    source_change.set_crate_graph(crate_graph);
-
-    let mut db = TestDB::default();
-    source_change.apply(&mut db);
-
-    let user_crate = {
-        let module = module_for_file(&db, user_file_id);
-        module.krate(&db)
-    };
-    let user_editioned = EditionedFileId::new(&db, user_file_id, Edition::Edition2021, user_crate);
-    (db, user_editioned, user_crate)
-}
-
-/// Build a display path for a function, e.g. "std::mem::replace".
-fn fn_display_path(db: &dyn hir_ty::db::HirDatabase, func_id: hir_def::FunctionId) -> String {
-    let fn_name = db.function_signature(func_id).name.as_str().to_owned();
-    let module = func_id.module(db);
-    let mut module_segments = Vec::new();
-    let mut current = module;
-    loop {
-        if let Some(name) = current.name(db) {
-            module_segments.push(name.as_str().to_owned());
-        }
-        match current.containing_module(db) {
-            Some(parent) => current = parent,
-            None => {
-                let krate = current.krate(db);
-                let extra = krate.extra_data(db);
-                if let Some(dn) = &extra.display_name {
-                    module_segments.push(dn.crate_name().to_string());
-                }
-                break;
-            }
-        }
-    }
-    module_segments.reverse();
-
-    if let hir_def::ItemContainerId::ImplId(impl_id) = func_id.lookup(db).container {
-        if let Some(self_ty_name) = impl_self_ty_name(db, impl_id) {
-            return format!("{}::{}::{}", module_segments.join("::"), self_ty_name, fn_name);
-        }
-    }
-
-    format!("{}::{}", module_segments.join("::"), fn_name)
-}
-
-/// Best-effort name for an impl self type, for path matching against mirdata.
-fn impl_self_ty_name(db: &dyn hir_ty::db::HirDatabase, impl_id: hir_def::ImplId) -> Option<String> {
-    use hir_ty::next_solver::{IntoKind, TyKind};
-    use hir_ty::primitive::{FloatTy, IntTy, UintTy};
-
-    let mut ty = db.impl_self_ty(impl_id).skip_binder();
-    loop {
-        match ty.kind() {
-            TyKind::Adt(adt_def, _) => {
-                let adt_id = adt_def.inner().id;
-                let name = match adt_id {
-                    hir_def::AdtId::StructId(id) => db.struct_signature(id).name.as_str().to_owned(),
-                    hir_def::AdtId::EnumId(id) => db.enum_signature(id).name.as_str().to_owned(),
-                    hir_def::AdtId::UnionId(id) => db.union_signature(id).name.as_str().to_owned(),
-                };
-                return Some(name);
-            }
-            TyKind::Bool => return Some("bool".to_owned()),
-            TyKind::Char => return Some("char".to_owned()),
-            TyKind::Str => return Some("str".to_owned()),
-            TyKind::Int(IntTy::I8) => return Some("i8".to_owned()),
-            TyKind::Int(IntTy::I16) => return Some("i16".to_owned()),
-            TyKind::Int(IntTy::I32) => return Some("i32".to_owned()),
-            TyKind::Int(IntTy::I64) => return Some("i64".to_owned()),
-            TyKind::Int(IntTy::I128) => return Some("i128".to_owned()),
-            TyKind::Int(IntTy::Isize) => return Some("isize".to_owned()),
-            TyKind::Uint(UintTy::U8) => return Some("u8".to_owned()),
-            TyKind::Uint(UintTy::U16) => return Some("u16".to_owned()),
-            TyKind::Uint(UintTy::U32) => return Some("u32".to_owned()),
-            TyKind::Uint(UintTy::U64) => return Some("u64".to_owned()),
-            TyKind::Uint(UintTy::U128) => return Some("u128".to_owned()),
-            TyKind::Uint(UintTy::Usize) => return Some("usize".to_owned()),
-            TyKind::Float(FloatTy::F32) => return Some("f32".to_owned()),
-            TyKind::Float(FloatTy::F64) => return Some("f64".to_owned()),
-            TyKind::Float(FloatTy::F16) => return Some("f16".to_owned()),
-            TyKind::Float(FloatTy::F128) => return Some("f128".to_owned()),
-            TyKind::Ref(_, inner, _) => ty = inner,
-            TyKind::RawPtr(inner, _) => ty = inner,
-            _ => return None,
-        }
-    }
-}
-
-fn generic_lookup_key_for_fn(
-    db: &dyn hir_ty::db::HirDatabase,
-    func_id: hir_def::FunctionId,
-    generic_args: &hir_ty::next_solver::StoredGenericArgs,
-    ext_crate_disambiguators: &std::collections::HashMap<String, u64>,
-) -> Option<ra_mir_types::GenericFnLookupKey> {
-    let stable_crate_id = stable_crate_id_for_fn(db, func_id, ext_crate_disambiguators)?;
-    let path = fn_display_path(db, func_id);
-    Some(ra_mir_types::GenericFnLookupKey {
-        stable_crate_id,
-        normalized_path: ra_mir_types::normalize_def_path(&path),
-        num_generic_params: mirdata_args_len(generic_args),
-    })
-}
-
-/// Context for converting r-a types to mirdata types.
-struct TyConvertCtx<'a> {
-    db: &'a dyn hir_ty::db::HirDatabase,
-    ext_crate_disambiguators: &'a std::collections::HashMap<String, u64>,
-    adt_hash_lookup: &'a std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-}
-
-/// Convert an r-a type to a mirdata GenericArg.
-fn ra_ty_to_mirdata_arg(
-    ctx: &TyConvertCtx<'_>,
-    ty: hir_ty::next_solver::Ty<'_>,
-) -> ra_mir_types::GenericArg {
-    ra_mir_types::GenericArg::Ty(ra_ty_to_mirdata(ctx, ty))
-}
-
-fn ra_ty_to_mirdata(
-    ctx: &TyConvertCtx<'_>,
-    ty: hir_ty::next_solver::Ty<'_>,
-) -> ra_mir_types::Ty {
-    use hir_ty::next_solver::{IntoKind, TyKind};
-    use hir_ty::primitive::{FloatTy, IntTy, UintTy};
-    match ty.kind() {
-        TyKind::Bool => ra_mir_types::Ty::Bool,
-        TyKind::Char => ra_mir_types::Ty::Char,
-        TyKind::Str => ra_mir_types::Ty::Str,
-        TyKind::Never => ra_mir_types::Ty::Never,
-        TyKind::Int(IntTy::I8) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::I8),
-        TyKind::Int(IntTy::I16) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::I16),
-        TyKind::Int(IntTy::I32) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::I32),
-        TyKind::Int(IntTy::I64) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::I64),
-        TyKind::Int(IntTy::I128) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::I128),
-        TyKind::Int(IntTy::Isize) => ra_mir_types::Ty::Int(ra_mir_types::IntTy::Isize),
-        TyKind::Uint(UintTy::U8) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::U8),
-        TyKind::Uint(UintTy::U16) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::U16),
-        TyKind::Uint(UintTy::U32) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::U32),
-        TyKind::Uint(UintTy::U64) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::U64),
-        TyKind::Uint(UintTy::U128) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::U128),
-        TyKind::Uint(UintTy::Usize) => ra_mir_types::Ty::Uint(ra_mir_types::UintTy::Usize),
-        TyKind::Float(FloatTy::F32) => ra_mir_types::Ty::Float(ra_mir_types::FloatTy::F32),
-        TyKind::Float(FloatTy::F64) => ra_mir_types::Ty::Float(ra_mir_types::FloatTy::F64),
-        TyKind::Float(FloatTy::F16) => ra_mir_types::Ty::Float(ra_mir_types::FloatTy::F16),
-        TyKind::Float(FloatTy::F128) => ra_mir_types::Ty::Float(ra_mir_types::FloatTy::F128),
-        TyKind::Ref(_, inner, mutbl) => {
-            let m = match mutbl {
-                hir_ty::next_solver::Mutability::Not => ra_mir_types::Mutability::Not,
-                hir_ty::next_solver::Mutability::Mut => ra_mir_types::Mutability::Mut,
-            };
-            ra_mir_types::Ty::Ref(m, Box::new(ra_ty_to_mirdata(ctx, inner)))
-        }
-        TyKind::RawPtr(inner, mutbl) => {
-            let m = match mutbl {
-                hir_ty::next_solver::Mutability::Not => ra_mir_types::Mutability::Not,
-                hir_ty::next_solver::Mutability::Mut => ra_mir_types::Mutability::Mut,
-            };
-            ra_mir_types::Ty::RawPtr(m, Box::new(ra_ty_to_mirdata(ctx, inner)))
-        }
-        TyKind::Tuple(tys) if tys.is_empty() => ra_mir_types::Ty::Tuple(vec![]),
-        TyKind::Tuple(tys) => {
-            ra_mir_types::Ty::Tuple(tys.iter().map(|t| ra_ty_to_mirdata(ctx, t)).collect())
-        }
-        TyKind::Slice(inner) => ra_mir_types::Ty::Slice(Box::new(ra_ty_to_mirdata(ctx, inner))),
-        TyKind::Adt(def, args) => {
-            let adt_id = def.inner().id;
-            let path = adt_display_path(ctx.db, adt_id);
-            let krate = match adt_id {
-                hir_def::AdtId::StructId(id) => id.krate(ctx.db),
-                hir_def::AdtId::EnumId(id) => id.krate(ctx.db),
-                hir_def::AdtId::UnionId(id) => id.krate(ctx.db),
-            };
-            let crate_name = krate
-                .extra_data(ctx.db)
-                .display_name
-                .as_ref()
-                .map(|dn| dn.crate_name().to_string())
-                .unwrap_or_default();
-            let stable_crate_id = ctx.ext_crate_disambiguators
-                .get(&crate_name)
-                .copied()
-                .unwrap_or(0);
-
-            let short_name = match adt_id {
-                hir_def::AdtId::StructId(id) => ctx.db.struct_signature(id).name.as_str().to_owned(),
-                hir_def::AdtId::EnumId(id) => ctx.db.enum_signature(id).name.as_str().to_owned(),
-                hir_def::AdtId::UnionId(id) => ctx.db.union_signature(id).name.as_str().to_owned(),
-            };
-            let hash = ctx.adt_hash_lookup
-                .get(&(stable_crate_id, path.clone()))
-                .or_else(|| ctx.adt_hash_lookup.get(&(stable_crate_id, short_name.clone())))
-                .copied()
-                .unwrap_or_else(|| {
-                    eprintln!("warning: no mirdata hash for ADT {path} / {short_name} (crate_id={stable_crate_id:#x})");
-                    (stable_crate_id, 0)
-                });
-            let generic_args = ra_generic_args_to_mirdata(ctx, args);
-            ra_mir_types::Ty::Adt(hash, path, generic_args)
-        }
-        TyKind::FnDef(def, args) => {
-            // For FnDef, we just need a hash that's consistent. Since we don't
-            // use FnDef for layout lookup (it's a ZST), a placeholder hash is OK.
-            let hash = (0u64, 0u64);
-            let generic_args = ra_generic_args_to_mirdata(ctx, args);
-            ra_mir_types::Ty::FnDef(hash, generic_args)
-        }
-        TyKind::Array(elem, len) => {
-            let n = crate::const_to_u64(len);
-            ra_mir_types::Ty::Array(
-                Box::new(ra_ty_to_mirdata(ctx, elem)),
-                n,
-            )
-        }
-        TyKind::Closure(closure_id, args) => {
-            // Use a synthetic hash based on the InternedClosureId.
-            // Layout computation treats all closures as ZST (which is correct
-            // for non-capturing closures; capturing closures need real layout).
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            closure_id.0.hash(&mut hasher);
-            let hash = (0u64, hasher.finish());
-            let generic_args = ra_generic_args_to_mirdata(ctx, args);
-            ra_mir_types::Ty::Closure(hash, generic_args)
-        }
-        other => ra_mir_types::Ty::Opaque(format!("{:?}", other)),
-    }
-}
-
-fn ra_generic_args_to_mirdata(
-    ctx: &TyConvertCtx<'_>,
-    args: hir_ty::next_solver::GenericArgs<'_>,
-) -> Vec<ra_mir_types::GenericArg> {
-    use hir_ty::next_solver::GenericArgKind;
-    args.as_ref()
-        .iter()
-        .filter_map(|arg| match arg.kind() {
-            GenericArgKind::Type(ty) => Some(ra_mir_types::GenericArg::Ty(
-                ra_ty_to_mirdata(ctx, ty),
-            )),
-            GenericArgKind::Lifetime(_) => Some(ra_mir_types::GenericArg::Lifetime),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Build a lookup table: (stable_crate_id, adt_path) → DefPathHash
-/// from mirdata's layout entries and function bodies. Used to translate
-/// r-a ADT types to the same DefPathHash that rustc uses.
-///
-/// The `adt_path` is the full def path string (e.g. "alloc::alloc::Global").
-fn build_adt_hash_lookup(
-    mirdata: &ra_mir_types::MirData,
-) -> std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash> {
-    let mut map = std::collections::HashMap::new();
-    // From layout entries
-    for entry in &mirdata.layouts {
-        collect_adt_hashes_from_ty(&entry.ty, &mut map);
-    }
-    // From function body types (locals, projections, etc.)
-    for fb in &mirdata.bodies {
-        for local in &fb.body.locals {
-            collect_adt_hashes_from_ty(&local.ty, &mut map);
-        }
-        for bb in &fb.body.blocks {
-            for stmt in &bb.stmts {
-                collect_adt_hashes_from_stmt(stmt, &mut map);
-            }
-            collect_adt_hashes_from_terminator(&bb.terminator, &mut map);
-        }
-    }
-    map
-}
-
-fn collect_adt_hashes_from_stmt(
-    stmt: &ra_mir_types::Statement,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    match stmt {
-        ra_mir_types::Statement::Assign(place, rvalue) => {
-            collect_adt_hashes_from_place(place, map);
-            collect_adt_hashes_from_rvalue(rvalue, map);
-        }
-        ra_mir_types::Statement::SetDiscriminant { place, .. } |
-        ra_mir_types::Statement::Deinit(place) => {
-            collect_adt_hashes_from_place(place, map);
-        }
-        _ => {}
-    }
-}
-
-fn collect_adt_hashes_from_place(
-    place: &ra_mir_types::Place,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    for proj in &place.projections {
-        match proj {
-            ra_mir_types::Projection::Field(_, ty) | ra_mir_types::Projection::OpaqueCast(ty) => {
-                collect_adt_hashes_from_ty(ty, map);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_adt_hashes_from_rvalue(
-    rv: &ra_mir_types::Rvalue,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    match rv {
-        ra_mir_types::Rvalue::Cast(_, op, ty) => {
-            collect_adt_hashes_from_operand(op, map);
-            collect_adt_hashes_from_ty(ty, map);
-        }
-        ra_mir_types::Rvalue::Aggregate(kind, ops) => {
-            if let ra_mir_types::AggregateKind::Array(ty) = kind {
-                collect_adt_hashes_from_ty(ty, map);
-            }
-            for op in ops { collect_adt_hashes_from_operand(op, map); }
-        }
-        ra_mir_types::Rvalue::Use(op) | ra_mir_types::Rvalue::Repeat(op, _) |
-        ra_mir_types::Rvalue::UnaryOp(_, op) => {
-            collect_adt_hashes_from_operand(op, map);
-        }
-        ra_mir_types::Rvalue::BinaryOp(_, l, r) => {
-            collect_adt_hashes_from_operand(l, map);
-            collect_adt_hashes_from_operand(r, map);
-        }
-        _ => {}
-    }
-}
-
-fn collect_adt_hashes_from_operand(
-    op: &ra_mir_types::Operand,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    if let ra_mir_types::Operand::Constant(c) = op {
-        collect_adt_hashes_from_ty(&c.ty, map);
-    }
-}
-
-fn collect_adt_hashes_from_terminator(
-    term: &ra_mir_types::Terminator,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    match term {
-        ra_mir_types::Terminator::Call { func, args, dest, .. } => {
-            collect_adt_hashes_from_operand(func, map);
-            for arg in args { collect_adt_hashes_from_operand(arg, map); }
-            collect_adt_hashes_from_place(dest, map);
-        }
-        ra_mir_types::Terminator::SwitchInt { discr, .. } => {
-            collect_adt_hashes_from_operand(discr, map);
-        }
-        _ => {}
-    }
-}
-
-fn collect_adt_hashes_from_ty(
-    ty: &ra_mir_types::Ty,
-    map: &mut std::collections::HashMap<(u64, String), ra_mir_types::DefPathHash>,
-) {
-    match ty {
-        ra_mir_types::Ty::Adt(hash, name, args) => {
-            map.entry((hash.0, name.clone())).or_insert(*hash);
-            // Also insert with alternative path formats for re-export matching.
-            // E.g. "std::alloc::Global" also gets indexed under the defining
-            // crate's module path. We do this by extracting the short name
-            // and inserting under all possible crate prefixes.
-            if let Some(short_name) = name.rsplit("::").next() {
-                // Insert with just the crate_id + short name as fallback
-                map.entry((hash.0, short_name.to_string())).or_insert(*hash);
-            }
-            for arg in args {
-                if let ra_mir_types::GenericArg::Ty(t) = arg {
-                    collect_adt_hashes_from_ty(t, map);
-                }
-            }
-        }
-        ra_mir_types::Ty::Ref(_, inner) | ra_mir_types::Ty::RawPtr(_, inner) => {
-            collect_adt_hashes_from_ty(inner, map);
-        }
-        ra_mir_types::Ty::Array(elem, _) | ra_mir_types::Ty::Slice(elem) => {
-            collect_adt_hashes_from_ty(elem, map);
-        }
-        ra_mir_types::Ty::Tuple(tys) => {
-            for t in tys { collect_adt_hashes_from_ty(t, map); }
-        }
-        ra_mir_types::Ty::FnPtr(params, ret) => {
-            for p in params { collect_adt_hashes_from_ty(p, map); }
-            collect_adt_hashes_from_ty(ret, map);
-        }
-        _ => {}
-    }
-}
-
-/// Build a display path for an ADT, e.g. "alloc::alloc::Global".
-fn adt_display_path(db: &dyn hir_ty::db::HirDatabase, adt_id: hir_def::AdtId) -> String {
-    let adt_name = match adt_id {
-        hir_def::AdtId::StructId(id) => db.struct_signature(id).name.as_str().to_owned(),
-        hir_def::AdtId::EnumId(id) => db.enum_signature(id).name.as_str().to_owned(),
-        hir_def::AdtId::UnionId(id) => db.union_signature(id).name.as_str().to_owned(),
-    };
-    let module = match adt_id {
-        hir_def::AdtId::StructId(id) => id.module(db),
-        hir_def::AdtId::EnumId(id) => id.module(db),
-        hir_def::AdtId::UnionId(id) => id.module(db),
-    };
-    let mut segments = vec![adt_name];
-    let mut current = module;
-    loop {
-        if let Some(name) = current.name(db) {
-            segments.push(name.as_str().to_owned());
-        }
-        match current.containing_module(db) {
-            Some(parent) => current = parent,
-            None => {
-                let krate = current.krate(db);
-                let extra = krate.extra_data(db);
-                if let Some(dn) = &extra.display_name {
-                    segments.push(dn.crate_name().to_string());
-                }
-                break;
-            }
-        }
-    }
-    segments.reverse();
-    segments.join("::")
-}
-
-/// Seamless JIT harness: compile user code that calls `std::` functions.
-///
-/// User code is compiled via r-a with real sysroot loaded. Cross-crate
-/// generic calls are compiled from mirdata, non-generic calls resolved
-/// via libstd.so.
-fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
-    use hir_ty::next_solver::GenericArgKind;
-
-    // Load mirdata generated by the test runner.
-    let mirdata_path = mirdata_path_from_env();
-    let (mirdata, layouts) = crate::link::load_mirdata_layouts(&mirdata_path)
-        .unwrap_or_else(|e| panic!("failed to load mirdata {}: {e}", mirdata_path.display()));
-    let mut ty_layouts = crate::mirdata_codegen::build_ty_layout_map(
-        &mirdata.layouts, &layouts,
-    );
-    let adt_defs: std::collections::HashMap<ra_mir_types::DefPathHash, ra_mir_types::AdtDefEntry> =
-        mirdata.adt_defs.iter().map(|a| (a.def_path_hash, a.clone())).collect();
-    let adt_hash_lookup = build_adt_hash_lookup(&mirdata);
-    let mut mirdata_by_hash: std::collections::HashMap<ra_mir_types::DefPathHash, &ra_mir_types::FnBody> =
-        std::collections::HashMap::new();
-    for fb in &mirdata.bodies {
-        mirdata_by_hash.insert(fb.def_path_hash, fb);
-    }
-    let mut mirdata_generic_lookup: std::collections::HashMap<
-        ra_mir_types::GenericFnLookupKey,
-        Vec<&ra_mir_types::FnBody>,
-    > = std::collections::HashMap::new();
-    for entry in &mirdata.generic_fn_lookup {
-        let fb = mirdata_by_hash.get(&entry.def_path_hash).unwrap_or_else(|| {
-            panic!(
-                "generic_fn_lookup contains missing body hash: {:?}",
-                entry.def_path_hash
-            )
-        });
-        mirdata_generic_lookup.entry(entry.key.clone()).or_default().push(*fb);
-    }
-    // Build lookup for non-generic (monomorphic / #[inline]) functions by (stable_crate_id, path)
-    let mut mirdata_mono_lookup: std::collections::HashMap<
-        (u64, String),
-        &ra_mir_types::FnBody,
-    > = std::collections::HashMap::new();
-    for fb in &mirdata.bodies {
-        if fb.num_generic_params == 0 {
-            mirdata_mono_lookup.insert(
-                (fb.def_path_hash.0, ra_mir_types::normalize_def_path(&fb.name)),
-                fb,
-            );
-        }
-    }
-
-    // Extract crate disambiguators from mirdata
-    let mut ext_crate_disambiguators = std::collections::HashMap::new();
-    for info in &mirdata.crates {
-        ext_crate_disambiguators.insert(info.name.clone(), info.stable_crate_id);
-    }
-
-    // Load libstd.so globally for non-generic cross-crate calls
-    load_libstd_global();
-
-    // Load real sysroot + user code into r-a
-    let (db, file_id, user_crate) = load_sysroot_and_user_code(src);
-
-    attach_db(&db, || {
-        let isa = crate::build_host_isa(false);
-
-        let mut jit_builder = cranelift_jit::JITBuilder::with_isa(
-            isa.clone(),
-            cranelift_module::default_libcall_names(),
-        );
-        jit_builder.symbol("fmodf", fmodf as *const u8);
-        jit_builder.symbol("fmod", fmod as *const u8);
-        let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
-
-        let entry_func_id = find_fn(&db, file_id, entry);
-        let local_crate = user_crate;
-        let env = hir_ty::ParamEnvAndCrate {
-            param_env: db.trait_environment(entry_func_id.into()),
-            krate: local_crate,
-        }
-        .store();
-
-        // Discover reachable functions (local + cross-crate callees)
-        let (reachable_fns, reachable_closures, drop_types, cross_crate_fns) =
-            crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
-
-        let dl = get_target_data_layout(&db, entry_func_id);
-
-        // Compile cross-crate functions from mirdata
-        let fn_registry = std::collections::HashMap::new();
-        let mut compiled_mirdata_fns = std::collections::HashSet::new();
-        for (func_id, generic_args) in &cross_crate_fns {
-            // Check if this function has generic type args
-            let ty_args: Vec<_> = generic_args
-                .as_ref()
-                .iter()
-                .filter_map(|arg| match arg.kind() {
-                    GenericArgKind::Type(ty) => Some(ty),
-                    _ => None,
-                })
-                .collect();
-
-            if ty_args.is_empty() {
-                // Non-generic: try mirdata first (for #[inline] fns not in libstd.so),
-                // fall back to libstd.so via dlsym
-                let mangled = crate::symbol_mangling::mangle_function(
-                    &db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
-                );
-                if let Some(stable_crate_id) = stable_crate_id_for_fn(&db, *func_id, &ext_crate_disambiguators) {
-                    let path = fn_display_path(&db, *func_id);
-                    let key = (stable_crate_id, ra_mir_types::normalize_def_path(&path));
-                    if let Some(fb) = mirdata_mono_lookup.get(&key) {
-                        if compiled_mirdata_fns.insert(mangled.clone()) {
-                            crate::layout::ensure_body_layouts(&fb.body, &adt_defs, &mut ty_layouts, &dl);
-                            crate::mirdata_codegen::compile_mirdata_body(
-                                &mut jit_module,
-                                &*isa,
-                                &dl,
-                                &fb.body,
-                                &layouts,
-                                &mangled,
-                                cranelift_module::Linkage::Export,
-                                &fn_registry,
-                                &ty_layouts,
-                            )
-                            .unwrap_or_else(|e| panic!("compiling mirdata mono {} failed: {e}", fb.name));
-                        }
-                    }
-                    // else: not in mirdata, will be resolved by libstd.so via dlsym
-                }
-                continue;
-            }
-
-            // Compute the v0-mangled name (same name codegen will import)
-            let mangled = crate::symbol_mangling::mangle_function(
-                &db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
-            );
-
-            let lookup_key = generic_lookup_key_for_fn(
-                &db,
-                *func_id,
-                generic_args,
-                &ext_crate_disambiguators,
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing stable crate id for cross-crate generic: {}",
-                    fn_display_path(&db, *func_id)
-                )
-            });
-            let candidates = mirdata_generic_lookup
-                .get(&lookup_key)
-                .unwrap_or_else(|| panic!(
-                    "mirdata lookup miss for cross-crate generic: key={:?}, mangled={}",
-                    lookup_key, mangled
-                ));
-
-            let fb = match candidates.as_slice() {
-                [fb] => *fb,
-                _ => {
-                    let names: Vec<_> = candidates.iter().map(|fb| fb.name.as_str()).collect();
-                    panic!(
-                        "ambiguous mirdata lookup for key={:?}, candidates={:?}",
-                        lookup_key, names
-                    );
-                }
-            };
-
-            // Convert r-a generic args to mirdata args
-            let ty_ctx = TyConvertCtx {
-                db: &db,
-                ext_crate_disambiguators: &ext_crate_disambiguators,
-                adt_hash_lookup: &adt_hash_lookup,
-            };
-            let mirdata_args: Vec<_> = generic_args
-                .as_ref()
-                .iter()
-                .filter_map(|arg| match arg.kind() {
-                    GenericArgKind::Type(ty) => Some(ra_ty_to_mirdata_arg(&ty_ctx, ty)),
-                    _ => None,
-                })
-                .collect();
-
-            // Monomorphize and compile
-            let mono_body = fb.body.subst(&mirdata_args);
-            crate::layout::ensure_body_layouts(&mono_body, &adt_defs, &mut ty_layouts, &dl);
-            crate::mirdata_codegen::compile_mirdata_body(
-                &mut jit_module,
-                &*isa,
-                &dl,
-                &mono_body,
-                &layouts,
-                &mangled,
-                cranelift_module::Linkage::Export,
-                &fn_registry,
-                &ty_layouts,
-            )
-            .unwrap_or_else(|e| panic!("compiling mirdata {} failed: {e}", fb.name));
-        }
-
-        // Compile local functions (user code)
-        for (func_id, generic_args) in &reachable_fns {
-            let fn_name = crate::symbol_mangling::mangle_function(
-                &db, *func_id, generic_args.as_ref(), &ext_crate_disambiguators,
-            );
-            let body = db
-                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("MIR error for {fn_name}: {:?}", e));
-            crate::compile_fn(
-                &mut jit_module, &*isa, &db, &dl, &env, &body, &fn_name,
-                cranelift_module::Linkage::Export, local_crate,
-                &ext_crate_disambiguators, &[],
-            )
-            .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"));
-        }
-        for (closure_id, closure_subst) in &reachable_closures {
-            let body = db
-                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
-            let closure_name = crate::symbol_mangling::mangle_closure(
-                &db, *closure_id, &ext_crate_disambiguators,
-            );
-            crate::compile_fn(
-                &mut jit_module, &*isa, &db, &dl, &env, &body, &closure_name,
-                cranelift_module::Linkage::Export, local_crate,
-                &ext_crate_disambiguators, &[],
-            )
-            .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
-        }
-        for ty in &drop_types {
-            crate::compile_drop_in_place(
-                &mut jit_module, &*isa, &db, &dl, &env, ty,
-                local_crate, &ext_crate_disambiguators,
-            )
-            .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
-        }
-
-        // Finalize & execute
-        jit_module.finalize_definitions().unwrap();
-
-        let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
-        let sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body, &[]).expect("sig");
-        let entry_mangled = crate::symbol_mangling::mangle_function(
-            &db, entry_func_id,
-            hir_ty::next_solver::GenericArgs::empty(
-                hir_ty::next_solver::DbInterner::new_no_crate(&db),
-            ),
-            &ext_crate_disambiguators,
-        );
-        let eid = jit_module
-            .declare_function(&entry_mangled, cranelift_module::Linkage::Import, &sig)
-            .expect("declare entry");
-        let code_ptr = jit_module.get_finalized_function(eid);
-        unsafe {
-            let f: extern "C" fn() -> R = std::mem::transmute(code_ptr);
-            f()
-        }
-    })
-}
-
-fn mirdata_args_len(generic_args: &hir_ty::next_solver::StoredGenericArgs) -> usize {
-    use hir_ty::next_solver::GenericArgKind;
-
-    generic_args
-        .as_ref()
-        .iter()
-        .filter(|arg| matches!(arg.kind(), GenericArgKind::Type(_)))
-        .count()
-}
-
-fn stable_crate_id_for_fn(
-    db: &dyn hir_ty::db::HirDatabase,
-    func_id: hir_def::FunctionId,
-    ext_crate_disambiguators: &std::collections::HashMap<String, u64>,
-) -> Option<u64> {
-    let krate = func_id.krate(db);
-    let crate_name = krate
-        .extra_data(db)
-        .display_name
-        .as_ref()
-        .map(|dn| dn.crate_name().to_string())?;
-    ext_crate_disambiguators.get(&crate_name).copied()
-}
-
-#[test]
-fn mirdata_jit_identity_i32() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    core::convert::identity(42)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn mirdata_jit_ptr_write_read_i32() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let mut slot: i32 = 0;
-    unsafe {
-        core::ptr::write(&mut slot as *mut i32, 99);
-        core::ptr::read(&slot as *const i32)
-    }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 99);
-}
-
-#[test]
-fn mirdata_jit_mem_replace_i32() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let mut x: i32 = 42;
-    let old = core::mem::replace(&mut x, 99);
-    old + x
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42 + 99);
-}
-
-#[test]
-#[should_panic] // HasErrorType in local layout
-fn mirdata_jit_vec_push_len() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let mut v: Vec<i32> = Vec::new();
-    v.push(10);
-    v.push(20);
-    v.push(30);
-    v.len() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 3);
-}
-
-#[test]
-fn mirdata_jit_option_unwrap() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<i32> = Some(42);
-    x.unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn mirdata_jit_option_unwrap_bool() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<bool> = Some(true);
-    if x.unwrap() { 1 } else { 0 }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 1);
-}
-
-#[test]
-fn mirdata_jit_option_unwrap_u8() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<u8> = Some(255);
-    x.unwrap() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 255);
-}
-
-#[test]
-fn mirdata_jit_option_unwrap_i64() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<i64> = Some(999);
-    x.unwrap() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 999);
-}
-
-#[test]
-fn mirdata_jit_option_is_some() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: Option<i32> = Some(1);
-    let b: Option<i32> = None;
-    (a.is_some() as i32) + (b.is_none() as i32)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 2);
-}
-
-#[test]
-fn mirdata_jit_option_match() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<i32> = Some(10);
-    match x {
-        Some(v) => v + 5,
-        None => 0,
-    }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 15);
-}
-
-#[test]
-fn mirdata_jit_option_unwrap_or() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: Option<i32> = Some(10);
-    let b: Option<i32> = None;
-    a.unwrap_or(0) + b.unwrap_or(99)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 109);
-}
-
-#[test]
-#[ignore] // SIGILL — closure codegen in mirdata generic body
-fn mirdata_jit_option_map() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<i32> = Some(10);
-    let y = x.map(|v| v * 3);
-    y.unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 30);
-}
-
-#[test]
-fn mirdata_jit_option_nested() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Option<Option<i32>> = Some(Some(7));
-    x.unwrap().unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 7);
-}
-
-#[test]
-fn mirdata_jit_closure_call() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let f = |x: i32| x + 1;
-    f(41)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn mirdata_jit_closure_capture() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a = 10;
-    let f = |x: i32| x + a;
-    f(32)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn mirdata_jit_fn_pointer() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn add_one(x: i32) -> i32 { x + 1 }
-fn foo() -> i32 {
-    let f: fn(i32) -> i32 = add_one;
-    f(41)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-#[ignore] // SIGILL - generates bad codegen, crashes the test runner
-fn mirdata_jit_box_i32() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let b = Box::new(42i32);
-    *b
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-#[should_panic] // mirdata lookup miss: core::convert::from
-fn mirdata_jit_string_len() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let s = String::from("hello");
-    s.len() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 5);
-}
-
-#[test]
-fn mirdata_jit_i32_wrapping_add() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 100;
-    a.wrapping_add(42)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 142);
-}
-
-#[test]
-fn mirdata_jit_i32_abs() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = -42;
-    a.abs()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-#[ignore] // SIGILL — likely missing intrinsic
-fn mirdata_jit_i32_min_max() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 10;
-    let b: i32 = 20;
-    a.min(b) + a.max(b)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 30);
-}
-
-#[test]
-#[ignore] // SIGILL — likely missing intrinsic
-fn mirdata_jit_i32_pow() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 3;
-    a.pow(4)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 81);
-}
-
-#[test]
-fn mirdata_jit_i32_checked_add() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 100;
-    match a.checked_add(42) {
-        Some(v) => v,
-        None => -1,
-    }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 142);
-}
-
-#[test]
-#[ignore] // SIGILL — likely missing intrinsic
-fn mirdata_jit_i32_count_ones() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 0b1010_1010;
-    a.count_ones() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 4);
-}
-
-#[test]
-#[ignore] // SIGILL — likely missing intrinsic
-fn mirdata_jit_i32_leading_zeros() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 1;
-    a.leading_zeros() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 31);
-}
-
-#[test]
-#[ignore] // SIGILL — likely missing intrinsic
-fn mirdata_jit_i32_swap_bytes() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let a: i32 = 0x12345678_u32 as i32;
-    if a.swap_bytes() == 0x78563412_u32 as i32 { 1 } else { 0 }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 1);
-}
-
-#[test]
-fn mirdata_jit_str_len() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let s: &str = "hello";
-    s.len() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 5);
-}
-
-#[test]
-#[should_panic] // HasErrorType in local layout
-fn mirdata_jit_vec_new_len() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let v: Vec<i32> = Vec::new();
-    v.len() as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 0);
-}
-
-#[test]
-fn mirdata_jit_generic_user_fn() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn identity<T>(x: T) -> T { x }
-fn foo() -> i32 {
-    identity(42)
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-#[should_panic] // mirdata lookup miss: core::slice::iter
-fn mirdata_jit_iter_sum() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let arr = [1i32, 2, 3, 4];
-    let mut sum = 0;
-    for x in arr.iter() {
-        sum += x;
-    }
-    sum
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 10);
-}
-
-#[test]
-#[should_panic] // infer_dst_pointee not implemented for VarError
-fn mirdata_jit_env_var() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    use std::env;
-    unsafe { env::set_var("CG_CLIF_TEST_VAR", "hello"); }
-    let val = env::var("CG_CLIF_TEST_VAR").unwrap();
-    if val == "hello" { 1 } else { 0 }
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 1);
-}
-
-#[test]
-#[should_panic] // infer_dst_pointee not implemented for SendError
-fn mirdata_jit_mpsc_channel() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel();
-    tx.send(42i32).unwrap();
-    rx.recv().unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 42);
-}
-
-#[test]
-#[should_panic] // infer_dst_pointee: Ref(Not, Str)
-fn mirdata_jit_result_and_then() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let x: Result<i32, &str> = Ok(10);
-    let y = x.and_then(|v| Ok(v * 2));
-    y.unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 20);
-}
-
-#[test]
-#[should_panic] // mirdata lookup miss: core::convert::from
-fn mirdata_jit_string_parse() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let s = String::from("123");
-    let n: i32 = s.parse().unwrap();
-    n
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 123);
-}
-
-#[test]
-#[should_panic] // monomorphization resulted in errors
-fn mirdata_jit_hashmap_insert_get() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    use std::collections::HashMap;
-    let mut m = HashMap::new();
-    m.insert("a", 10i32);
-    m.insert("b", 20);
-    *m.get("a").unwrap() + *m.get("b").unwrap()
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 30);
-}

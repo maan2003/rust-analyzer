@@ -1,5 +1,5 @@
-use rustc_abi::{ArmCall, CanonAbi, HasDataLayout};
 use crate::layout_ty::TyAbiInterface;
+use rustc_abi::{ArmCall, CanonAbi, HasDataLayout};
 
 use crate::callconv::{ArgAbi, FnAbi, Reg, RegKind, Uniform};
 use crate::spec::HasTargetSpec;

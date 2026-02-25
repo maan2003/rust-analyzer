@@ -1,6 +1,5 @@
-
-use crate::layout_ty::TyAbiInterface;
 use crate::callconv::{ArgAbi, FnAbi};
+use crate::layout_ty::TyAbiInterface;
 
 fn classify_ret<Ty>(ret: &mut ArgAbi<'_, Ty>) {
     if ret.layout.is_aggregate() {

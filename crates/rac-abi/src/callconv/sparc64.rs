@@ -1,5 +1,5 @@
-use rustc_abi::{Align, BackendRepr, FieldsShape, Float, HasDataLayout, Primitive, Size, Variants};
 use crate::layout_ty::{TyAbiInterface, TyAndLayout};
+use rustc_abi::{Align, BackendRepr, FieldsShape, Float, HasDataLayout, Primitive, Size, Variants};
 
 use crate::callconv::{ArgAbi, ArgAttribute, CastTarget, FnAbi, Reg, Uniform};
 use crate::spec::{HasTargetSpec, Os};

@@ -1751,7 +1751,8 @@ impl Variant {
             layout::Variants::Multiple { variants, .. } => Layout(
                 {
                     let lookup = self.id.lookup(db);
-                    let rustc_enum_variant_idx = RustcEnumVariantIdx::from_usize(lookup.index as usize);
+                    let rustc_enum_variant_idx =
+                        RustcEnumVariantIdx::from_usize(lookup.index as usize);
                     Arc::new(variants[rustc_enum_variant_idx].clone())
                 },
                 db.target_data_layout(parent_enum.krate(db).into()).unwrap(),

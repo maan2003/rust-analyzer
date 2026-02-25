@@ -1,6 +1,5 @@
-
-use crate::layout_ty::TyAbiInterface;
 use crate::callconv::{ArgAbi, FnAbi};
+use crate::layout_ty::TyAbiInterface;
 use crate::spec::{Env, HasTargetSpec, Os};
 
 fn classify_ret<Ty>(ret: &mut ArgAbi<'_, Ty>) {

@@ -1,8 +1,8 @@
 // The classification code for the x86_64 ABI is taken from the clay language
 // https://github.com/jckarter/clay/blob/db0bd2702ab0b6e48965cd85f8859bbd5f60e48e/compiler/externals.cpp
 
-use rustc_abi::{BackendRepr, HasDataLayout, Primitive, Size, Variants};
 use crate::layout_ty::{TyAbiInterface, TyAndLayout};
+use rustc_abi::{BackendRepr, HasDataLayout, Primitive, Size, Variants};
 
 use crate::callconv::{ArgAbi, CastTarget, FnAbi, Reg, RegKind};
 use crate::spec::HasTargetSpec;
@@ -56,7 +56,6 @@ where
             },
 
             BackendRepr::SimdVector { .. } => Class::Sse,
-
 
             BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => {
                 for i in 0..layout.fields.count() {

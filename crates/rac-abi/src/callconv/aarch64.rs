@@ -1,7 +1,7 @@
 use std::iter;
 
-use rustc_abi::{BackendRepr, HasDataLayout, Primitive};
 use crate::layout_ty::TyAbiInterface;
+use rustc_abi::{BackendRepr, HasDataLayout, Primitive};
 
 use crate::callconv::{ArgAbi, FnAbi, Reg, RegKind, Uniform};
 use crate::spec::{Abi, HasTargetSpec, Target};

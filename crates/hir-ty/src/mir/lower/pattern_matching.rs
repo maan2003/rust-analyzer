@@ -606,8 +606,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     );
                     current = next;
                 }
-                let variant_idx =
-                    rac_abi::VariantIdx::from_usize(v.lookup(self.db).index as usize);
+                let variant_idx = rac_abi::VariantIdx::from_usize(v.lookup(self.db).index as usize);
                 let downcast_place = cond_place.project(
                     ProjectionElem::Downcast(variant_idx),
                     &mut self.result.projection_store,

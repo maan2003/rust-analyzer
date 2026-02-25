@@ -1,7 +1,7 @@
 use rustc_abi::{BackendRepr, FieldsShape, Primitive, Size, Variants};
 
-use crate::{TyAbiInterface, TyAndLayout};
 use crate::callconv::{Reg, RegKind};
+use crate::{TyAbiInterface, TyAndLayout};
 
 /// Return value from the `homogeneous_aggregate` test function.
 #[derive(Copy, Clone, Debug)]

@@ -405,12 +405,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     else {
                         return Ok(None);
                     };
-                    self.push_assignment(
-                        current,
-                        place,
-                        Rvalue::AddressOf(*m, p),
-                        expr_id.into(),
-                    );
+                    self.push_assignment(current, place, Rvalue::AddressOf(*m, p), expr_id.into());
                     Ok(Some(current))
                 }
                 Adjust::Pointer(cast) => {
@@ -710,8 +705,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         // Lower transmute intrinsic to Cast(Transmute) instead of a call
                         if let CallableDefId::FunctionId(func_id) = def.0 {
                             if hir_def::signatures::FunctionSignature::is_intrinsic(
-                                self.db,
-                                func_id,
+                                self.db, func_id,
                             ) {
                                 let fn_data = self.db.function_signature(func_id);
                                 if fn_data.name.as_str() == "transmute"
@@ -920,7 +914,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     (op, c)
                 } else {
                     let unit_ty = self.expr_ty_without_adjust(expr_id);
-                    (Operand::from_concrete_const(Box::default(), MemoryMap::default(), unit_ty), current)
+                    (
+                        Operand::from_concrete_const(Box::default(), MemoryMap::default(), unit_ty),
+                        current,
+                    )
                 };
                 let resume_arg = place;
                 let resume = self.new_basic_block();
@@ -1365,18 +1362,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                     let tmp_ty = capture.ty.get().instantiate_identity();
                                     // FIXME: Handle more than one span.
                                     let capture_spans = capture.spans();
-                                    let tmp: Place = self.temp(tmp_ty, current, capture_spans[0])?.into();
+                                    let tmp: Place =
+                                        self.temp(tmp_ty, current, capture_spans[0])?.into();
                                     self.push_assignment(
                                         current,
                                         tmp,
                                         Rvalue::Ref(*bk, p),
                                         capture_spans[0],
                                     );
-                                    operands.push(Operand { kind: OperandKind::Move(tmp), span: None });
+                                    operands
+                                        .push(Operand { kind: OperandKind::Move(tmp), span: None });
                                 }
-                                CaptureKind::ByValue => {
-                                    operands.push(Operand { kind: OperandKind::Move(p), span: None })
-                                }
+                                CaptureKind::ByValue => operands
+                                    .push(Operand { kind: OperandKind::Move(p), span: None }),
                             }
                         }
                         self.push_assignment(
@@ -1400,7 +1398,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.push_assignment(
                             current,
                             place,
-                            Rvalue::Aggregate(AggregateKind::CoroutineClosure(ty.store()), Box::new([])),
+                            Rvalue::Aggregate(
+                                AggregateKind::CoroutineClosure(ty.store()),
+                                Box::new([]),
+                            ),
                             expr_id.into(),
                         );
                         Ok(Some(current))

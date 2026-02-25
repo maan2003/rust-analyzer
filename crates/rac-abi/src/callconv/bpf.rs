@@ -1,7 +1,7 @@
 // see https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/BPF/BPFCallingConv.td
 
-use crate::layout_ty::TyAbiInterface;
 use crate::callconv::{ArgAbi, FnAbi};
+use crate::layout_ty::TyAbiInterface;
 
 fn classify_ret<Ty>(ret: &mut ArgAbi<'_, Ty>) {
     if ret.layout.is_aggregate() || ret.layout.size.bits() > 64 {

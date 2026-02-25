@@ -23,7 +23,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-pub use rac_abi::callconv::{PassMode, CastTarget, Uniform};
+pub use rac_abi::callconv::{CastTarget, PassMode, Uniform};
 
 // ---------------------------------------------------------------------------
 // Display impl for Ty — required by TyAbiInterface
@@ -80,10 +80,7 @@ impl<'a> CodegenCx<'a> {
     fn layout_of<'db>(&self, ty: Ty<'db>) -> Option<TyAndLayout<'a, AbiTy<'db>>> {
         let layout_arc = self.db.layout_of_ty(ty.store(), self.env.clone()).ok()?;
         let layout_ref: &'a HirLayout = self.arena.alloc((*layout_arc).clone());
-        Some(TyAndLayout {
-            ty: AbiTy(ty),
-            layout: Layout(Interned(layout_ref)),
-        })
+        Some(TyAndLayout { ty: AbiTy(ty), layout: Layout(Interned(layout_ref)) })
     }
 }
 
@@ -97,7 +94,7 @@ impl<'a: 'db, 'db> TyAbiInterface<'a, CodegenCx<'a>> for AbiTy<'db> {
         cx: &CodegenCx<'a>,
         variant_index: VariantIdx,
     ) -> TyAndLayout<'a, Self> {
-        let layout = match this.layout.0 .0.variants {
+        let layout = match this.layout.0.0.variants {
             Variants::Single { index } if index == variant_index => this.layout,
             Variants::Single { .. } => this.layout,
             Variants::Multiple { ref variants, .. } => {
@@ -116,15 +113,13 @@ impl<'a: 'db, 'db> TyAbiInterface<'a, CodegenCx<'a>> for AbiTy<'db> {
     ) -> TyAndLayout<'a, Self> {
         match this.ty.0.kind() {
             TyKind::Adt(def, args) => {
-                let variant_id = match &this.layout.0 .0.variants {
+                let variant_id = match &this.layout.0.0.variants {
                     Variants::Single { index } => match def.inner().id {
                         hir_def::AdtId::StructId(s) => hir_def::VariantId::StructId(s),
                         hir_def::AdtId::UnionId(u) => hir_def::VariantId::UnionId(u),
                         hir_def::AdtId::EnumId(e) => {
                             let variants = e.enum_variants(cx.db);
-                            hir_def::VariantId::EnumVariantId(
-                                variants.variants[index.as_usize()].0,
-                            )
+                            hir_def::VariantId::EnumVariantId(variants.variants[index.as_usize()].0)
                         }
                     },
                     _ => panic!("ty_and_layout_field on multi-variant without for_variant"),
@@ -132,8 +127,7 @@ impl<'a: 'db, 'db> TyAbiInterface<'a, CodegenCx<'a>> for AbiTy<'db> {
                 let field_types = cx.db.field_types(variant_id);
                 let fields: Vec<_> = field_types.iter().collect();
                 let (_field_id, field_ty) = fields[i];
-                let field_ty =
-                    (*field_ty).get().instantiate(DbInterner::new_no_crate(cx.db), args);
+                let field_ty = (*field_ty).get().instantiate(DbInterner::new_no_crate(cx.db), args);
                 cx.layout_of(field_ty).expect("field layout")
             }
             TyKind::Tuple(tys) => {
@@ -153,8 +147,7 @@ impl<'a: 'db, 'db> TyAbiInterface<'a, CodegenCx<'a>> for AbiTy<'db> {
                         cx.layout_of(ptr_ty).expect("pointer layout")
                     }
                     1 => {
-                        let usize_ty =
-                            Ty::new(interner, TyKind::Uint(rustc_ast_ir::UintTy::Usize));
+                        let usize_ty = Ty::new(interner, TyKind::Uint(rustc_ast_ir::UintTy::Usize));
                         cx.layout_of(usize_ty).expect("metadata layout")
                     }
                     _ => panic!("pointer only has 2 fields"),
@@ -261,9 +254,7 @@ pub fn compute_fn_abi<'a: 'db, 'db>(
         .iter()
         .map(|&ty| {
             let layout = cx.layout_of(ty)?;
-            Some(ArgAbi::new(cx, layout, |scalar, offset| {
-                scalar_arg_attrs(dl, scalar, offset)
-            }))
+            Some(ArgAbi::new(cx, layout, |scalar, offset| scalar_arg_attrs(dl, scalar, offset)))
         })
         .collect::<Option<_>>()?;
 

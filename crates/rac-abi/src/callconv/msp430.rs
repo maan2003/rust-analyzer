@@ -1,9 +1,8 @@
 // Reference: MSP430 Embedded Application Binary Interface
 // https://www.ti.com/lit/an/slaa534a/slaa534a.pdf
 
-
-use crate::layout_ty::TyAbiInterface;
 use crate::callconv::{ArgAbi, FnAbi};
+use crate::layout_ty::TyAbiInterface;
 
 // 3.5 Structures or Unions Passed and Returned by Reference
 //

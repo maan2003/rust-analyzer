@@ -842,7 +842,9 @@ impl<'db> Evaluator<'db> {
                         Variants::Multiple { variants, .. } => {
                             &variants[match f.parent {
                                 hir_def::VariantId::EnumVariantId(it) => {
-                                    RustcEnumVariantIdx::from_usize(it.lookup(self.db).index as usize)
+                                    RustcEnumVariantIdx::from_usize(
+                                        it.lookup(self.db).index as usize,
+                                    )
                                 }
                                 _ => {
                                     return Err(MirEvalError::InternalError(
@@ -1447,7 +1449,9 @@ impl<'db> Evaluator<'db> {
                             Owned(r.to_bytes())
                         }
                         BinOp::Offset => not_supported!("offset binop"),
-                        BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
+                        BinOp::AddWithOverflow
+                        | BinOp::SubWithOverflow
+                        | BinOp::MulWithOverflow => {
                             let (r, overflow) = match op {
                                 BinOp::AddWithOverflow => l128.overflowing_add(r128),
                                 BinOp::SubWithOverflow => l128.overflowing_sub(r128),
@@ -1724,9 +1728,7 @@ impl<'db> Evaluator<'db> {
                     }
                 }
                 CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
-                CastKind::Transmute => {
-                    Borrowed(self.eval_operand(operand, locals)?)
-                }
+                CastKind::Transmute => Borrowed(self.eval_operand(operand, locals)?),
             },
             Rvalue::ThreadLocalRef(_) => not_supported!("thread local ref"),
         })
@@ -1743,8 +1745,9 @@ impl<'db> Evaluator<'db> {
         match &layout.variants {
             Variants::Empty => unreachable!(),
             Variants::Single { index } => {
-                let r =
-                    self.const_eval_discriminant(e.enum_variants(self.db).variants[index.as_usize()].0)?;
+                let r = self.const_eval_discriminant(
+                    e.enum_variants(self.db).variants[index.as_usize()].0,
+                )?;
                 Ok(r)
             }
             Variants::Multiple { tag, tag_encoding, variants, .. } => {

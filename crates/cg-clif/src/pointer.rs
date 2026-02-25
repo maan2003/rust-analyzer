@@ -38,11 +38,7 @@ impl Pointer {
         match self.base {
             PointerBase::Addr(base_addr) => {
                 let offset: i64 = self.offset.into();
-                if offset == 0 {
-                    base_addr
-                } else {
-                    bcx.ins().iadd_imm(base_addr, offset)
-                }
+                if offset == 0 { base_addr } else { bcx.ins().iadd_imm(base_addr, offset) }
             }
             PointerBase::Stack(stack_slot) => {
                 bcx.ins().stack_addr(pointer_type, stack_slot, self.offset)
@@ -53,7 +49,12 @@ impl Pointer {
         }
     }
 
-    pub(crate) fn offset_i64(self, bcx: &mut FunctionBuilder<'_>, pointer_type: Type, extra_offset: i64) -> Self {
+    pub(crate) fn offset_i64(
+        self,
+        bcx: &mut FunctionBuilder<'_>,
+        pointer_type: Type,
+        extra_offset: i64,
+    ) -> Self {
         if let Some(new_offset) = self.offset.try_add_i64(extra_offset) {
             Pointer { base: self.base, offset: new_offset }
         } else {
@@ -61,9 +62,7 @@ impl Pointer {
             let new_offset = base_offset.checked_add(extra_offset).expect("offset overflow");
             let base_addr = match self.base {
                 PointerBase::Addr(addr) => addr,
-                PointerBase::Stack(stack_slot) => {
-                    bcx.ins().stack_addr(pointer_type, stack_slot, 0)
-                }
+                PointerBase::Stack(stack_slot) => bcx.ins().stack_addr(pointer_type, stack_slot, 0),
                 PointerBase::Dangling(align) => {
                     bcx.ins().iconst(pointer_type, i64::try_from(align.bytes()).unwrap())
                 }
@@ -81,7 +80,12 @@ impl Pointer {
         }
     }
 
-    pub(crate) fn offset_value(self, bcx: &mut FunctionBuilder<'_>, pointer_type: Type, extra_offset: Value) -> Self {
+    pub(crate) fn offset_value(
+        self,
+        bcx: &mut FunctionBuilder<'_>,
+        pointer_type: Type,
+        extra_offset: Value,
+    ) -> Self {
         match self.base {
             PointerBase::Addr(addr) => Pointer {
                 base: PointerBase::Addr(bcx.ins().iadd(addr, extra_offset)),

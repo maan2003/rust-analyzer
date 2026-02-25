@@ -79,10 +79,7 @@ impl CValue {
     }
 
     /// Load a scalar pair. Panics if the layout is not `ScalarPair`.
-    pub(crate) fn load_scalar_pair(
-        &self,
-        fx: &mut FunctionCx<'_, impl Module>,
-    ) -> (Value, Value) {
+    pub(crate) fn load_scalar_pair(&self, fx: &mut FunctionCx<'_, impl Module>) -> (Value, Value) {
         match self.inner {
             CValueInner::ByValPair(a, b) => (a, b),
             CValueInner::ByRef(ptr) => {
@@ -98,8 +95,11 @@ impl CValue {
                 let mut flags = MemFlags::new();
                 flags.set_notrap();
                 let a_val = ptr.load(&mut fx.bcx, a_clif, flags);
-                let b_val =
-                    ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).load(&mut fx.bcx, b_clif, flags);
+                let b_val = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).load(
+                    &mut fx.bcx,
+                    b_clif,
+                    flags,
+                );
                 (a_val, b_val)
             }
             CValueInner::ByVal(_) => {
@@ -158,32 +158,6 @@ impl CPlace {
         CPlace { inner: CPlaceInner::Addr(Pointer::stack_slot(slot), None), layout }
     }
 
-    pub(crate) fn new_var(
-        fx: &mut FunctionCx<'_, impl Module>,
-        layout: Arc<Layout>,
-    ) -> Self {
-        let BackendRepr::Scalar(scalar) = layout.backend_repr else {
-            panic!("new_var requires Scalar layout, got {:?}", layout.backend_repr);
-        };
-        let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
-        let var = fx.bcx.declare_var(clif_ty);
-        CPlace { inner: CPlaceInner::Var(var), layout }
-    }
-
-    pub(crate) fn new_var_pair(
-        fx: &mut FunctionCx<'_, impl Module>,
-        layout: Arc<Layout>,
-    ) -> Self {
-        let BackendRepr::ScalarPair(a, b) = layout.backend_repr else {
-            panic!("new_var_pair requires ScalarPair layout, got {:?}", layout.backend_repr);
-        };
-        let a_clif = scalar_to_clif_type(fx.dl, &a);
-        let b_clif = scalar_to_clif_type(fx.dl, &b);
-        let var1 = fx.bcx.declare_var(a_clif);
-        let var2 = fx.bcx.declare_var(b_clif);
-        CPlace { inner: CPlaceInner::VarPair(var1, var2), layout }
-    }
-
     /// Create a Var CPlace from an already-declared variable.
     /// Used during local setup before FunctionCx is built.
     pub(crate) fn new_var_raw(var: Variable, layout: Arc<Layout>) -> Self {
@@ -192,11 +166,7 @@ impl CPlace {
 
     /// Create a VarPair CPlace from already-declared variables.
     /// Used during local setup before FunctionCx is built.
-    pub(crate) fn new_var_pair_raw(
-        var1: Variable,
-        var2: Variable,
-        layout: Arc<Layout>,
-    ) -> Self {
+    pub(crate) fn new_var_pair_raw(var1: Variable, var2: Variable, layout: Arc<Layout>) -> Self {
         CPlace { inner: CPlaceInner::VarPair(var1, var2), layout }
     }
 
@@ -258,13 +228,6 @@ impl CPlace {
         }
     }
 
-    pub(crate) fn to_ptr_unsized(&self) -> (Pointer, Value) {
-        match self.inner {
-            CPlaceInner::Addr(ptr, Some(extra)) => (ptr, extra),
-            _ => panic!("to_ptr_unsized on non-unsized CPlace"),
-        }
-    }
-
     /// Get the metadata value for unsized places (e.g. slice length).
     /// Returns `None` for sized places.
     pub(crate) fn get_extra(&self) -> Option<Value> {
@@ -297,11 +260,7 @@ impl CPlace {
     }
 
     /// Write a CValue into this place.
-    pub(crate) fn write_cvalue(
-        &self,
-        fx: &mut FunctionCx<'_, impl Module>,
-        from: CValue,
-    ) {
+    pub(crate) fn write_cvalue(&self, fx: &mut FunctionCx<'_, impl Module>, from: CValue) {
         if self.layout.is_zst() {
             return;
         }
@@ -338,15 +297,17 @@ impl CPlace {
                         ptr.store(&mut fx.bcx, val, flags);
                     }
                     CValueInner::ByValPair(val1, val2) => {
-                        let BackendRepr::ScalarPair(a_scalar, b_scalar) =
-                            self.layout.backend_repr
+                        let BackendRepr::ScalarPair(a_scalar, b_scalar) = self.layout.backend_repr
                         else {
                             panic!("writing ByValPair to non-ScalarPair memory");
                         };
                         let b_off = scalar_pair_b_offset(fx.dl, a_scalar, b_scalar);
                         ptr.store(&mut fx.bcx, val1, flags);
-                        ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off)
-                            .store(&mut fx.bcx, val2, flags);
+                        ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).store(
+                            &mut fx.bcx,
+                            val2,
+                            flags,
+                        );
                     }
                     CValueInner::ByRef(from_ptr) => {
                         // Delegate to scalar/pair load if possible, else memcpy
@@ -365,13 +326,15 @@ impl CPlace {
                                     .offset_i64(&mut fx.bcx, fx.pointer_type, b_off)
                                     .load(&mut fx.bcx, b_clif, flags);
                                 ptr.store(&mut fx.bcx, val1, flags);
-                                ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off)
-                                    .store(&mut fx.bcx, val2, flags);
+                                ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).store(
+                                    &mut fx.bcx,
+                                    val2,
+                                    flags,
+                                );
                             }
                             _ => {
                                 // Memory-to-memory copy
-                                let from_addr =
-                                    from_ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+                                let from_addr = from_ptr.get_addr(&mut fx.bcx, fx.pointer_type);
                                 let to_addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
                                 let size = self.layout.size.bytes();
                                 let dst_align: u8 =
@@ -411,7 +374,10 @@ impl CPlace {
                 // Special case: if the field itself is ScalarPair (newtype wrapper),
                 // it encompasses the whole pair (e.g. Box<[u8]>.field(0) → Unique<[u8]>).
                 if matches!(field_layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
-                    return CPlace { inner: CPlaceInner::VarPair(var1, var2), layout: field_layout };
+                    return CPlace {
+                        inner: CPlaceInner::VarPair(var1, var2),
+                        layout: field_layout,
+                    };
                 }
                 // ScalarPair: select first or second scalar based on field offset.
                 // Typically field 0 → var1, field 1 → var2, but unions may have
@@ -479,19 +445,7 @@ impl CPlace {
 
     /// Change the layout to represent a specific enum variant without moving
     /// the pointer. Used for `ProjectionElem::Downcast`.
-    pub(crate) fn downcast_variant(
-        &self,
-        variant_layout: Arc<Layout>,
-    ) -> CPlace {
+    pub(crate) fn downcast_variant(&self, variant_layout: Arc<Layout>) -> CPlace {
         CPlace { inner: self.inner, layout: variant_layout }
-    }
-
-    /// Reinterpret the place with a different layout of the same size.
-    /// Used for `ProjectionElem::OpaqueCast` and similar no-op type changes.
-    pub(crate) fn transmute_type(
-        &self,
-        new_layout: Arc<Layout>,
-    ) -> CPlace {
-        CPlace { inner: self.inner, layout: new_layout }
     }
 }
