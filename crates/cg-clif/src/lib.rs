@@ -546,6 +546,35 @@ fn codegen_cast(
         return codegen_transmute(fx, from_cval, result_layout);
     }
 
+    let is_ptr_like_cast = matches!(
+        kind,
+        CastKind::PtrToPtr
+            | CastKind::FnPtrToPtr
+            | CastKind::PointerExposeProvenance
+            | CastKind::PointerWithExposedProvenance
+            | CastKind::PointerCoercion(_)
+    );
+
+    // Handle wide-pointer casts explicitly (mirrors upstream behavior):
+    // - wide -> wide: preserve data + metadata
+    // - wide -> thin: drop metadata
+    if is_ptr_like_cast {
+        match (&from_cval.layout.backend_repr, &result_layout.backend_repr) {
+            (BackendRepr::ScalarPair(_, _), BackendRepr::ScalarPair(_, _)) => {
+                let (data, meta) = from_cval.load_scalar_pair(fx);
+                return CValue::by_val_pair(data, meta, result_layout.clone());
+            }
+            (BackendRepr::ScalarPair(_, _), BackendRepr::Scalar(_)) => {
+                let (data, _) = from_cval.load_scalar_pair(fx);
+                return CValue::by_val(data, result_layout.clone());
+            }
+            (BackendRepr::Scalar(_), BackendRepr::ScalarPair(_, _)) => {
+                panic!("unsupported thin->wide ptr-like cast without unsize coercion")
+            }
+            _ => {}
+        }
+    }
+
     let from_val = from_cval.load_scalar(fx);
 
     let BackendRepr::Scalar(target_scalar) = result_layout.backend_repr else {
