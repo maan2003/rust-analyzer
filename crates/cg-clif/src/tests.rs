@@ -2425,6 +2425,37 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails: to_ptr on unsized CPlace; use to_ptr_unsized"]
+fn std_jit_vec_push_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(7);
+    ((v.len() == 1) && (v[0] == 7)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: const_eval_select runtime callee signature mismatch"]
+fn std_jit_string_from_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let value = String::from("hello");
+    ((value.len() == 5) && (value == "hello")) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "investigation: vec smoke with mem::forget"]
 fn std_jit_vec_new_forget_smoke() {
     let result: i32 = jit_run_with_std(
@@ -2434,6 +2465,52 @@ fn foo() -> i32 {
     let ok = (v.len() == 0) as i32;
     std::mem::forget(v);
     ok
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_env_var_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    std::env::var("PATH").is_ok() as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: to_ptr on unsized CPlace; use to_ptr_unsized"]
+fn std_jit_str_parse_i32_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    match "42".parse::<i32>() {
+        Ok(value) => (value == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: std::io::error::repr_bitpacked::Repr::drop layout HasErrorType"]
+fn std_jit_env_set_var_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let key = "CG_CLIF_STD_JIT_SET_VAR_SMOKE";
+    unsafe { std::env::set_var(key, "ok") };
+    std::env::var(key).is_ok() as i32
 }
 "#,
         "foo",
