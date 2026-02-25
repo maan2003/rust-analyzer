@@ -2207,6 +2207,20 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_array_index_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let x = [1, 2, 3];
+    x[0]
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails during codegen: const_to_i64 unsupported UnevaluatedConst in Vec::new path"]
 fn std_jit_vec_new_smoke() {
     let result: i32 = jit_run_with_std(
