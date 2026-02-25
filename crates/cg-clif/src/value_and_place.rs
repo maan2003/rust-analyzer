@@ -216,6 +216,14 @@ impl CPlace {
         }
     }
 
+    pub(crate) fn to_ptr_unsized(&self) -> (Pointer, Value) {
+        match self.inner {
+            CPlaceInner::Addr(ptr, Some(extra)) => (ptr, extra),
+            CPlaceInner::Addr(_, None) => panic!("to_ptr_unsized on sized CPlace"),
+            _ => panic!("to_ptr_unsized on non-Addr CPlace"),
+        }
+    }
+
     /// Get a pointer to this place, spilling to the stack if necessary.
     /// Used when we need the address of a place (e.g. for `drop(&mut self)`).
     pub(crate) fn to_ptr_maybe_spill(&self, fx: &mut FunctionCx<'_, impl Module>) -> Pointer {

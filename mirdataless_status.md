@@ -37,6 +37,12 @@ What is in place:
   (instead of becoming unresolved external symbols).
 - Lang-item `core::ptr::drop_in_place` calls are now lowered to generated drop glue,
   avoiding execution of the intentionally-recursive shim body from core.
+- Unsized-place pointer projection handling has been extended in `cg-clif`:
+  - `CPlace::to_ptr_unsized()` exists and is used in `codegen_place` for
+    `ProjectionElem::Index` and `ProjectionElem::ConstantIndex` on slice/str-like DST places.
+  - `ProjectionElem::Subslice` lowering is implemented (array/slice/str cases),
+    carrying updated metadata for DST subslices.
+- `core::intrinsics::cold_path` is lowered as a no-op intrinsic hint.
 - MIR lowering now supports const blocks in the mirdataless path:
   - `Expr::Const` no longer returns `NotSupported("const block")`.
   - the inner const-block expression is lowered under const scope in `crates/hir-ty/src/mir/lower.rs`.
@@ -58,13 +64,13 @@ What is in place:
   - `std_jit_box_new_i32_smoke`
   - `std_jit_vec_new_smoke` (now unignored and passing)
   - `std_jit_env_var_smoke`
+  - `std_jit_str_parse_i32_smoke` (now passes when run ignored)
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
   - `std_jit_vec_push_smoke`
-    - fails with `to_ptr on unsized CPlace; use to_ptr_unsized`
-  - `std_jit_str_parse_i32_smoke`
-    - fails with `to_ptr on unsized CPlace; use to_ptr_unsized`
+    - now fails later with `const_eval_select` runtime-callee signature mismatch
+      (`core::ub_checks::runtime` signature clash at `declare_function`)
   - `std_jit_string_from_smoke`
     - fails with `const_eval_select` runtime callee signature mismatch
       (`core::ub_checks::runtime` signature clash at `declare_function`)
@@ -83,10 +89,10 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_box_new_i32_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_push_smoke)' --no-capture` fails with
-  `to_ptr on unsized CPlace; use to_ptr_unsized`
-- `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` fails with
-  `to_ptr on unsized CPlace; use to_ptr_unsized`
+- `just test-clif std_jit_str_parse_i32_smoke --run-ignored only --no-capture` passes
+- `just test-clif std_jit_vec_push_smoke --run-ignored only --no-capture` fails with
+  `const_eval_select` runtime-callee signature mismatch
+  (`core::ub_checks::runtime`: `() -> bool` vs `(usize, usize) -> bool`)
 - `just test-clif -E 'test(std_jit_string_from_smoke)' --no-capture` fails with
   `const_eval_select` runtime-callee signature mismatch
 - `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
@@ -95,10 +101,9 @@ Validation recently run:
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
-- Unsized-place pointer handling still has a correctness gap (`to_ptr` vs `to_ptr_unsized`).
-  - currently blocks both `Vec::push` and `str::parse::<i32>` probes.
 - `const_eval_select` runtime-arm call lowering still has signature mismatch cases.
-  - currently blocks `String::from` probe via `core::ub_checks::runtime`.
+  - currently blocks `Vec::push` and `String::from` probes via `core::ub_checks::runtime`.
+  - likely related to local helper symbol collisions for same-named `runtime` shims.
 - ScalarPair constant materialization is still incomplete for non-value const forms.
   - currently blocks `std_jit_env_var_roundtrip`.
 - Some std paths still hit `HasErrorType` layout failures in deeper std internals.
@@ -107,34 +112,30 @@ Validation recently run:
 
 ## Recommended Fix Order
 
-1. Fix unsized-place pointer lowering (`to_ptr`/`to_ptr_unsized`) in codegen.
-   - Repro targets: `std_jit_vec_push_smoke`, `std_jit_str_parse_i32_smoke`.
-   - Why first: one core bug is blocking multiple collection/string paths.
+1. Fix `const_eval_select` runtime-arm signature mismatches.
+   - Repro targets: `std_jit_vec_push_smoke`, `std_jit_string_from_smoke`.
+   - Focus: runtime callable signature construction + symbol/disambiguation consistency
+     for `core::ub_checks::runtime`-style local helper callees.
 
-2. Fix `const_eval_select` runtime-arm signature mismatches.
-   - Repro target: `std_jit_string_from_smoke`.
-   - Focus: runtime callable signature construction and declaration consistency for
-     `core::ub_checks::runtime`-style callees.
-
-3. Complete ScalarPair constant lowering for non-value const forms.
+2. Complete ScalarPair constant lowering for non-value const forms.
    - Repro target: `std_jit_env_var_roundtrip`.
    - Goal: support the const shapes used by `std::env` result/error paths.
 
-4. Address `HasErrorType` layout holes in std IO error paths.
+3. Address `HasErrorType` layout holes in std IO error paths.
    - Repro target: `std_jit_env_set_var_smoke`.
    - Focus: why `repr_bitpacked::Repr::drop` local layout still unresolved in mirdataless flow.
 
-5. Re-run and unignore probes incrementally as each blocker is fixed.
-   - Unignore order: `vec_push`/`str_parse` -> `string_from` -> `env_var_roundtrip` -> `env_set_var`.
+4. Re-run and unignore probes incrementally as each blocker is fixed.
+   - Unignore order: `str_parse` (ready now) -> `vec_push`/`string_from` -> `env_var_roundtrip` -> `env_set_var`.
 
-6. Expand coverage with more deterministic std probes once blockers are cleared.
+5. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.
 
-7. Improve sysroot loading ergonomics/perf for tests.
+6. Improve sysroot loading ergonomics/perf for tests.
    - Cache file discovery and/or loaded roots across tests when feasible.
    - Keep wall-time reasonable as std-smoke coverage grows.
 
-8. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
+7. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
    - Make it easy to run only mirdataless std-JIT smoke tests locally.
 
 ## Non-Goals (Still True)

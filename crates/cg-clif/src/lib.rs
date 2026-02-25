@@ -24,6 +24,7 @@ use hir_def::{
     VariantId,
 };
 use hir_ty::PointerCast;
+use hir_ty::consteval::{try_const_usize, usize_const};
 use hir_ty::db::HirDatabase;
 use hir_ty::method_resolution::TraitImpls;
 use hir_ty::mir::{
@@ -37,7 +38,7 @@ use hir_ty::next_solver::{
 use hir_ty::traits::StoredParamEnvAndCrate;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
-use rustc_type_ir::inherent::GenericArgs as _;
+use rustc_type_ir::inherent::{GenericArgs as _, Ty as _};
 use triomphe::Arc as TArc;
 
 pub mod link;
@@ -957,6 +958,7 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
             ProjectionElem::Index(index_local) => {
                 let index_place = fx.local_place(*index_local).clone();
                 let index_val = index_place.to_cvalue(fx).load_scalar(fx);
+                let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
                     _ => panic!("Index on non-array/slice type"),
@@ -970,13 +972,15 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     let ptr = cval.force_stack(fx);
                     cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                 }
+                let base_ptr = if is_slice { cplace.to_ptr_unsized().0 } else { cplace.to_ptr() };
                 cplace = CPlace::for_ptr(
-                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, offset),
+                    base_ptr.offset_value(&mut fx.bcx, fx.pointer_type, offset),
                     elem_layout,
                 );
                 cur_ty = elem_ty;
             }
             ProjectionElem::ConstantIndex { offset, from_end } => {
+                let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
                     _ => panic!("ConstantIndex on non-array/slice type"),
@@ -986,14 +990,18 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 let index = if !*from_end {
                     fx.bcx.ins().iconst(fx.pointer_type, *offset as i64)
                 } else {
-                    // from_end: get array length from layout
-                    let arr_len = match &cplace.layout.fields {
-                        rustc_abi::FieldsShape::Array { count, .. } => {
-                            fx.bcx.ins().iconst(fx.pointer_type, *count as i64)
+                    // from_end: use array length or slice metadata length.
+                    let len = if is_slice {
+                        cplace.to_ptr_unsized().1
+                    } else {
+                        match &cplace.layout.fields {
+                            rustc_abi::FieldsShape::Array { count, .. } => {
+                                fx.bcx.ins().iconst(fx.pointer_type, *count as i64)
+                            }
+                            _ => panic!("ConstantIndex from_end on non-array layout"),
                         }
-                        _ => panic!("ConstantIndex from_end on non-array layout"),
                     };
-                    fx.bcx.ins().iadd_imm(arr_len, -(*offset as i64))
+                    fx.bcx.ins().iadd_imm(len, -(*offset as i64))
                 };
                 if cplace.is_register() {
                     let cval = cplace.to_cvalue(fx);
@@ -1001,13 +1009,73 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                 }
                 let byte_offset = fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64);
+                let base_ptr = if is_slice { cplace.to_ptr_unsized().0 } else { cplace.to_ptr() };
                 cplace = CPlace::for_ptr(
-                    cplace.to_ptr().offset_value(&mut fx.bcx, fx.pointer_type, byte_offset),
+                    base_ptr.offset_value(&mut fx.bcx, fx.pointer_type, byte_offset),
                     elem_layout,
                 );
                 cur_ty = elem_ty;
             }
-            ProjectionElem::Subslice { .. } => todo!("Subslice projection"),
+            ProjectionElem::Subslice { from, to } => {
+                match cur_ty.as_ref().kind() {
+                    TyKind::Array(elem_ty, len) => {
+                        let elem_layout = fx
+                            .db()
+                            .layout_of_ty(elem_ty.store(), fx.env().clone())
+                            .expect("array subslice elem layout");
+
+                        if cplace.is_register() {
+                            let cval = cplace.to_cvalue(fx);
+                            let ptr = cval.force_stack(fx);
+                            cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
+                        }
+
+                        let from_bytes = i64::try_from(*from)
+                            .unwrap()
+                            .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
+                            .expect("array subslice offset overflow");
+                        let base_ptr = cplace.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+
+                        let new_len = try_const_usize(fx.db(), len)
+                            .and_then(|n| n.checked_sub(u128::from(*from + *to)));
+                        let new_len_const = usize_const(fx.db(), new_len, fx.local_crate());
+                        let interner = DbInterner::new_no_crate(fx.db());
+                        let subslice_ty =
+                            hir_ty::next_solver::Ty::new_array_with_const_len(interner, elem_ty, new_len_const);
+                        let subslice_layout = fx
+                            .db()
+                            .layout_of_ty(subslice_ty.store(), fx.env().clone())
+                            .expect("array subslice layout");
+
+                        cplace = CPlace::for_ptr(base_ptr, subslice_layout);
+                        cur_ty = subslice_ty.store();
+                    }
+                    TyKind::Slice(elem_ty) => {
+                        let elem_layout = fx
+                            .db()
+                            .layout_of_ty(elem_ty.store(), fx.env().clone())
+                            .expect("slice subslice elem layout");
+                        let (ptr, len) = cplace.to_ptr_unsized();
+                        let from_bytes = i64::try_from(*from)
+                            .unwrap()
+                            .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
+                            .expect("slice subslice offset overflow");
+                        let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+                        let total_trim = i64::try_from(*from + *to).unwrap();
+                        let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
+                        cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
+                    }
+                    TyKind::Str => {
+                        let (ptr, len) = cplace.to_ptr_unsized();
+                        let from_bytes = i64::try_from(*from).unwrap();
+                        let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+                        let total_trim = i64::try_from(*from + *to).unwrap();
+                        let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
+                        cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
+                    }
+                    _ => panic!("Subslice projection on non-array/slice/str type"),
+                }
+            }
             ProjectionElem::OpaqueCast(_) => todo!("OpaqueCast projection"),
         }
     }
@@ -3307,7 +3375,11 @@ fn codegen_intrinsic_call(
         }
 
         // --- no-ops and hints ---
-        "assume" | "assert_inhabited" | "assert_zero_valid" | "assert_mem_uninitialized_valid" => {
+        "assume"
+        | "assert_inhabited"
+        | "assert_zero_valid"
+        | "assert_mem_uninitialized_valid"
+        | "cold_path" => {
             None // no-op
         }
         "likely" | "unlikely" => {

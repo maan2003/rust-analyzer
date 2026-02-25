@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use base_db::Crate;
-use hir_def::{AdtId, FunctionId, HasModule, ImplId, ItemContainerId};
+use hir_def::{AdtId, FunctionId, HasModule, ImplId, ItemContainerId, ModuleDefId};
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::Mutability;
 use hir_ty::next_solver::{GenericArgKind, GenericArgs, IntoKind, Ty, TyKind};
@@ -37,6 +37,7 @@ pub fn mangle_function(
 
     let container = func_id.loc(db).container;
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
+    let fn_disambiguator = m.function_disambiguator(func_id, container, &fn_name);
 
     // Collect non-lifetime generic args.
     let ty_args: Vec<_> = generic_args
@@ -52,7 +53,7 @@ pub fn mangle_function(
         m.out.push_str("N");
         m.out.push('v'); // ValueNs
         m.print_container_path(container);
-        m.push_disambiguator(0);
+        m.push_disambiguator(fn_disambiguator);
         m.push_ident(&fn_name);
     } else {
         // Wrap with I...E for generic instantiation.
@@ -60,7 +61,7 @@ pub fn mangle_function(
         m.out.push_str("N");
         m.out.push('v'); // ValueNs
         m.print_container_path(container);
-        m.push_disambiguator(0);
+        m.push_disambiguator(fn_disambiguator);
         m.push_ident(&fn_name);
         for ty in &ty_args {
             m.print_type(*ty);
@@ -146,6 +147,63 @@ impl<'a> SymbolMangler<'a> {
 
     fn push_ident(&mut self, ident: &str) {
         push_ident(ident, &mut self.out)
+    }
+
+    fn function_disambiguator(
+        &self,
+        func_id: FunctionId,
+        container: ItemContainerId,
+        fn_name: &str,
+    ) -> u64 {
+        let mut same_named = Vec::new();
+        match container {
+            ItemContainerId::ModuleId(module) => {
+                let def_map = module.def_map(self.db);
+                let scope = &def_map[module].scope;
+                for decl in scope.declarations() {
+                    if let ModuleDefId::FunctionId(fid) = decl
+                        && self.db.function_signature(fid).name.as_str() == fn_name
+                    {
+                        same_named.push(fid);
+                    }
+                }
+            }
+            ItemContainerId::ImplId(impl_id) => {
+                let impl_items = impl_id.impl_items(self.db);
+                for (_name, item) in impl_items.items.iter() {
+                    if let hir_def::AssocItemId::FunctionId(fid) = item
+                        && self.db.function_signature(*fid).name.as_str() == fn_name
+                    {
+                        same_named.push(*fid);
+                    }
+                }
+            }
+            ItemContainerId::TraitId(trait_id) => {
+                let trait_items = trait_id.trait_items(self.db);
+                for (_name, item) in trait_items.items.iter() {
+                    if let hir_def::AssocItemId::FunctionId(fid) = item
+                        && self.db.function_signature(*fid).name.as_str() == fn_name
+                    {
+                        same_named.push(*fid);
+                    }
+                }
+            }
+            ItemContainerId::ExternBlockId(_) => {
+                // Extern symbols use function names directly and don't rely on rust-path disambiguators.
+                return 0;
+            }
+        }
+
+        if same_named.len() <= 1 {
+            return 0;
+        }
+
+        same_named.sort_by_key(|fid| format!("{fid:?}"));
+        same_named
+            .iter()
+            .position(|fid| *fid == func_id)
+            .map(|idx| idx as u64)
+            .unwrap_or(0)
     }
 
     // -- Path encoding ------------------------------------------------------
