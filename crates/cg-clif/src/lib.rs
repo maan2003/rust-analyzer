@@ -2778,6 +2778,18 @@ fn codegen_intrinsic_call(
             let result = hir_ty::drop::has_drop_glue_mono(interner, generic_ty.as_ref());
             Some(fx.bcx.ins().iconst(types::I8, i64::from(result)))
         }
+        "ptr_metadata" => {
+            assert_eq!(args.len(), 1, "ptr_metadata expects 1 arg");
+            let ptr = codegen_operand(fx, &args[0].kind);
+            match ptr.layout.backend_repr {
+                BackendRepr::ScalarPair(_, _) => {
+                    let (_, metadata) = ptr.load_scalar_pair(fx);
+                    Some(metadata)
+                }
+                // Thin pointers have `()` metadata; destination is ZST so no write needed.
+                _ => None,
+            }
+        }
         "type_id" | "type_name" => {
             // These are complex; fall through to let them be unresolved
             // (they need const eval or string allocation)

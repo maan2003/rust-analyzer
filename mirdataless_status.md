@@ -13,9 +13,16 @@ What is in place:
   - `collect_reachable_fns`
   - `compile_fn`
   - `compile_drop_in_place`
-- External monomorphic std calls are resolved through existing mangling/link strategy:
+- Cross-crate monomorphic calls use a hybrid strategy:
+  - compile from MIR when the mangled symbol is not exported from `libstd.so`
+    (covers many `#[inline]` std/core helpers such as `core::str::len`)
+  - keep as imports when exported in `libstd.so`
+  - if cross-crate MIR lowering fails (e.g. unresolved `libc::...` in sys shims),
+    fall back to import linkage instead of failing test compilation
+- External calls are resolved through existing mangling/link strategy:
   - crate disambiguators from `RA_MIRDATA` metadata (`extract_crate_disambiguators()`)
   - dynamic loading of `libstd.so` (`dlopen(..., RTLD_GLOBAL)`)
+- `core::intrinsics::ptr_metadata` is now lowered in codegen intrinsic handling.
 - `.mirdata` remains metadata-only (crate names + stable crate ids); no old body/layout schema was revived.
 - rust-analyzer builtin macro coverage now includes `pattern_type!` (erased to base type in fallback expander).
   - this unblocks `core::num::niche_types::UsizeNoHighBit` type resolution in `alloc::raw_vec`/`Vec` layout paths.
@@ -26,6 +33,7 @@ What is in place:
 - Passing smoke test:
   - `std_jit_process_id_nonzero`
   - `std_jit_generic_identity_i32`
+  - `std_jit_str_len_smoke`
 - Additional probe test present but ignored:
   - `std_jit_process_id_is_stable_across_calls`
   - currently `#[ignore]` due to observed JIT flakiness where repeated calls can diverge.
@@ -36,6 +44,7 @@ Validation recently run:
 
 - `cargo check -p cg-clif` passes
 - `just test-clif -E 'test(std_jit_process_id_nonzero)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_str_len_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_var_roundtrip)' --no-capture --run-ignored all`
   now reaches codegen and fails with `non-value const in ScalarPair constant` (previous `HasErrorType` gone).
 
@@ -49,8 +58,8 @@ Validation recently run:
 
 ## Good Next Steps
 
-1. Expand passing std smoke coverage with monomorphic, exported std APIs.
-   - Candidate families: `std::env`, `std::thread::current`, `std::time` where symbol export is stable.
+1. Expand passing std smoke coverage beyond the current process/id + str len checks.
+   - Candidate families: `std::env`, `std::thread::current`, `std::time`.
    - Keep tests small and deterministic.
 
 2. Investigate and fix the repeated-call instability.

@@ -24,6 +24,10 @@ unsafe extern "C" {
     fn fmodf(x: f32, y: f32) -> f32;
     fn fmod(x: f64, y: f64) -> f64;
     fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
 }
 
 use crate::symbol_mangling;
@@ -1748,10 +1752,10 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 const RTLD_LAZY: i32 = 0x1;
 const RTLD_GLOBAL: i32 = 0x100;
 
-fn load_libstd_global() {
+fn load_libstd_global() -> *mut std::ffi::c_void {
     static LIBSTD_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-    LIBSTD_HANDLE.get_or_init(|| {
+    let handle = *LIBSTD_HANDLE.get_or_init(|| {
         let libdir = crate::link::find_target_libdir().expect("rustc target-libdir unavailable");
         let libstd = crate::link::find_libstd_so(&libdir).expect("libstd-*.so not found");
         let c_path = std::ffi::CString::new(libstd.to_string_lossy().as_bytes())
@@ -1760,6 +1764,15 @@ fn load_libstd_global() {
         assert!(!handle.is_null(), "dlopen({}) failed", libstd.display());
         handle as usize
     });
+
+    handle as *mut std::ffi::c_void
+}
+
+fn libstd_exports_symbol(libstd_handle: *mut std::ffi::c_void, symbol: &str) -> bool {
+    let c_symbol =
+        std::ffi::CString::new(symbol).expect("mangled symbol contains interior NUL byte");
+    let ptr = unsafe { dlsym(libstd_handle, c_symbol.as_ptr()) };
+    !ptr.is_null()
 }
 
 fn find_sysroot_src_dir() -> std::path::PathBuf {
@@ -2009,11 +2022,13 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 /// JIT harness for std calls in the mirdataless architecture.
 ///
 /// - Real sysroot sources are loaded into the test DB for type/MIR queries.
-/// - Local reachable functions and cross-crate generic instantiations are compiled.
+/// - Local reachable functions, cross-crate generic instantiations, and
+///   cross-crate monomorphic functions that are not exported from `libstd.so`
+///   (commonly `#[inline]`) are compiled.
 /// - Cross-crate monomorphic calls are left as imports and resolved from libstd/libc
 ///   through symbol mangling + disambiguators (`RA_MIRDATA` metadata only).
 fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
-    load_libstd_global();
+    let libstd_handle = load_libstd_global();
     let disambiguators = crate::link::extract_crate_disambiguators()
         .expect("failed to load crate disambiguators; run via `just test-clif`");
     let (db, file_id, local_crate) = load_sysroot_and_user_code(src);
@@ -2043,22 +2058,42 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         for (func_id, generic_args) in &reachable_fns {
             let is_cross_crate = func_id.krate(&db) != local_crate;
             let is_generic_instance = !generic_args.as_ref().is_empty();
-
-            // For external calls, keep monomorphic functions as dylib imports
-            // and only compile generic instantiations from MIR.
-            if is_cross_crate && !is_generic_instance {
-                continue;
-            }
-
             let fn_name = crate::symbol_mangling::mangle_function(
                 &db,
                 *func_id,
                 generic_args.as_ref(),
                 &disambiguators,
             );
-            let body = db
-                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("MIR error for compiled fn {fn_name}: {:?}", e));
+            let exported_in_libstd =
+                is_cross_crate && libstd_exports_symbol(libstd_handle, &fn_name);
+            let should_compile_cross_crate =
+                is_generic_instance || !exported_in_libstd;
+
+            if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+                eprintln!(
+                    "std-jit: fn={fn_name} cross_crate={is_cross_crate} generic={is_generic_instance} exported_in_libstd={exported_in_libstd} compile={}",
+                    !is_cross_crate || should_compile_cross_crate
+                );
+            }
+
+            // For external calls, keep monomorphic functions as dylib imports by default,
+            // but compile monomorphic callees from MIR when their symbols are not
+            // exported from libstd (e.g. many `#[inline]` methods such as core::str::len).
+            if is_cross_crate && !should_compile_cross_crate {
+                continue;
+            }
+            let body = match db.monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone()) {
+                Ok(body) => body,
+                Err(e) if is_cross_crate => {
+                    if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+                        eprintln!(
+                            "std-jit: fn={fn_name} fallback=import reason=mir_error error={e:?}"
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => panic!("MIR error for compiled fn {fn_name}: {:?}", e),
+            };
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2159,7 +2194,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails in JIT import resolution: unresolved symbol core::str::len"]
 fn std_jit_str_len_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2628,6 +2662,26 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 // Essential intrinsics tests (M11c)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn jit_ptr_metadata_str() {
+    let result: usize = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn ptr_metadata<P: ?Sized>(ptr: *const P) -> usize;
+}
+
+fn foo() -> usize {
+    let s: &str = "hello";
+    let p: *const str = s as *const str;
+    unsafe { ptr_metadata::<str>(p) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 5);
+}
 
 #[test]
 fn jit_size_of() {
