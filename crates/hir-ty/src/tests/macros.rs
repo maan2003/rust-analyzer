@@ -732,6 +732,24 @@ fn infer_builtin_macros_column() {
 }
 
 #[test]
+fn infer_builtin_macros_pattern_type() {
+    check_types(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! pattern_type { ($($arg:tt)*) => {} }
+
+type Positive = pattern_type!(i32 is 1..);
+
+fn main() {
+    let x: Positive = 5;
+    x;
+  //^ i32
+}
+"#,
+    );
+}
+
+#[test]
 fn infer_builtin_macros_concat() {
     check_infer(
         r#"
