@@ -2288,6 +2288,32 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_option_unwrap_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    Some(9_i32).unwrap()
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 9);
+}
+
+#[test]
+fn std_jit_option_expect_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    Some(11_i32).expect("value should be present")
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 11);
+}
+
+#[test]
 #[ignore = "currently fails during codegen: duplicate definition for core::alloc::layout::precondition_check"]
 fn std_jit_box_new_i32_smoke() {
     let result: i32 = jit_run_with_std(
