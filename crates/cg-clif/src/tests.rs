@@ -2066,8 +2066,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             );
             let exported_in_libstd =
                 is_cross_crate && libstd_exports_symbol(libstd_handle, &fn_name);
-            let should_compile_cross_crate =
-                is_generic_instance || !exported_in_libstd;
+            let should_compile_cross_crate = is_generic_instance || !exported_in_libstd;
 
             if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
                 eprintln!(
@@ -2082,7 +2081,11 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             if is_cross_crate && !should_compile_cross_crate {
                 continue;
             }
-            let body = match db.monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone()) {
+            let body = match db.monomorphized_mir_body(
+                (*func_id).into(),
+                generic_args.clone(),
+                env.clone(),
+            ) {
                 Ok(body) => body,
                 Err(e) if is_cross_crate => {
                     if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
@@ -2207,7 +2210,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails during codegen: const_to_i64 unsupported UnevaluatedConst in Vec::new path"]
+#[ignore = "currently fails during codegen cast: load_scalar on ByValPair"]
 fn std_jit_vec_new_smoke() {
     let result: i32 = jit_run_with_std(
         r#"

@@ -19,7 +19,10 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use either::Either;
 use hir_def::signatures::FunctionSignature;
-use hir_def::{AssocItemId, CallableDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId};
+use hir_def::{
+    AssocItemId, CallableDefId, GeneralConstId, HasModule, ItemContainerId, Lookup, TraitId,
+    VariantId,
+};
 use hir_ty::PointerCast;
 use hir_ty::db::HirDatabase;
 use hir_ty::method_resolution::TraitImpls;
@@ -29,6 +32,7 @@ use hir_ty::mir::{
 };
 use hir_ty::next_solver::{
     Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
+    ValueConst,
 };
 use hir_ty::traits::StoredParamEnvAndCrate;
 use rac_abi::VariantIdx;
@@ -78,6 +82,16 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
         32 => types::I32,
         64 => types::I64,
         _ => unreachable!(),
+    }
+}
+
+fn iconst_from_bits(bcx: &mut FunctionBuilder<'_>, ty: Type, bits: u128) -> Value {
+    if ty == types::I128 {
+        let lsb = bcx.ins().iconst(types::I64, bits as u64 as i64);
+        let msb = bcx.ins().iconst(types::I64, (bits >> 64) as u64 as i64);
+        bcx.ins().iconcat(lsb, msb)
+    } else {
+        bcx.ins().iconst(ty, bits as u64 as i64)
     }
 }
 
@@ -247,32 +261,45 @@ impl<'a, M: Module> FunctionCx<'a, M> {
 // Constant extraction
 // ---------------------------------------------------------------------------
 
-fn const_to_i64(konst: Const<'_>, size: Size) -> i64 {
-    match konst.kind() {
-        ConstKind::Value(val) => {
-            let bytes = &val.value.inner().memory;
-            let n = size.bytes() as usize;
-            let mut buf = [0u8; 8];
-            let len = n.min(8);
-            buf[..len].copy_from_slice(&bytes[..len]);
-            i64::from_le_bytes(buf)
+fn resolve_const_value<'db>(db: &'db dyn HirDatabase, mut konst: Const<'db>) -> ValueConst<'db> {
+    loop {
+        match konst.kind() {
+            ConstKind::Value(val) => return val,
+            ConstKind::Unevaluated(uv) => {
+                let evaluated = match uv.def.0 {
+                    GeneralConstId::ConstId(id) => db.const_eval(id, uv.args, None),
+                    GeneralConstId::StaticId(id) => db.const_eval_static(id),
+                }
+                .unwrap_or_else(|e| panic!("failed to evaluate const {:?}: {e:?}", konst));
+
+                if evaluated == konst {
+                    panic!("const eval made no progress for unevaluated const: {:?}", konst);
+                }
+
+                konst = evaluated;
+            }
+            _ => panic!("resolve_const_value: unsupported const kind: {:?}", konst),
         }
-        _ => panic!("const_to_i64: unsupported const kind: {:?}", konst),
     }
 }
 
+fn const_to_u128<'db>(db: &'db dyn HirDatabase, konst: Const<'db>, size: Size) -> u128 {
+    let val = resolve_const_value(db, konst);
+    let bytes = &val.value.inner().memory;
+    let mut buf = [0u8; 16];
+    let len = (size.bytes() as usize).min(16);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u128::from_le_bytes(buf)
+}
+
 /// Extract a `u64` from a constant. Used for array lengths and repeat counts.
-fn const_to_u64(konst: Const<'_>) -> u64 {
-    match konst.kind() {
-        ConstKind::Value(val) => {
-            let bytes = &val.value.inner().memory;
-            let mut buf = [0u8; 8];
-            let len = bytes.len().min(8);
-            buf[..len].copy_from_slice(&bytes[..len]);
-            u64::from_le_bytes(buf)
-        }
-        _ => panic!("const_to_u64: unsupported const kind: {:?}", konst),
-    }
+fn const_to_u64<'db>(db: &'db dyn HirDatabase, konst: Const<'db>) -> u64 {
+    let val = resolve_const_value(db, konst);
+    let bytes = &val.value.inner().memory;
+    let mut buf = [0u8; 8];
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u64::from_le_bytes(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,7 +1110,7 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &
         }
         Rvalue::Repeat(operand, count) => {
             let elem_val = codegen_operand(fx, &operand.kind);
-            let count_val = const_to_u64(count.as_ref());
+            let count_val = const_to_u64(fx.db(), count.as_ref());
             let elem_layout = elem_val.layout.clone();
             for i in 0..count_val {
                 let field_place = dest.place_field(fx, i as usize, elem_layout.clone());
@@ -1116,7 +1143,7 @@ fn codegen_rvalue(
             let place_ty = place_ty(fx.db(), body, place);
             match place_ty.as_ref().kind() {
                 TyKind::Array(_, len) => {
-                    let len_val = const_to_u64(len) as i64;
+                    let len_val = const_to_u64(fx.db(), len) as i64;
                     CValue::by_val(
                         fx.bcx.ins().iconst(fx.pointer_type, len_val),
                         result_layout.clone(),
@@ -1309,7 +1336,7 @@ pub(crate) fn codegen_get_discriminant(
         Variants::Single { index } => {
             // TODO: Use db.const_eval_discriminant() for explicit discriminant values
             let discr_val = index.as_u32();
-            fx.bcx.ins().iconst(dest_clif_ty, i64::from(discr_val))
+            iconst_from_bits(&mut fx.bcx, dest_clif_ty, discr_val.into())
         }
         Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
             use rustc_abi::TagEncoding;
@@ -1360,14 +1387,16 @@ pub(crate) fn codegen_get_discriminant(
                         // Single niche variant: just compare tag == niche_start
                         let is_niche =
                             codegen_icmp_imm(fx, IntCC::Equal, tag_val, *niche_start as i128);
-                        let tagged_discr = fx
-                            .bcx
-                            .ins()
-                            .iconst(dest_clif_ty, niche_variants.start().as_u32() as i64);
+                        let tagged_discr = iconst_from_bits(
+                            &mut fx.bcx,
+                            dest_clif_ty,
+                            niche_variants.start().as_u32().into(),
+                        );
                         (is_niche, tagged_discr, 0)
                     } else {
                         // General case: compute relative_tag, check range
-                        let niche_start_val = fx.bcx.ins().iconst(tag_clif_ty, *niche_start as i64);
+                        let niche_start_val =
+                            iconst_from_bits(&mut fx.bcx, tag_clif_ty, *niche_start);
                         let relative_discr = fx.bcx.ins().isub(tag_val, niche_start_val);
                         let cast_tag = codegen_intcast(fx, relative_discr, dest_clif_ty, false);
                         let is_niche = codegen_icmp_imm(
@@ -1382,19 +1411,22 @@ pub(crate) fn codegen_get_discriminant(
                     let tagged_discr = if delta == 0 {
                         tagged_discr
                     } else {
-                        let delta_val = fx.bcx.ins().iconst(dest_clif_ty, delta as i64);
+                        let delta_val = iconst_from_bits(&mut fx.bcx, dest_clif_ty, delta);
                         fx.bcx.ins().iadd(tagged_discr, delta_val)
                     };
 
-                    let untagged_variant_val =
-                        fx.bcx.ins().iconst(dest_clif_ty, i64::from(untagged_variant.as_u32()));
+                    let untagged_variant_val = iconst_from_bits(
+                        &mut fx.bcx,
+                        dest_clif_ty,
+                        untagged_variant.as_u32().into(),
+                    );
                     fx.bcx.ins().select(is_niche, tagged_discr, untagged_variant_val)
                 }
             }
         }
         Variants::Empty => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
-            fx.bcx.ins().iconst(dest_clif_ty, 0)
+            iconst_from_bits(&mut fx.bcx, dest_clif_ty, 0)
         }
     }
 }
@@ -1420,7 +1452,7 @@ pub(crate) fn codegen_set_discriminant(
                     let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
                     // TODO: Use db.const_eval_discriminant() for explicit discriminant values
                     let discr_val = variant_index.as_u32();
-                    let to = fx.bcx.ins().iconst(tag_clif_ty, i64::from(discr_val));
+                    let to = iconst_from_bits(&mut fx.bcx, tag_clif_ty, discr_val.into());
                     ptr.write_cvalue(fx, CValue::by_val(to, ptr.layout.clone()));
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
@@ -1429,7 +1461,7 @@ pub(crate) fn codegen_set_discriminant(
                         let niche_type = scalar_to_clif_type(fx.dl, tag);
                         let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
                         let niche_value = (niche_value as u128).wrapping_add(*niche_start);
-                        let niche_value = fx.bcx.ins().iconst(niche_type, niche_value as i64);
+                        let niche_value = iconst_from_bits(&mut fx.bcx, niche_type, niche_value);
                         niche.write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
                     }
                 }
@@ -1733,49 +1765,50 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
             }
             match layout.backend_repr {
                 BackendRepr::Scalar(scalar) => {
-                    let raw = const_to_i64(konst.as_ref(), scalar.size(fx.dl));
+                    let raw_bits = const_to_u128(fx.db(), konst.as_ref(), scalar.size(fx.dl));
                     let val = match scalar.primitive() {
                         Primitive::Float(rustc_abi::Float::F32) => {
-                            fx.bcx.ins().f32const(f32::from_bits(raw as u32))
+                            fx.bcx.ins().f32const(f32::from_bits(raw_bits as u32))
                         }
                         Primitive::Float(rustc_abi::Float::F64) => {
-                            fx.bcx.ins().f64const(f64::from_bits(raw as u64))
+                            fx.bcx.ins().f64const(f64::from_bits(raw_bits as u64))
                         }
                         Primitive::Float(_) => todo!("f16/f128 constants"),
                         _ => {
                             let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
-                            fx.bcx.ins().iconst(clif_ty, raw)
+                            iconst_from_bits(&mut fx.bcx, clif_ty, raw_bits)
                         }
                     };
                     CValue::by_val(val, layout)
                 }
                 BackendRepr::ScalarPair(a_scalar, b_scalar) => {
-                    let ConstKind::Value(val) = konst.as_ref().kind() else {
-                        panic!("non-value const in ScalarPair constant");
+                    let (const_memory, const_memory_map) = {
+                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        let const_bytes = val.value.inner();
+                        (const_bytes.memory.clone(), const_bytes.memory_map.clone())
                     };
-                    let const_bytes = val.value.inner();
-                    let bytes = &const_bytes.memory;
+                    let bytes = &const_memory;
                     let a_size = a_scalar.size(fx.dl).bytes() as usize;
                     let b_offset =
                         a_scalar.size(fx.dl).align_to(b_scalar.align(fx.dl).abi).bytes() as usize;
                     let b_size = b_scalar.size(fx.dl).bytes() as usize;
 
                     let a_raw = {
-                        let mut buf = [0u8; 8];
-                        let len = a_size.min(8);
+                        let mut buf = [0u8; 16];
+                        let len = a_size.min(16);
                         buf[..len].copy_from_slice(&bytes[..len]);
-                        i64::from_le_bytes(buf)
+                        u128::from_le_bytes(buf)
                     };
                     let b_raw = {
-                        let mut buf = [0u8; 8];
-                        let len = b_size.min(8);
+                        let mut buf = [0u8; 16];
+                        let len = b_size.min(16);
                         buf[..len].copy_from_slice(&bytes[b_offset..b_offset + len]);
-                        i64::from_le_bytes(buf)
+                        u128::from_le_bytes(buf)
                     };
 
                     // Create data sections for allocations in the memory_map,
                     // building a mapping of old addresses → GlobalValues.
-                    let addr_to_gv = create_const_data_sections(fx, &const_bytes.memory_map);
+                    let addr_to_gv = create_const_data_sections(fx, &const_memory_map);
 
                     let a_val = codegen_scalar_const(fx, &a_scalar, a_raw, &addr_to_gv);
                     let b_val = codegen_scalar_const(fx, &b_scalar, b_raw, &addr_to_gv);
@@ -1783,12 +1816,12 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                 }
                 _ => {
                     // Memory-repr constant: store raw bytes in a data section
-                    let ConstKind::Value(val) = konst.as_ref().kind() else {
-                        panic!("non-value const in memory-repr constant");
+                    let const_memory = {
+                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        val.value.inner().memory.clone()
                     };
-                    let bytes = &val.value.inner().memory;
                     let mut data_desc = DataDescription::new();
-                    data_desc.define(bytes.to_vec().into_boxed_slice());
+                    data_desc.define(const_memory.clone());
                     data_desc.set_align(layout.align.abi.bytes());
                     let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
                     fx.module.define_data(data_id, &data_desc).unwrap();
@@ -1849,7 +1882,7 @@ fn create_const_data_sections(
 fn codegen_scalar_const(
     fx: &mut FunctionCx<'_, impl Module>,
     scalar: &Scalar,
-    raw: i64,
+    raw: u128,
     addr_to_gv: &HashMap<usize, cranelift_codegen::ir::GlobalValue>,
 ) -> Value {
     match scalar.primitive() {
@@ -1858,10 +1891,10 @@ fn codegen_scalar_const(
             if let Some(&gv) = addr_to_gv.get(&addr) {
                 fx.bcx.ins().symbol_value(fx.pointer_type, gv)
             } else if addr == 0 {
-                fx.bcx.ins().iconst(fx.pointer_type, 0)
+                iconst_from_bits(&mut fx.bcx, fx.pointer_type, 0)
             } else {
                 // Unknown address — treat as raw integer (shouldn't normally happen)
-                fx.bcx.ins().iconst(fx.pointer_type, raw)
+                iconst_from_bits(&mut fx.bcx, fx.pointer_type, raw)
             }
         }
         Primitive::Float(rustc_abi::Float::F32) => {
@@ -1872,7 +1905,7 @@ fn codegen_scalar_const(
         }
         _ => {
             let clif_ty = scalar_to_clif_type(fx.dl, scalar);
-            fx.bcx.ins().iconst(clif_ty, raw)
+            iconst_from_bits(&mut fx.bcx, clif_ty, raw)
         }
     }
 }
