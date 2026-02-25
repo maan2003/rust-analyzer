@@ -2503,8 +2503,10 @@ fn codegen_direct_call(
         return;
     }
 
-    // Check for virtual dispatch: trait method called on dyn Trait
-    if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db()).container {
+    let (callee_func_id, generic_args) = if let ItemContainerId::TraitId(trait_id) =
+        callee_func_id.loc(fx.db()).container
+    {
+        // Check for virtual dispatch: trait method called on dyn Trait
         let interner = DbInterner::new_no_crate(fx.db());
         if hir_ty::method_resolution::is_dyn_method(
             interner,
@@ -2534,7 +2536,17 @@ fn codegen_direct_call(
                 return;
             }
         }
-    }
+
+        // Static trait dispatch: resolve to concrete impl method when possible.
+        hir_ty::method_resolution::lookup_impl_method(
+            fx.db(),
+            fx.env().as_ref(),
+            callee_func_id,
+            generic_args,
+        )
+    } else {
+        (callee_func_id, generic_args)
+    };
 
     // Check if this is an extern function (no MIR available)
     let is_extern =
@@ -3919,9 +3931,11 @@ where
             continue;
         }
 
-        // Skip abstract trait method definitions (they have no MIR body;
-        // only their impl methods are compiled)
-        if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
+        // Skip trait methods with no MIR (abstract methods). Keep default
+        // trait methods that do have MIR bodies.
+        if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_))
+            && db.monomorphized_mir_body(func_id.into(), generic_args.clone(), env.clone()).is_err()
+        {
             continue;
         }
 
@@ -3983,7 +3997,10 @@ where
             if FunctionSignature::is_intrinsic(db, func_id) {
                 continue;
             }
-            if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_)) {
+            if matches!(func_id.loc(db).container, ItemContainerId::TraitId(_))
+                && db.monomorphized_mir_body(func_id.into(), generic_args.clone(), env.clone())
+                    .is_err()
+            {
                 continue;
             }
             result.push((func_id, generic_args.clone()));
@@ -4165,6 +4182,9 @@ fn scan_body_for_callees(
                 let OperandKind::Constant { ty, .. } = &func.kind else { continue };
                 let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
                 if let CallableDefId::FunctionId(callee_id) = def.0 {
+                    let mut resolved_id = callee_id;
+                    let mut resolved_args = callee_args;
+
                     // Skip virtual calls — trait methods on dyn types are dispatched
                     // through vtables, not compiled as standalone functions.
                     if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
@@ -4191,8 +4211,15 @@ fn scan_body_for_callees(
                                 continue;
                             }
                         }
+
+                        (resolved_id, resolved_args) = hir_ty::method_resolution::lookup_impl_method(
+                            db,
+                            env.as_ref(),
+                            callee_id,
+                            callee_args,
+                        );
                     }
-                    queue.push_back((callee_id, callee_args.store()));
+                    queue.push_back((resolved_id, resolved_args.store()));
                 }
             }
             TerminatorKind::Drop { place, .. } => {

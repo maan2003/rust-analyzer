@@ -464,6 +464,23 @@ pub(crate) fn lookup_impl_method_query<'db>(
     )
 }
 
+/// Looks up the concrete impl method for a trait method call.
+///
+/// Returns the original `(func, fn_subst)` if `func` is not a trait method or
+/// if resolution fails. Builtin-derive pseudo methods are not representable as
+/// a `FunctionId`, so those also fall back to the original method.
+pub fn lookup_impl_method<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    func: FunctionId,
+    fn_subst: GenericArgs<'db>,
+) -> (FunctionId, GenericArgs<'db>) {
+    match lookup_impl_method_query(db, env, func, fn_subst) {
+        (Either::Left(impl_func), impl_subst) => (impl_func, impl_subst),
+        (Either::Right(_), _) => (func, fn_subst),
+    }
+}
+
 fn lookup_impl_assoc_item_for_trait_ref<'db>(
     infcx: &InferCtxt<'db>,
     trait_ref: TraitRef<'db>,

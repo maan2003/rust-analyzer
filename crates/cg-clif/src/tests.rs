@@ -2344,6 +2344,23 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "investigation: vec smoke with mem::forget"]
+fn std_jit_vec_new_forget_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let v: Vec<i32> = Vec::new();
+    let ok = (v.len() == 0) as i32;
+    std::mem::forget(v);
+    ok
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails during codegen: non-value const in ScalarPair constant"]
 fn std_jit_env_var_roundtrip() {
     let result: i32 = jit_run_with_std(
