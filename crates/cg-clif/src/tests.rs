@@ -2159,6 +2159,25 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails during codegen with local layout error: HasErrorType"]
+fn std_jit_env_var_roundtrip() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let key = "CG_CLIF_STD_JIT_ENV_VAR";
+    unsafe { std::env::set_var(key, "hello") };
+    match std::env::var(key) {
+        Ok(value) => (value == "hello") as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently flaky in JIT: repeated std::process::id() calls can diverge"]
 fn std_jit_process_id_is_stable_across_calls() {
     let result: i32 = jit_run_with_std(

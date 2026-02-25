@@ -26,6 +26,8 @@ What is in place:
 - Additional probe test present but ignored:
   - `std_jit_process_id_is_stable_across_calls`
   - currently `#[ignore]` due to observed JIT flakiness where repeated calls can diverge.
+  - `std_jit_env_var_roundtrip`
+  - currently `#[ignore]` due to `local layout error: HasErrorType` while compiling `std::env::var` flow.
 
 Validation recently run:
 
@@ -37,6 +39,7 @@ Validation recently run:
 - Coverage is still narrow: only a small `std` smoke path is live.
 - We do not yet have a broader stable suite of std-JIT end-to-end tests (collections, env/thread/time, etc.).
 - The ignored repeated-call process-id test indicates a correctness/ABI/call-lowering issue that should be diagnosed.
+- `std::env::var` path is still blocked by `HasErrorType` in local layout computation.
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Good Next Steps
