@@ -9,7 +9,7 @@ What is in place:
 
 - `jit_run_with_std` is restored with the new architecture (no mirdata body translation).
 - Real sysroot sources (`core`, `alloc`, `std`) are loaded into a `TestDB` for r-a MIR/type queries.
-- Reachable local code is compiled using the normal pipeline:
+- Reachable local code and cross-crate generic instantiations are compiled using the normal pipeline:
   - `collect_reachable_fns`
   - `compile_fn`
   - `compile_drop_in_place`
@@ -22,6 +22,7 @@ What is in place:
 
 - Passing smoke test:
   - `std_jit_process_id_nonzero`
+  - `std_jit_generic_identity_i32`
 - Additional probe test present but ignored:
   - `std_jit_process_id_is_stable_across_calls`
   - currently `#[ignore]` due to observed JIT flakiness where repeated calls can diverge.

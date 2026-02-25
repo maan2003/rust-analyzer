@@ -2009,7 +2009,7 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 /// JIT harness for std calls in the mirdataless architecture.
 ///
 /// - Real sysroot sources are loaded into the test DB for type/MIR queries.
-/// - Local reachable functions are compiled via `collect_reachable_fns` + `compile_fn`.
+/// - Local reachable functions and cross-crate generic instantiations are compiled.
 /// - Cross-crate monomorphic calls are left as imports and resolved from libstd/libc
 ///   through symbol mangling + disambiguators (`RA_MIRDATA` metadata only).
 fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
@@ -2041,9 +2041,15 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         let dl = get_target_data_layout(&db, entry_func_id);
 
         for (func_id, generic_args) in &reachable_fns {
-            if func_id.krate(&db) != local_crate {
+            let is_cross_crate = func_id.krate(&db) != local_crate;
+            let is_generic_instance = !generic_args.as_ref().is_empty();
+
+            // For external calls, keep monomorphic functions as dylib imports
+            // and only compile generic instantiations from MIR.
+            if is_cross_crate && !is_generic_instance {
                 continue;
             }
+
             let fn_name = crate::symbol_mangling::mangle_function(
                 &db,
                 *func_id,
@@ -2052,7 +2058,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             );
             let body = db
                 .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("MIR error for local fn {fn_name}: {:?}", e));
+                .unwrap_or_else(|e| panic!("MIR error for compiled fn {fn_name}: {:?}", e));
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2065,7 +2071,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 local_crate,
                 &disambiguators,
             )
-            .unwrap_or_else(|e| panic!("compiling local fn {fn_name} failed: {e}"));
+            .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"));
         }
 
         for (closure_id, closure_subst) in &reachable_closures {
@@ -2137,6 +2143,19 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_generic_identity_i32() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    core::convert::identity(42)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
 }
 
 #[test]
