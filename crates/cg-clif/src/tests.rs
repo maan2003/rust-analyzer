@@ -2224,6 +2224,46 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_option_match_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let some = Some(5_i32);
+    let none: Option<i32> = None;
+
+    let a = match some {
+        Some(v) => v,
+        None => 0,
+    };
+    let b = match none {
+        Some(v) => v,
+        None => 7,
+    };
+
+    a + b
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 12);
+}
+
+#[test]
+#[ignore = "currently fails during codegen: duplicate definition for core::alloc::layout::precondition_check"]
+fn std_jit_box_new_i32_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let boxed = Box::new(123_i32);
+    (*boxed == 123) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails during codegen cast: load_scalar on ByValPair"]
 fn std_jit_vec_new_smoke() {
     let result: i32 = jit_run_with_std(
