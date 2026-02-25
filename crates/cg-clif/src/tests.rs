@@ -1851,9 +1851,11 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 
     let cfg = rustc_cfg_options();
 
-    let mut load_sysroot_crate =
-        |crate_name: &str, sub_path: &str, origin: LangCrateOrigin| -> base_db::CrateBuilderId {
-            let crate_dir = sysroot_src.join(sub_path);
+    let mut load_source_crate =
+        |crate_name: &str,
+         crate_dir: &std::path::Path,
+         origin: CrateOrigin|
+         -> base_db::CrateBuilderId {
             let src_dir = crate_dir.join("src");
             let lib_rs = src_dir.join("lib.rs");
             assert!(lib_rs.exists(), "{} not found", lib_rs.display());
@@ -1907,7 +1909,7 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
                 cfg.clone(),
                 Some(cfg.clone()),
                 Env::default(),
-                CrateOrigin::Lang(origin),
+                origin,
                 Vec::new(),
                 false,
                 proc_macro_cwd.clone(),
@@ -1915,9 +1917,21 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
             )
         };
 
-    let core_id = load_sysroot_crate("core", "core", LangCrateOrigin::Core);
-    let alloc_id = load_sysroot_crate("alloc", "alloc", LangCrateOrigin::Alloc);
-    let std_id = load_sysroot_crate("std", "std", LangCrateOrigin::Std);
+    let core_id = load_source_crate(
+        "core",
+        &sysroot_src.join("core"),
+        CrateOrigin::Lang(LangCrateOrigin::Core),
+    );
+    let alloc_id = load_source_crate(
+        "alloc",
+        &sysroot_src.join("alloc"),
+        CrateOrigin::Lang(LangCrateOrigin::Alloc),
+    );
+    let std_id = load_source_crate(
+        "std",
+        &sysroot_src.join("std"),
+        CrateOrigin::Lang(LangCrateOrigin::Std),
+    );
 
     crate_graph
         .add_dep(
@@ -2051,7 +2065,35 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         .store();
 
         let (reachable_fns, reachable_closures, drop_types) =
-            crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
+            crate::collect_reachable_fns_with_body_filter(
+                &db,
+                &env,
+                entry_func_id,
+                local_crate,
+                |func_id, generic_args| {
+                    let is_cross_crate = func_id.krate(&db) != local_crate;
+                    if !is_cross_crate {
+                        return true;
+                    }
+
+                    let is_generic_instance = !generic_args.as_ref().is_empty();
+                    if is_generic_instance {
+                        return true;
+                    }
+
+                    let fn_name = crate::symbol_mangling::mangle_function(
+                        &db,
+                        func_id,
+                        generic_args.as_ref(),
+                        &disambiguators,
+                    );
+
+                    // If the symbol is exported from libstd, keep it imported and
+                    // avoid traversing its MIR body to prevent pulling in private
+                    // std internals that aren't needed for JIT compilation.
+                    !libstd_exports_symbol(libstd_handle, &fn_name)
+                },
+            );
 
         let dl = get_target_data_layout(&db, entry_func_id);
 
@@ -2082,18 +2124,15 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             if is_cross_crate && !should_compile_cross_crate {
                 continue;
             }
-            let body = match db.monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone()) {
-                Ok(body) => body,
-                Err(e) if is_cross_crate => {
-                    if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
-                        eprintln!(
-                            "std-jit: fn={fn_name} fallback=import reason=mir_error error={e:?}"
-                        );
-                    }
-                    continue;
-                }
-                Err(e) => panic!("MIR error for compiled fn {fn_name}: {:?}", e),
-            };
+            let body = db
+                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "MIR error for required compiled fn {fn_name} \
+                         (cross_crate={is_cross_crate}, generic={is_generic_instance}, \
+                         exported_in_libstd={exported_in_libstd}): {e:?}"
+                    )
+                });
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,

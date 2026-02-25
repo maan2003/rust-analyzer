@@ -3770,6 +3770,28 @@ fn collect_reachable_fns(
     Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     Vec<StoredTy>,
 ) {
+    collect_reachable_fns_with_body_filter(db, env, root, local_crate, |_func_id, _generic_args| {
+        true
+    })
+}
+
+/// Same as `collect_reachable_fns`, but allows callers to skip MIR body
+/// traversal for selected function instances while still retaining them in
+/// the reachable function result list.
+fn collect_reachable_fns_with_body_filter<F>(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    root: hir_def::FunctionId,
+    local_crate: base_db::Crate,
+    mut should_scan_body: F,
+) -> (
+    Vec<(hir_def::FunctionId, StoredGenericArgs)>,
+    Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    Vec<StoredTy>,
+)
+where
+    F: FnMut(hir_def::FunctionId, &StoredGenericArgs) -> bool,
+{
     use std::collections::{HashSet, VecDeque};
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
@@ -3808,6 +3830,10 @@ fn collect_reachable_fns(
         }
 
         result.push((func_id, generic_args.clone()));
+
+        if !should_scan_body(func_id, &generic_args) {
+            continue;
+        }
 
         // Get monomorphized MIR and scan for direct callees
         let Ok(body) = db.monomorphized_mir_body(func_id.into(), generic_args, env.clone()) else {
@@ -3865,6 +3891,9 @@ fn collect_reachable_fns(
                 continue;
             }
             result.push((func_id, generic_args.clone()));
+            if !should_scan_body(func_id, &generic_args) {
+                continue;
+            }
             let Ok(body) = db.monomorphized_mir_body(func_id.into(), generic_args, env.clone())
             else {
                 continue;
