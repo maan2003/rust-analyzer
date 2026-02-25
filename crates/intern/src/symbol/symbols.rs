@@ -375,6 +375,7 @@ define_symbols! {
     panic_nounwind,
     panic_null_pointer_dereference,
     panic,
+    pattern_type,
     Param,
     parse,
     partial_ord,

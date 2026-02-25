@@ -2159,7 +2159,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails during codegen with local layout error: HasErrorType"]
+#[ignore = "currently fails during codegen: non-value const in ScalarPair constant"]
 fn std_jit_env_var_roundtrip() {
     let result: i32 = jit_run_with_std(
         r#"
