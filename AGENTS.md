@@ -12,6 +12,8 @@ rustc/ is the rust tree, but not a subtree. it is read only.
 
 cargo .. -p .. is slow, avoid it.
 
+Use `jj commit -m "<short commit message>"` to create commits.
+
 AVOID HACKS, just say it to the user
 
 You are in a "vibe coding" setting, user doesn't review the code, so you have to be very clear when
