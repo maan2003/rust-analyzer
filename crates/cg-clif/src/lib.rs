@@ -1594,6 +1594,17 @@ fn codegen_binop(
             panic!("overflow binop on non-integer type");
         };
         let (res, has_overflow) = codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
+        let BackendRepr::ScalarPair(_, overflow_scalar) = result_layout.backend_repr else {
+            panic!("overflow binop must return ScalarPair");
+        };
+        let overflow_ty = scalar_to_clif_type(fx.dl, &overflow_scalar);
+        let has_overflow = if fx.bcx.func.dfg.value_type(has_overflow) == overflow_ty {
+            has_overflow
+        } else {
+            let one = fx.bcx.ins().iconst(overflow_ty, 1);
+            let zero = fx.bcx.ins().iconst(overflow_ty, 0);
+            fx.bcx.ins().select(has_overflow, one, zero)
+        };
         return CValue::by_val_pair(res, has_overflow, result_layout.clone());
     }
 
@@ -2536,6 +2547,48 @@ fn codegen_direct_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
+    // `core::ptr::drop_in_place` is a lang-item shim with intentionally
+    // recursive source; rustc replaces it with drop glue. Mirror that here
+    // by lowering to our generated `drop_in_place::<T>` glue directly.
+    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
+    if Some(callee_func_id) == lang_items.DropInPlace {
+        assert_eq!(args.len(), 1, "drop_in_place expects 1 argument");
+        assert!(generic_args.len() > 0, "drop_in_place requires pointee generic arg");
+
+        let pointee_ty = generic_args.type_at(0).store();
+        let interner = DbInterner::new_with(fx.db(), fx.local_crate());
+        if hir_ty::drop::has_drop_glue_mono(interner, pointee_ty.as_ref()) {
+            let arg = codegen_operand(fx, &args[0].kind);
+            let ptr = match arg.layout.backend_repr {
+                BackendRepr::Scalar(_) => arg.load_scalar(fx),
+                BackendRepr::ScalarPair(_, _) => {
+                    panic!("drop_in_place for unsized type with drop glue is not supported yet")
+                }
+                _ => panic!("drop_in_place argument must be a pointer"),
+            };
+
+            let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+            drop_sig.params.push(AbiParam::new(fx.pointer_type));
+            let fn_name = symbol_mangling::mangle_drop_in_place(
+                fx.db(),
+                pointee_ty.as_ref(),
+                fx.ext_crate_disambiguators(),
+            );
+            let callee_id = fx
+                .module
+                .declare_function(&fn_name, Linkage::Import, &drop_sig)
+                .expect("declare drop_in_place glue");
+            let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+            fx.bcx.ins().call(callee_ref, &[ptr]);
+        }
+
+        if let Some(target) = target {
+            let block = fx.clif_block(*target);
+            fx.bcx.ins().jump(block, &[]);
+        }
+        return;
+    }
+
     if codegen_intrinsic_call(fx, callee_func_id, generic_args, args, destination, target) {
         return;
     }
@@ -3354,6 +3407,44 @@ fn codegen_intrinsic_call(
             let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().imul(a, b))
+        }
+        "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+
+            let lhs = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let rhs = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let signed = ty_is_signed_int(operand_ty(fx.db(), body, &args[0].kind));
+
+            let op = match name {
+                "add_with_overflow" => BinOp::AddWithOverflow,
+                "sub_with_overflow" => BinOp::SubWithOverflow,
+                "mul_with_overflow" => BinOp::MulWithOverflow,
+                _ => unreachable!(),
+            };
+
+            let (result, has_overflow) = codegen_checked_int_binop(fx, &op, lhs, rhs, signed);
+            let dest = codegen_place(fx, destination);
+            let BackendRepr::ScalarPair(_, overflow_scalar) = dest.layout.backend_repr else {
+                panic!("{name} intrinsic must return ScalarPair");
+            };
+            let overflow_ty = scalar_to_clif_type(fx.dl, &overflow_scalar);
+            let has_overflow = if fx.bcx.func.dfg.value_type(has_overflow) == overflow_ty {
+                has_overflow
+            } else {
+                let one = fx.bcx.ins().iconst(overflow_ty, 1);
+                let zero = fx.bcx.ins().iconst(overflow_ty, 0);
+                fx.bcx.ins().select(has_overflow, one, zero)
+            };
+
+            dest.write_cvalue(
+                fx,
+                CValue::by_val_pair(result, has_overflow, dest.layout.clone()),
+            );
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
         }
         "unchecked_shl" => {
             assert_eq!(args.len(), 2);

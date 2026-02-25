@@ -2149,7 +2149,9 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             );
 
         let dl = get_target_data_layout(&db, entry_func_id);
+        let trace_enabled = std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some();
         let mut compiled_fn_symbols = std::collections::HashSet::new();
+        let mut finalized_symbol_ids: Vec<(String, cranelift_module::FuncId)> = Vec::new();
 
         for (func_id, generic_args) in &reachable_fns {
             let is_cross_crate = func_id.krate(&db) != local_crate;
@@ -2164,7 +2166,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 is_cross_crate && libstd_exports_symbol(libstd_handle, &fn_name);
             let should_compile_cross_crate = is_generic_instance || !exported_in_libstd;
 
-            if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+            if trace_enabled {
                 eprintln!(
                     "std-jit: fn={fn_name} cross_crate={is_cross_crate} generic={is_generic_instance} exported_in_libstd={exported_in_libstd} compile={}",
                     !is_cross_crate || should_compile_cross_crate
@@ -2181,7 +2183,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             // Reachability can surface distinct fn instances that mangle to the same
             // exported symbol. Avoid duplicate `define_function` attempts in one module.
             if !compiled_fn_symbols.insert(fn_name.clone()) {
-                if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
+                if trace_enabled {
                     eprintln!("std-jit: skipping duplicate symbol definition for {fn_name}");
                 }
                 continue;
@@ -2196,7 +2198,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                          exported_in_libstd={exported_in_libstd}): {e:?}"
                     )
                 });
-            crate::compile_fn(
+            let compiled_id = crate::compile_fn(
                 &mut jit_module,
                 &*isa,
                 &db,
@@ -2209,6 +2211,9 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &disambiguators,
             )
             .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"));
+            if trace_enabled {
+                finalized_symbol_ids.push((fn_name, compiled_id));
+            }
         }
 
         for (closure_id, closure_subst) in &reachable_closures {
@@ -2217,7 +2222,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name =
                 crate::symbol_mangling::mangle_closure(&db, *closure_id, &disambiguators);
-            crate::compile_fn(
+            let closure_id = crate::compile_fn(
                 &mut jit_module,
                 &*isa,
                 &db,
@@ -2230,10 +2235,13 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &disambiguators,
             )
             .unwrap_or_else(|e| panic!("compiling closure failed: {e}"));
+            if trace_enabled {
+                finalized_symbol_ids.push((closure_name, closure_id));
+            }
         }
 
         for ty in &drop_types {
-            crate::compile_drop_in_place(
+            let drop_id = crate::compile_drop_in_place(
                 &mut jit_module,
                 &*isa,
                 &db,
@@ -2244,9 +2252,24 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &disambiguators,
             )
             .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
+            if trace_enabled {
+                let drop_name = crate::symbol_mangling::mangle_drop_in_place(
+                    &db,
+                    ty.as_ref(),
+                    &disambiguators,
+                );
+                finalized_symbol_ids.push((drop_name, drop_id));
+            }
         }
 
         jit_module.finalize_definitions().unwrap();
+
+        if trace_enabled {
+            for (name, id) in &finalized_symbol_ids {
+                let addr = jit_module.get_finalized_function(*id) as usize;
+                eprintln!("std-jit: addr=0x{addr:x} fn={name}");
+            }
+        }
 
         let (entry_body, entry_env) = get_mir_and_env(&db, entry_func_id);
         let entry_sig = crate::build_fn_sig(&*isa, &db, &dl, &entry_env, &entry_body).expect("sig");
@@ -2388,7 +2411,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails during codegen cast: load_scalar on ByValPair"]
 fn std_jit_vec_new_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
