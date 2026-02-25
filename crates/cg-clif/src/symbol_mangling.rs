@@ -238,14 +238,32 @@ impl<'a> SymbolMangler<'a> {
                 self.print_crate(module.krate(self.db));
             }
             Some(parent) => {
-                let name = module.name(self.db).map(|n| n.as_str().to_owned()).unwrap_or_default();
+                let (name, disambiguator) = match module.name(self.db) {
+                    Some(name) => (name.as_str().to_owned(), 0),
+                    None => (String::new(), self.anon_module_disambiguator(module)),
+                };
                 self.out.push('N');
                 self.out.push('t'); // TypeNs
                 self.print_module_path(parent);
-                self.push_disambiguator(0);
+                self.push_disambiguator(disambiguator);
                 self.push_ident(&name);
             }
         }
+    }
+
+    /// Anonymous/block modules need a disambiguator; otherwise all local-item
+    /// scopes collapse to the same mangled path (`...0`), causing collisions.
+    fn anon_module_disambiguator(&self, module: hir_def::ModuleId) -> u64 {
+        debug_assert!(module.name(self.db).is_none());
+
+        // FNV-1a over the module debug identity keeps this deterministic per
+        // database while avoiding dependence on HashMap's randomized hasher.
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in format!("{module:?}").bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash.max(1)
     }
 
     fn print_container_path(&mut self, container: ItemContainerId) {
