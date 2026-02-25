@@ -1042,18 +1042,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 );
                 Ok(Some(current))
             }
-            &Expr::Const(_) => {
-                // let subst = self.placeholder_subst();
-                // self.lower_const(
-                //     id.into(),
-                //     current,
-                //     place,
-                //     subst,
-                //     expr_id.into(),
-                //     self.expr_ty_without_adjust(expr_id),
-                // )?;
-                // Ok(Some(current))
-                not_supported!("const block")
+            &Expr::Const(inner_expr) => {
+                // Keep const-block name resolution isolated from surrounding locals.
+                let resolver_guard =
+                    self.resolver.update_to_inner_scope(self.db, self.owner, expr_id);
+                let lowered = self.lower_expr_to_place(inner_expr, place, current);
+                self.resolver.reset_to_guard(resolver_guard);
+                lowered
             }
             Expr::Cast { expr, type_ref: _ } => {
                 let Some((it, current)) = self.lower_expr_to_some_operand(*expr, current)? else {
