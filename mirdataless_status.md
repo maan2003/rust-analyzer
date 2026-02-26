@@ -163,16 +163,12 @@ What is in place:
 Validation recently run:
 
 - `just test-clif --run-ignored all --no-fail-fast`
-  - historical snapshot from before the sync builtin-derive impl-resolution fix;
-    use the targeted sync run below for current mutex/arc status
+  - latest full-suite rerun after sync/static-operand and builtin-derive impl-resolution fixes
   - runs one full `cg-clif` nextest sweep in one invocation (covers all `tests.rs` cases,
     plus `link::tests::find_libstd_so_in_sysroot`)
-  - result: 129 tests run, 119 passed, 10 failed
+  - result: 129 tests run, 122 passed, 7 failed
   - failures:
     - `std_jit_hashmap_insert_get_probe`
-    - `std_jit_mutex_lock_smoke`
-    - `std_jit_mutex_try_lock_smoke`
-    - `std_jit_arc_mutex_probe`
     - `std_jit_format_macro_probe`
     - `std_jit_iter_repeat_take_collect_smoke`
     - `std_jit_env_set_var_smoke`
@@ -202,7 +198,7 @@ Validation recently run:
   - formatting-heavy paths still hit monomorphization errors in `core::fmt`
   - algorithm/collection-heavy paths (Vec sort / HashMap / BTreeMap) still surface
     indexing + monomorphization gaps in deeper generic code
-  - sync-heavy probes (`mutex_lock`, `mutex_try_lock`, `arc_mutex`) now pass in targeted runs;
+  - sync-heavy probes (`mutex_lock`, `mutex_try_lock`, `arc_mutex`) now pass in latest full-suite runs;
     remaining blockers are in formatting/collections and indexing paths
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
