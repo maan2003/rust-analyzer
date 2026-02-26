@@ -23,6 +23,9 @@ What is in place:
   - crate disambiguators from `RA_MIRDATA` metadata (`extract_crate_disambiguators()`)
   - dynamic loading of `libstd.so` (`dlopen(..., RTLD_GLOBAL)`)
 - `core::intrinsics::ptr_metadata` is now lowered in codegen intrinsic handling.
+- `core::intrinsics::size_of_val` now computes DST runtime sizes from pointer metadata
+  (slice/str lengths and dyn-trait vtable size slot), instead of using static layout size.
+- `core::intrinsics::align_of_val` now shares the same DST-aware runtime size/align helper path.
 - `.mirdata` remains metadata-only (crate names + stable crate ids); no old body/layout schema was revived.
 - rust-analyzer builtin macro coverage now includes `pattern_type!` (erased to base type in fallback expander).
   - this unblocks `core::num::niche_types::UsizeNoHighBit` type resolution in `alloc::raw_vec`/`Vec` layout paths.
@@ -94,6 +97,7 @@ What is in place:
   - `std_jit_string_from_smoke` (passes under `--run-ignored only`; ignore annotation is stale)
   - `std_jit_string_push_str_smoke` (passes under `--run-ignored only`; currently kept as probe)
 - Passing non-std frontier probe (current):
+  - `jit_size_of_val_slice_unsized_probe` (newly unignored and passing)
   - `jit_float_scalar_pair_const_probe` (newly unignored and passing)
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
@@ -121,8 +125,6 @@ What is in place:
       vtable-lookup merge)
   - `std_jit_refcell_replace_smoke`
     - last known behavior: aborts with `SIGSEGV` (not revalidated in latest batch)
-  - `jit_size_of_val_slice_unsized_probe`
-    - fails in MIR lowering with `HasErrors`
   - `jit_size_of_val_dyn_trait_probe`
     - fails in MIR lowering with `HasErrors`
   - `jit_explicit_enum_discriminant_probe`
@@ -169,13 +171,15 @@ Validation recently run:
 - `just test-clif -j 24 -E 'test(std_jit_env_set_var_smoke) or test(std_jit_env_var_roundtrip) or test(std_jit_mutex_lock_smoke) or test(std_jit_mutex_try_lock_smoke) or test(std_jit_once_call_once_smoke)' --run-ignored all --no-fail-fast`
   runs 5 ignored probes: all fail with current blockers listed above
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --no-fail-fast`
-  runs active members of the frontier set: 2 passed (`jit_float_scalar_pair_const_probe`,
+  runs active members of the frontier set: 3 passed
+  (`jit_size_of_val_slice_unsized_probe`, `jit_float_scalar_pair_const_probe`,
   `std_jit_option_map_closure_probe`), ignored members skipped.
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --run-ignored all --no-fail-fast`
-  runs full frontier set: 7 run, 2 passed, 5 failed
-  (`jit_size_of_val_slice_unsized_probe`, `jit_size_of_val_dyn_trait_probe`,
-  `jit_explicit_enum_discriminant_probe`, `jit_copy_nonoverlapping_intrinsic_probe`,
-  `jit_write_bytes_intrinsic_probe`).
+  runs full frontier set: 7 run, 3 passed, 4 failed
+  (`jit_size_of_val_dyn_trait_probe`, `jit_explicit_enum_discriminant_probe`,
+  `jit_copy_nonoverlapping_intrinsic_probe`, `jit_write_bytes_intrinsic_probe`).
+- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --run-ignored all --no-fail-fast` passes
+- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --no-fail-fast` passes
 
 ## What Is Still Missing
 
@@ -189,7 +193,7 @@ Validation recently run:
   - lifetime/generic-arg propagation for some monomorphic drop impl lookups
     (`std_jit_once_call_once_smoke` -> `CompletionGuard::drop`)
 - Additional backend gaps tracked by current frontier probes:
-  - unsized `size_of_val` paths fail in MIR lowering (`HasErrors`) for both slices and dyn-trait refs
+  - unsized `size_of_val` dyn-trait path still fails in MIR lowering (`HasErrors`)
   - explicit enum discriminants are currently encoded as variant indices
   - intrinsic lowering gaps remain for `copy_nonoverlapping` (monomorphization errors)
     and `write_bytes` (`bitcast size mismatch`)
@@ -210,8 +214,8 @@ Validation recently run:
 3. Fix monomorphic drop call generic/lifetime propagation for std once internals.
    - Repro target: `std_jit_once_call_once_smoke`.
 
-4. Fix unsized `size_of_val` MIR-lowering failures.
-   - Repro targets: `jit_size_of_val_slice_unsized_probe`, `jit_size_of_val_dyn_trait_probe`.
+4. Fix unsized `size_of_val` dyn-trait MIR-lowering failure.
+   - Repro target: `jit_size_of_val_dyn_trait_probe`.
 
 5. Fix explicit enum discriminant encoding.
    - Repro target: `jit_explicit_enum_discriminant_probe`.

@@ -373,6 +373,65 @@ fn unsized_tail_ty(db: &dyn HirDatabase, mut ty: StoredTy) -> StoredTy {
     }
 }
 
+/// Compute runtime size/alignment for a potentially-DST pointee type.
+///
+/// Mirrors upstream cg_clif's `unsize::size_and_align_of` behavior for
+/// `size_of_val`/`align_of_val` intrinsics.
+fn size_and_align_of_pointee(
+    fx: &mut FunctionCx<'_, impl Module>,
+    pointee_ty: StoredTy,
+    pointee_layout: &LayoutArc,
+    metadata: Option<Value>,
+) -> (Value, Value) {
+    let static_size = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.size.bytes() as i64);
+    let static_align = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
+
+    let tail_ty = unsized_tail_ty(fx.db(), pointee_ty);
+    let (tail_size, tail_align) = match tail_ty.as_ref().kind() {
+        TyKind::Dynamic(..) => {
+            let vtable = metadata.expect("size/align_of_val(dyn) requires metadata");
+            let ptr_size = fx.dl.pointer_size().bytes() as i32;
+            let size = fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), vtable, ptr_size);
+            let align = fx
+                .bcx
+                .ins()
+                .load(fx.pointer_type, vtable_memflags(), vtable, ptr_size * 2);
+            (Some(size), Some(align))
+        }
+        TyKind::Slice(elem_ty) => {
+            let len = metadata.expect("size/align_of_val(slice) requires metadata");
+            let elem_layout = fx
+                .db()
+                .layout_of_ty(elem_ty.store(), fx.env().clone())
+                .expect("size/align_of_val(slice): elem layout error");
+            let elem_size = elem_layout.size.bytes() as i64;
+            let size = if elem_size == 1 { len } else { fx.bcx.ins().imul_imm(len, elem_size) };
+            let align = fx.bcx.ins().iconst(fx.pointer_type, elem_layout.align.abi.bytes() as i64);
+            (Some(size), Some(align))
+        }
+        TyKind::Str => {
+            let len = metadata.expect("size/align_of_val(str) requires metadata");
+            let align = fx.bcx.ins().iconst(fx.pointer_type, 1);
+            (Some(len), Some(align))
+        }
+        _ => (None, None),
+    };
+
+    match (tail_size, tail_align) {
+        (Some(tail_size), Some(tail_align)) => {
+            let full_align = fx.bcx.ins().umax(static_align, tail_align);
+            let full_size = fx.bcx.ins().iadd(static_size, tail_size);
+            // Align size up to full alignment: (size + align - 1) & -align.
+            let align_minus_one = fx.bcx.ins().iadd_imm(full_align, -1);
+            let add = fx.bcx.ins().iadd(full_size, align_minus_one);
+            let neg_align = fx.bcx.ins().ineg(full_align);
+            let aligned_size = fx.bcx.ins().band(add, neg_align);
+            (aligned_size, full_align)
+        }
+        _ => (static_size, static_align),
+    }
+}
+
 pub(crate) fn bin_op_to_intcc(op: &BinOp, signed: bool) -> IntCC {
     match op {
         BinOp::Eq => IntCC::Equal,
@@ -3158,9 +3217,18 @@ fn codegen_intrinsic_call(
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
         }
         "size_of_val" => {
-            // For sized types, same as size_of
-            let layout = generic_ty_layout.clone().expect("size_of_val: layout error");
-            Some(fx.bcx.ins().iconst(fx.pointer_type, layout.size.bytes() as i64))
+            assert_eq!(args.len(), 1, "size_of_val expects 1 arg");
+
+            let pointee_ty = generic_ty.clone().expect("size_of_val requires a generic arg");
+            let pointee_layout = generic_ty_layout.clone().expect("size_of_val: layout error");
+            let ptr = codegen_operand(fx, &args[0].kind);
+            let metadata = match ptr.layout.backend_repr {
+                BackendRepr::ScalarPair(_, _) => Some(ptr.load_scalar_pair(fx).1),
+                _ => None,
+            };
+
+            let (size, _) = size_and_align_of_pointee(fx, pointee_ty, &pointee_layout, metadata);
+            Some(size)
         }
         "min_align_of_val" => {
             let layout = generic_ty_layout.clone().expect("min_align_of_val: layout error");
@@ -3171,42 +3239,15 @@ fn codegen_intrinsic_call(
 
             let pointee_ty = generic_ty.clone().expect("align_of_val requires a generic arg");
             let pointee_layout = generic_ty_layout.clone().expect("align_of_val: layout error");
-            let static_align =
-                fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
-
             let ptr = codegen_operand(fx, &args[0].kind);
             let metadata = match ptr.layout.backend_repr {
                 BackendRepr::ScalarPair(_, _) => Some(ptr.load_scalar_pair(fx).1),
                 _ => None,
             };
 
-            let tail_ty = unsized_tail_ty(fx.db(), pointee_ty);
-            let tail_align = match tail_ty.as_ref().kind() {
-                TyKind::Dynamic(..) => {
-                    let vtable = metadata.expect("align_of_val(dyn) requires metadata");
-                    let vtable_align_offset = (fx.dl.pointer_size().bytes() * 2) as i32;
-                    Some(fx.bcx.ins().load(
-                        fx.pointer_type,
-                        vtable_memflags(),
-                        vtable,
-                        vtable_align_offset,
-                    ))
-                }
-                TyKind::Slice(elem_ty) => {
-                    let elem_layout = fx
-                        .db()
-                        .layout_of_ty(elem_ty.store(), fx.env().clone())
-                        .expect("align_of_val(slice): elem layout error");
-                    Some(fx.bcx.ins().iconst(fx.pointer_type, elem_layout.align.abi.bytes() as i64))
-                }
-                TyKind::Str => Some(fx.bcx.ins().iconst(fx.pointer_type, 1)),
-                _ => None,
-            };
-
-            Some(match tail_align {
-                Some(tail_align) => fx.bcx.ins().umax(static_align, tail_align),
-                None => static_align,
-            })
+            let (_, align) =
+                size_and_align_of_pointee(fx, pointee_ty, &pointee_layout, metadata);
+            Some(align)
         }
         "needs_drop" => {
             let generic_ty = generic_ty.as_ref().expect("needs_drop requires a generic arg");

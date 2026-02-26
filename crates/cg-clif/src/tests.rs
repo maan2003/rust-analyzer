@@ -3497,10 +3497,10 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "currently fails in MIR lowering: HasErrors for size_of_val<[T]> intrinsic path"]
 fn jit_size_of_val_slice_unsized_probe() {
     let result: usize = jit_run(
         r#"
+//- minicore: coerce_unsized
 extern "rust-intrinsic" {
     pub fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
 }
