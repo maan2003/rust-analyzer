@@ -3493,6 +3493,161 @@ fn foo() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Frontier probes (next hills to climb)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "currently fails in MIR lowering: HasErrors for size_of_val<[T]> intrinsic path"]
+fn jit_size_of_val_slice_unsized_probe() {
+    let result: usize = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
+}
+fn foo() -> usize {
+    let arr = [10_i32, 20, 30];
+    let slice: &[i32] = &arr;
+    unsafe { size_of_val::<[i32]>(slice as *const [i32]) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 12);
+}
+
+#[test]
+#[ignore = "currently fails in MIR lowering: HasErrors for size_of_val<dyn Trait> intrinsic path"]
+fn jit_size_of_val_dyn_trait_probe() {
+    let result: usize = jit_run(
+        r#"
+trait Animal {
+    fn legs(&self) -> i32;
+}
+struct Dog;
+impl Animal for Dog {
+    fn legs(&self) -> i32 {
+        4
+    }
+}
+extern "rust-intrinsic" {
+    pub fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
+}
+fn foo() -> usize {
+    let d = Dog;
+    let a: &dyn Animal = &d;
+    unsafe { size_of_val::<dyn Animal>(a as *const dyn Animal) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 4);
+}
+
+#[test]
+#[ignore = "currently fails: explicit enum discriminants are encoded as variant indices"]
+fn jit_explicit_enum_discriminant_probe() {
+    let result: i32 = jit_run(
+        r#"
+enum Code {
+    A = 100,
+    B = 7,
+}
+fn foo() -> i32 {
+    let v = if true { Code::A } else { Code::B };
+    v as i32
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 100);
+}
+
+#[test]
+fn jit_float_scalar_pair_const_probe() {
+    let result: i32 = jit_run(
+        r#"
+const PAIR: (f32, f32) = (1.25, 2.5);
+
+fn foo() -> i32 {
+    let p = PAIR;
+    (p.0 as i32) + (p.1 as i32) * 10
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 21);
+}
+
+#[test]
+#[ignore = "currently fails: monomorphization errors in copy_nonoverlapping intrinsic lowering"]
+fn jit_copy_nonoverlapping_intrinsic_probe() {
+    let result: i32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
+}
+fn foo() -> i32 {
+    let src = [3_i32, 5, 7];
+    let mut dst = [0_i32, 0, 0];
+    unsafe {
+        let src_ptr = &src as *const [i32; 3] as *const i32;
+        let dst_ptr = &mut dst as *mut [i32; 3] as *mut i32;
+        copy_nonoverlapping(src_ptr, dst_ptr, 3usize);
+    }
+    dst[0usize] + dst[1usize] * 10 + dst[2usize] * 100
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 753);
+}
+
+#[test]
+#[ignore = "currently fails: write_bytes hits bitcast size mismatch in value_and_place"]
+fn jit_write_bytes_intrinsic_probe() {
+    let result: i32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn write_bytes<T>(dst: *mut T, val: u8, count: usize);
+}
+fn foo() -> i32 {
+    let mut dst = [0_u8, 0, 0, 0];
+    unsafe {
+        let dst_ptr = &mut dst as *mut [u8; 4] as *mut u8;
+        write_bytes(dst_ptr, 0xABu8, 4usize);
+    }
+    dst[0usize] as i32 + dst[1usize] as i32 + dst[2usize] as i32 + dst[3usize] as i32
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 0xAB * 4);
+}
+
+#[test]
+fn std_jit_option_map_closure_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let input = Some(41_i32);
+    match input.map(|x| x + 1) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+// ---------------------------------------------------------------------------
 // Non-scalar constants tests (M11d)
 // ---------------------------------------------------------------------------
 
