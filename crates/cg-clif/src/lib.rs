@@ -2109,6 +2109,7 @@ fn store_call_result_and_jump(
     call: cranelift_codegen::ir::Inst,
     sret_slot: Option<CPlace>,
     dest: CPlace,
+    destination_place: &Place,
     target: &Option<BasicBlockId>,
 ) {
     if let Some(sret_slot) = sret_slot {
@@ -2131,6 +2132,12 @@ fn store_call_result_and_jump(
                 _ => {}
             }
         }
+    }
+
+    if target.is_some()
+        && destination_place.projection.lookup(&fx.ra_body().projection_store).is_empty()
+    {
+        fx.set_drop_flag(destination_place.local);
     }
 
     if let Some(target) = target {
@@ -2438,6 +2445,10 @@ fn codegen_adt_constructor_call(
         codegen_adt_fields(fx, variant_idx, &field_vals, dest);
     }
 
+    if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+        fx.set_drop_flag(destination.local);
+    }
+
     if let Some(target) = target {
         let block = fx.clif_block(*target);
         fx.bcx.ins().jump(block, &[]);
@@ -2542,7 +2553,7 @@ fn codegen_fn_ptr_call(
 
     // Emit indirect call
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 /// Call a closure body directly.
@@ -2617,7 +2628,7 @@ fn codegen_closure_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 fn codegen_direct_call(
@@ -2816,7 +2827,7 @@ fn codegen_direct_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -2938,7 +2949,7 @@ fn codegen_virtual_call(
     // Emit indirect call
     let sig_ref = fx.bcx.import_signature(sig);
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 fn codegen_intrinsic_call(
@@ -3287,7 +3298,7 @@ fn codegen_intrinsic_call(
             }
 
             let call = fx.bcx.ins().call(callee_ref, &call_args);
-            store_call_result_and_jump(fx, call, sret_slot, dest, target);
+            store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
             return true;
         }
 
@@ -3613,6 +3624,9 @@ fn codegen_intrinsic_call(
             let ptr = src.force_stack(fx);
             let dest_val = CValue::by_ref(ptr, dest.layout.clone());
             dest.write_cvalue(fx, dest_val);
+            if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                fx.set_drop_flag(destination.local);
+            }
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
                 fx.bcx.ins().jump(block, &[]);
@@ -3652,6 +3666,10 @@ fn codegen_intrinsic_call(
         if !dest.layout.is_zst() {
             dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
         }
+    }
+
+    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+        fx.set_drop_flag(destination.local);
     }
 
     if let Some(target) = target {
