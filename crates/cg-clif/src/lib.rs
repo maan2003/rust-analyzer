@@ -39,6 +39,7 @@ use hir_ty::next_solver::{
 use hir_ty::traits::StoredParamEnvAndCrate;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
+use rustc_type_ir::elaborate::supertrait_def_ids;
 use rustc_type_ir::inherent::{GenericArgs as _, Ty as _};
 use triomphe::Arc as TArc;
 
@@ -882,18 +883,6 @@ fn get_or_create_vtable(
     let concrete_size = concrete_layout.size.bytes();
     let concrete_align = concrete_layout.align.abi.bytes();
 
-    // Get trait methods in declaration order
-    let trait_items = trait_id.trait_items(fx.db());
-    let method_func_ids: Vec<hir_def::FunctionId> = trait_items
-        .items
-        .iter()
-        .filter_map(|(_name, item)| match item {
-            AssocItemId::FunctionId(fid) => Some(*fid),
-            _ => None,
-        })
-        .collect();
-    let num_methods = method_func_ids.len();
-
     // Find the impl for this concrete type.
     let krate = fx.local_crate();
     let interner = DbInterner::new_no_crate(fx.db());
@@ -924,6 +913,38 @@ fn get_or_create_vtable(
         concrete_ty,
         simplified
     );
+
+    // Collect vtable methods in declaration order.
+    // For closure fallback (`Fn`/`FnMut`/`FnOnce`), include supertrait methods
+    // to mirror rustc's vtable shape (e.g. dyn FnMut has call_once + call_mut).
+    let method_func_ids: Vec<hir_def::FunctionId> = if closure_fallback.is_some() {
+        let mut trait_hierarchy: Vec<TraitId> =
+            supertrait_def_ids(interner, trait_id.into()).map(|it| it.0).collect();
+        trait_hierarchy.reverse();
+        let mut seen_traits = std::collections::HashSet::new();
+        trait_hierarchy.retain(|it| seen_traits.insert(*it));
+
+        trait_hierarchy
+            .into_iter()
+            .flat_map(|tid| {
+                tid.trait_items(fx.db()).items.iter().filter_map(|(_name, item)| match item {
+                    AssocItemId::FunctionId(fid) => Some(*fid),
+                    _ => None,
+                })
+            })
+            .collect()
+    } else {
+        trait_id
+            .trait_items(fx.db())
+            .items
+            .iter()
+            .filter_map(|(_name, item)| match item {
+                AssocItemId::FunctionId(fid) => Some(*fid),
+                _ => None,
+            })
+            .collect()
+    };
+    let num_methods = method_func_ids.len();
 
     // Build unique vtable name
     let vtable_name = format!(
