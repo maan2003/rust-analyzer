@@ -3235,6 +3235,42 @@ fn codegen_builtin_derive_method_call(
                 fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             }
         }
+        BuiltinDeriveImplMethod::fmt => {
+            // Builtin derive impls are pseudo impls with no MIR body. For Debug::fmt
+            // we at least preserve the fmt::Result contract (`Ok(())`) so callers
+            // can continue execution instead of crashing in codegen.
+            assert_eq!(
+                args.len(),
+                2,
+                "builtin Debug::fmt expects receiver and formatter arguments"
+            );
+
+            let dest = codegen_place(fx, destination);
+            if !dest.layout.is_zst() {
+                let result_ty = place_ty(fx.db(), fx.ra_body(), destination);
+                let TyKind::Adt(adt, _) = result_ty.as_ref().kind() else {
+                    panic!("builtin Debug::fmt must return Result, got: {:?}", result_ty)
+                };
+                let hir_def::AdtId::EnumId(_) = adt.inner().id else {
+                    panic!("builtin Debug::fmt must return enum Result, got: {:?}", result_ty)
+                };
+                // `core::fmt::Result` is `Result<(), fmt::Error>`; variant 0 is `Ok`.
+                codegen_set_discriminant(fx, &dest, &result_ty, VariantIdx::from_u32(0));
+            }
+
+            if target.is_some()
+                && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+            {
+                fx.set_drop_flag(destination.local);
+            }
+
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            } else {
+                fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            }
+        }
         _ => panic!(
             "unsupported builtin-derive method during codegen: {:?}::{:?}",
             derive_impl_id, derive_method
