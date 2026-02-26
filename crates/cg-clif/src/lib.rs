@@ -1317,8 +1317,8 @@ fn codegen_rvalue(
 
 /// Write ADT fields into `dest` with proper variant handling.
 ///
-/// Handles Scalar/ScalarPair fast paths for single-variant ADTs, and
-/// multi-variant enums (spilling to a temp stack slot when needed).
+/// Handles single-variant ADT scalar fast path and multi-variant enums
+/// (spilling to a temp stack slot when needed).
 /// Used by both `AggregateKind::Adt` and `codegen_adt_constructor_call`.
 fn codegen_adt_fields(
     fx: &mut FunctionCx<'_, impl Module>,
@@ -1339,16 +1339,6 @@ fn codegen_adt_fields(
             return;
         }
 
-        // Fast path: ScalarPair ADT with single variant (two-field struct)
-        if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-            let lanes = collect_scalar_abi_lanes(fx, field_vals);
-            assert_eq!(lanes.len(), 2, "ScalarPair ADT expects 2 ABI scalar lanes");
-            let val0 = lanes[0];
-            let val1 = lanes[1];
-            dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
-            codegen_set_discriminant(fx, &dest, variant_idx);
-            return;
-        }
     }
 
     // General case: for multi-variant enums on register places,
@@ -1432,16 +1422,6 @@ fn codegen_aggregate(
         | AggregateKind::CoroutineClosure(_) => {
             let field_vals: Vec<_> =
                 operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
-
-            // For ScalarPair tuples, construct directly as a pair
-            if let BackendRepr::ScalarPair(_, _) = dest.layout.backend_repr {
-                let lanes = collect_scalar_abi_lanes(fx, &field_vals);
-                assert_eq!(lanes.len(), 2, "ScalarPair aggregate expects 2 ABI scalar lanes");
-                let val0 = lanes[0];
-                let val1 = lanes[1];
-                dest.write_cvalue(fx, CValue::by_val_pair(val0, val1, dest.layout.clone()));
-                return;
-            }
 
             // For single scalar, construct directly
             if let BackendRepr::Scalar(_) = dest.layout.backend_repr {
