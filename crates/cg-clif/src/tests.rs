@@ -3517,29 +3517,30 @@ fn foo() -> usize {
 }
 
 #[test]
-#[ignore = "currently fails in MIR lowering: HasErrors for size_of_val<dyn Trait> intrinsic path"]
 fn jit_size_of_val_dyn_trait_probe() {
     let result: usize = jit_run(
         r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+//- /main.rs
 trait Animal {
     fn legs(&self) -> i32;
 }
-struct Dog;
+struct Dog(i32);
 impl Animal for Dog {
     fn legs(&self) -> i32 {
-        4
+        self.0
     }
 }
 extern "rust-intrinsic" {
     pub fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
 }
 fn foo() -> usize {
-    let d = Dog;
+    let d = Dog(4);
     let a: &dyn Animal = &d;
     unsafe { size_of_val::<dyn Animal>(a as *const dyn Animal) }
 }
 "#,
-        &["foo"],
+        &["legs", "foo"],
         "foo",
     );
     assert_eq!(result, 4);
