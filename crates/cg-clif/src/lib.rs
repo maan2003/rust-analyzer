@@ -1061,6 +1061,7 @@ fn get_or_create_vtable(
                     }
                 };
 
+            // Declare/import the impl function.
             let impl_body = fx
                 .db()
                 .monomorphized_mir_body(
@@ -1234,7 +1235,6 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                         cur_ty = inner_ty.store();
                     }
                 }
-
                 let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
@@ -1287,7 +1287,6 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                         cur_ty = inner_ty.store();
                     }
                 }
-
                 let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
@@ -3632,7 +3631,7 @@ fn codegen_intrinsic_call(
             let layout = generic_ty_layout.clone().expect("size_of: layout error");
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.size.bytes() as i64))
         }
-        "min_align_of" | "pref_align_of" => {
+        "align_of" | "min_align_of" | "pref_align_of" => {
             let layout = generic_ty_layout.clone().expect("align_of: layout error");
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
         }

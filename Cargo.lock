@@ -276,6 +276,7 @@ dependencies = [
  "la-arena 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "object 0.37.3",
  "postcard",
+ "project-model",
  "ra-ap-rustc_abi",
  "ra-ap-rustc_hashes",
  "ra-ap-rustc_index",

@@ -1,4 +1,4 @@
-use std::{alloc::Layout, fmt, panic, sync::Mutex};
+use std::{alloc::Layout, collections::HashMap, fmt, panic, sync::Mutex};
 
 use cranelift_module::Module;
 
@@ -1824,344 +1824,131 @@ fn libstd_exports_symbol(libstd_handle: *mut std::ffi::c_void, symbol: &str) -> 
     !ptr.is_null()
 }
 
-fn find_sysroot_src_dir() -> std::path::PathBuf {
-    let output = std::process::Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .expect("failed to run `rustc --print sysroot`");
-    assert!(output.status.success(), "rustc --print sysroot failed");
-
-    let sysroot = String::from_utf8(output.stdout).expect("non-UTF8 sysroot path");
-    let src_dir = std::path::PathBuf::from(sysroot.trim()).join("lib/rustlib/src/rust/library");
-    assert!(src_dir.exists(), "sysroot sources not found at {}", src_dir.display());
-    src_dir
-}
-
-fn parse_libc_version_from_sysroot_lock() -> Option<String> {
-    let sysroot = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
-    if !sysroot.status.success() {
-        return None;
-    }
-    let sysroot = String::from_utf8(sysroot.stdout).ok()?;
-    let lock_path =
-        std::path::PathBuf::from(sysroot.trim()).join("lib/rustlib/src/rust/library/Cargo.lock");
-    let lock = std::fs::read_to_string(lock_path).ok()?;
-
-    let mut in_libc_package = false;
-    for line in lock.lines() {
-        let line = line.trim();
-        if line == "[[package]]" {
-            in_libc_package = false;
-            continue;
-        }
-        if line == "name = \"libc\"" {
-            in_libc_package = true;
-            continue;
-        }
-        if in_libc_package
-            && let Some(version) =
-                line.strip_prefix("version = \"").and_then(|v| v.strip_suffix('"'))
-        {
-            return Some(version.to_owned());
-        }
+fn walk_rs_files(
+    path: &std::path::Path,
+    excluded_prefixes: &[std::path::PathBuf],
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    if excluded_prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+        return;
     }
 
-    None
-}
-
-fn pick_highest_semver(
-    mut versions: Vec<(String, std::path::PathBuf)>,
-) -> Option<std::path::PathBuf> {
-    fn parse(v: &str) -> (u32, u32, u32) {
-        let mut it = v.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
-        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
-    }
-
-    versions.sort_by_key(|(v, _)| parse(v));
-    versions.pop().map(|(_, path)| path)
-}
-
-fn find_libc_src_dir() -> Option<std::path::PathBuf> {
-    let cargo_home =
-        std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from).or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
-        })?;
-    let registry_src = cargo_home.join("registry/src");
-
-    let desired_version = parse_libc_version_from_sysroot_lock();
-    let mut available = Vec::new();
-
-    let index_dirs = std::fs::read_dir(&registry_src).ok()?;
-    for index_dir in index_dirs.flatten() {
-        let crates = match std::fs::read_dir(index_dir.path()) {
-            Ok(crates) => crates,
-            Err(_) => continue,
-        };
-        for krate in crates.flatten() {
-            let path = krate.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name,
-                None => continue,
-            };
-            let Some(version) = name.strip_prefix("libc-") else { continue };
-            if !path.join("src/lib.rs").exists() {
-                continue;
-            }
-            if desired_version.as_deref() == Some(version) {
-                return Some(path);
-            }
-            available.push((version.to_owned(), path));
+    if path.is_file() {
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path.to_path_buf());
         }
+        return;
     }
 
-    pick_highest_semver(available)
-}
-
-fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
+        walk_rs_files(&entry.path(), excluded_prefixes, out);
     }
 }
 
-fn rustc_cfg_options() -> cfg::CfgOptions {
-    let output = std::process::Command::new("rustc")
-        .args(["--print", "cfg"])
-        .output()
-        .expect("failed to run `rustc --print cfg`");
-    assert!(output.status.success(), "rustc --print cfg failed");
-
-    let stdout = String::from_utf8(output.stdout).expect("non-UTF8 rustc cfg output");
-    let mut cfg = cfg::CfgOptions::default();
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Some((key, raw_value)) = line.split_once('=') {
-            let value = raw_value.trim_matches('"');
-            cfg.insert_key_value(intern::Symbol::intern(key), intern::Symbol::intern(value));
-        } else {
-            cfg.insert_atom(intern::Symbol::intern(line));
-        }
-    }
-    cfg
-}
-
-/// Load real sysroot crates (core/alloc/std) and user source into TestDB.
+/// Load sysroot crates through project-model's metadata-first flow (with stitched
+/// fallback), then attach detached user source as the local crate.
 fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_db::Crate) {
-    use base_db::{
-        CrateDisplayName, CrateOrigin, CrateWorkspaceData, DependencyBuilder, Env, FileChange,
-        LangCrateOrigin,
+    use base_db::FileChange;
+    use project_model::{
+        CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
     };
     use vfs::{AbsPathBuf, file_set::FileSet};
 
-    let sysroot_src = find_sysroot_src_dir();
-    let mut source_change = FileChange::default();
-    let mut crate_graph = CrateGraphBuilder::default();
-    let mut roots = Vec::new();
-    let mut next_file_raw = 0u32;
+    let detached_file_path = AbsPathBuf::assert_utf8(std::env::temp_dir().join("rac_test_main.rs"));
+    let detached_file_manifest =
+        ManifestPath::try_from(detached_file_path.clone()).expect("detached file path");
 
-    let proc_macro_cwd = Arc::new(AbsPathBuf::assert_utf8(std::env::current_dir().unwrap()));
-    let crate_ws_data = Arc::new(CrateWorkspaceData {
-        target: Ok(base_db::target::TargetData {
-            arch: base_db::target::Arch::Other,
-            data_layout:
-                "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-                    .into(),
-        }),
-        toolchain: None,
-    });
+    let mut cargo_config = CargoConfig::default();
+    cargo_config.sysroot = Some(RustLibSource::Discover);
 
-    let cfg = rustc_cfg_options();
-
-    let mut load_source_crate = |crate_name: &str,
-                                 crate_dir: &std::path::Path,
-                                 origin: CrateOrigin|
-     -> base_db::CrateBuilderId {
-        let src_dir = crate_dir.join("src");
-        let lib_rs = src_dir.join("lib.rs");
-        assert!(lib_rs.exists(), "{} not found", lib_rs.display());
-
-        let mut rs_files = Vec::new();
-        walk_rs_files(&src_dir, &mut rs_files);
-
-        let root_file_id = FileId::from_raw(next_file_raw);
-        next_file_raw += 1;
-
-        let lib_rs_content = std::fs::read_to_string(&lib_rs)
-            .unwrap_or_else(|e| panic!("read {}: {e}", lib_rs.display()));
-        source_change.change_file(root_file_id, Some(lib_rs_content));
-
-        let mut file_set = FileSet::default();
-        file_set.insert(
-            root_file_id,
-            base_db::VfsPath::new_virtual_path(format!("/sysroot/{crate_name}/src/lib.rs")),
-        );
-
-        for rs_path in rs_files {
-            if rs_path == lib_rs {
-                continue;
-            }
-
-            let rel = rs_path
-                .strip_prefix(&src_dir)
-                .unwrap_or_else(|e| panic!("strip_prefix {}: {e}", rs_path.display()));
-            let file_id = FileId::from_raw(next_file_raw);
-            next_file_raw += 1;
-
-            let content = std::fs::read_to_string(&rs_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", rs_path.display()));
-            source_change.change_file(file_id, Some(content));
-            file_set.insert(
-                file_id,
-                base_db::VfsPath::new_virtual_path(format!(
-                    "/sysroot/{crate_name}/src/{}",
-                    rel.display()
-                )),
-            );
-        }
-
-        roots.push(base_db::SourceRoot::new_library(file_set));
-
-        crate_graph.add_crate_root(
-            root_file_id,
-            Edition::Edition2021,
-            Some(CrateDisplayName::from_canonical_name(crate_name)),
-            None,
-            cfg.clone(),
-            Some(cfg.clone()),
-            Env::default(),
-            origin,
-            Vec::new(),
-            false,
-            proc_macro_cwd.clone(),
-            crate_ws_data.clone(),
-        )
+    let mut workspace = ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
+        .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
+    workspace.kind = ProjectWorkspaceKind::DetachedFile {
+        file: detached_file_manifest.clone(),
+        cargo: None,
     };
 
-    let core_id = load_source_crate(
-        "core",
-        &sysroot_src.join("core"),
-        CrateOrigin::Lang(LangCrateOrigin::Core),
-    );
-    let alloc_id = load_source_crate(
-        "alloc",
-        &sysroot_src.join("alloc"),
-        CrateOrigin::Lang(LangCrateOrigin::Alloc),
-    );
-    let std_id =
-        load_source_crate("std", &sysroot_src.join("std"), CrateOrigin::Lang(LangCrateOrigin::Std));
-    let libc_id = find_libc_src_dir().map(|libc_dir| {
-        load_source_crate("libc", &libc_dir, CrateOrigin::Lang(LangCrateOrigin::Dependency))
-    });
+    let mut source_change = FileChange::default();
+    let mut local_file_set = FileSet::default();
+    let mut library_file_set = FileSet::default();
+    let mut next_file_raw = 0u32;
+    let mut file_ids_by_path = HashMap::<AbsPathBuf, FileId>::new();
+    let detached_file_abs_path: AbsPathBuf = detached_file_manifest.clone().into();
 
-    crate_graph
-        .add_dep(
-            alloc_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("core").unwrap(),
-                core_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
-    crate_graph
-        .add_dep(
-            std_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("core").unwrap(),
-                core_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
-    crate_graph
-        .add_dep(
-            std_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("alloc").unwrap(),
-                alloc_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
-    if let Some(libc_id) = libc_id {
-        crate_graph
-            .add_dep(
-                std_id,
-                DependencyBuilder::with_prelude(
-                    base_db::CrateName::new("libc").unwrap(),
-                    libc_id,
-                    true,
-                    true,
-                ),
-            )
-            .unwrap();
+    let mut load_file = |path: &vfs::AbsPath, is_local: bool| -> Option<FileId> {
+        let abs_path = path.to_path_buf();
+        if let Some(&file_id) = file_ids_by_path.get(&abs_path) {
+            let vfs_path = base_db::VfsPath::from(path.to_path_buf());
+            if is_local {
+                local_file_set.insert(file_id, vfs_path);
+            } else {
+                library_file_set.insert(file_id, vfs_path);
+            }
+            return Some(file_id);
+        }
+
+        let contents = if abs_path == detached_file_abs_path {
+            user_src.to_owned()
+        } else {
+            std::fs::read_to_string(<AbsPathBuf as AsRef<std::path::Path>>::as_ref(&abs_path))
+                .ok()?
+        };
+
+        let file_id = FileId::from_raw(next_file_raw);
+        next_file_raw += 1;
+        source_change.change_file(file_id, Some(contents));
+
+        let vfs_path = base_db::VfsPath::from(path.to_path_buf());
+        if is_local {
+            local_file_set.insert(file_id, vfs_path);
+        } else {
+            library_file_set.insert(file_id, vfs_path);
+        }
+
+        file_ids_by_path.insert(abs_path, file_id);
+        Some(file_id)
+    };
+
+    let mut graph_loader = |path: &vfs::AbsPath| {
+        let is_local = path == detached_file_abs_path.as_path();
+        load_file(path, is_local)
+    };
+    let (crate_graph, _) = workspace.to_crate_graph(&mut graph_loader, &cargo_config.extra_env);
+
+    for package_root in workspace.to_roots() {
+        let excluded_prefixes: Vec<std::path::PathBuf> = package_root
+            .exclude
+            .iter()
+            .map(|path| <AbsPathBuf as AsRef<std::path::Path>>::as_ref(path).to_path_buf())
+            .collect();
+
+        let mut rs_files = Vec::new();
+        for include_path in package_root.include {
+            walk_rs_files(include_path.as_ref(), &excluded_prefixes, &mut rs_files);
+        }
+
+        for rs_file in rs_files {
+            let abs_path = vfs::AbsPathBuf::assert_utf8(rs_file);
+            let _ = load_file(abs_path.as_ref(), package_root.is_local);
+        }
     }
 
-    let user_file_id = FileId::from_raw(next_file_raw);
-    let mut user_file_set = FileSet::default();
-    source_change.change_file(user_file_id, Some(user_src.to_owned()));
-    user_file_set.insert(user_file_id, base_db::VfsPath::new_virtual_path("/main.rs".to_owned()));
-    roots.push(base_db::SourceRoot::new_local(user_file_set));
+    let mut roots = Vec::new();
+    if library_file_set.len() > 0 {
+        roots.push(SourceRoot::new_library(library_file_set));
+    }
+    if local_file_set.len() > 0 {
+        roots.push(SourceRoot::new_local(local_file_set));
+    }
 
-    let user_crate_id = crate_graph.add_crate_root(
-        user_file_id,
-        Edition::Edition2021,
-        Some(CrateDisplayName::from_canonical_name("test")),
-        None,
-        cfg.clone(),
-        Some(cfg),
-        Env::default(),
-        CrateOrigin::Local { repo: None, name: None },
-        Vec::new(),
-        false,
-        proc_macro_cwd,
-        crate_ws_data,
-    );
-
-    crate_graph
-        .add_dep(
-            user_crate_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("std").unwrap(),
-                std_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
-    crate_graph
-        .add_dep(
-            user_crate_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("core").unwrap(),
-                core_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
-    crate_graph
-        .add_dep(
-            user_crate_id,
-            DependencyBuilder::with_prelude(
-                base_db::CrateName::new("alloc").unwrap(),
-                alloc_id,
-                true,
-                true,
-            ),
-        )
-        .unwrap();
+    let user_file_id = *file_ids_by_path
+        .get(&detached_file_abs_path)
+        .expect("detached user file was not loaded into source roots");
 
     source_change.set_roots(roots);
     source_change.set_crate_graph(crate_graph);

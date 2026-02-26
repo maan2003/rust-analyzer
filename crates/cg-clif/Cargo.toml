@@ -42,3 +42,4 @@ salsa = { version = "0.25.2", default-features = false, features = ["salsa_unsta
 salsa-macros = "0.25.2"
 cfg.path = "../cfg"
 vfs.path = "../vfs"
+project-model.path = "../project-model"
