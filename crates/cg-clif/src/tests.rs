@@ -3603,7 +3603,6 @@ fn foo() -> usize {
 }
 
 #[test]
-#[ignore = "currently fails: explicit enum discriminants are encoded as variant indices"]
 fn jit_explicit_enum_discriminant_probe() {
     let result: i32 = jit_run(
         r#"
