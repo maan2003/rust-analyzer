@@ -1837,6 +1837,87 @@ fn find_sysroot_src_dir() -> std::path::PathBuf {
     src_dir
 }
 
+fn parse_libc_version_from_sysroot_lock() -> Option<String> {
+    let sysroot = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    if !sysroot.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8(sysroot.stdout).ok()?;
+    let lock_path =
+        std::path::PathBuf::from(sysroot.trim()).join("lib/rustlib/src/rust/library/Cargo.lock");
+    let lock = std::fs::read_to_string(lock_path).ok()?;
+
+    let mut in_libc_package = false;
+    for line in lock.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            in_libc_package = false;
+            continue;
+        }
+        if line == "name = \"libc\"" {
+            in_libc_package = true;
+            continue;
+        }
+        if in_libc_package
+            && let Some(version) =
+                line.strip_prefix("version = \"").and_then(|v| v.strip_suffix('"'))
+        {
+            return Some(version.to_owned());
+        }
+    }
+
+    None
+}
+
+fn pick_highest_semver(mut versions: Vec<(String, std::path::PathBuf)>) -> Option<std::path::PathBuf> {
+    fn parse(v: &str) -> (u32, u32, u32) {
+        let mut it = v.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+
+    versions.sort_by_key(|(v, _)| parse(v));
+    versions.pop().map(|(_, path)| path)
+}
+
+fn find_libc_src_dir() -> Option<std::path::PathBuf> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo")))?;
+    let registry_src = cargo_home.join("registry/src");
+
+    let desired_version = parse_libc_version_from_sysroot_lock();
+    let mut available = Vec::new();
+
+    let index_dirs = std::fs::read_dir(&registry_src).ok()?;
+    for index_dir in index_dirs.flatten() {
+        let crates = match std::fs::read_dir(index_dir.path()) {
+            Ok(crates) => crates,
+            Err(_) => continue,
+        };
+        for krate in crates.flatten() {
+            let path = krate.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            let Some(version) = name.strip_prefix("libc-") else { continue };
+            if !path.join("src/lib.rs").exists() {
+                continue;
+            }
+            if desired_version.as_deref() == Some(version) {
+                return Some(path);
+            }
+            available.push((version.to_owned(), path));
+        }
+    }
+
+    pick_highest_semver(available)
+}
+
 fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1977,6 +2058,9 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
     );
     let std_id =
         load_source_crate("std", &sysroot_src.join("std"), CrateOrigin::Lang(LangCrateOrigin::Std));
+    let libc_id = find_libc_src_dir().map(|libc_dir| {
+        load_source_crate("libc", &libc_dir, CrateOrigin::Lang(LangCrateOrigin::Dependency))
+    });
 
     crate_graph
         .add_dep(
@@ -2011,6 +2095,19 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
             ),
         )
         .unwrap();
+    if let Some(libc_id) = libc_id {
+        crate_graph
+            .add_dep(
+                std_id,
+                DependencyBuilder::with_prelude(
+                    base_db::CrateName::new("libc").unwrap(),
+                    libc_id,
+                    true,
+                    true,
+                ),
+            )
+            .unwrap();
+    }
 
     let user_file_id = FileId::from_raw(next_file_raw);
     let mut user_file_set = FileSet::default();
@@ -2783,7 +2880,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std::io::error::repr_bitpacked::Repr::drop layout HasErrorType"]
+#[ignore = "currently fails: core::fmt::num::impl::fmt local layout HasErrorConst"]
 fn std_jit_env_set_var_smoke() {
     let result: i32 = jit_run_with_std(
         r#"

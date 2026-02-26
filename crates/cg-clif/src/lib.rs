@@ -518,6 +518,32 @@ fn codegen_cast(
         let CallableDefId::FunctionId(callee_func_id) = def.0 else {
             panic!("ReifyFnPointer on non-function: {:?}", def);
         };
+        let (callee_func_id, generic_args) =
+            if let ItemContainerId::TraitId(_) = callee_func_id.loc(fx.db()).container {
+                let interner = DbInterner::new_no_crate(fx.db());
+                if hir_ty::method_resolution::is_dyn_method(
+                    interner,
+                    fx.env().param_env(),
+                    callee_func_id,
+                    generic_args,
+                )
+                .is_some()
+                {
+                    // Keep trait item identity for dyn methods; they don't have a
+                    // concrete impl target at reify time.
+                    (callee_func_id, generic_args)
+                } else {
+                    hir_ty::method_resolution::lookup_impl_method(
+                        fx.db(),
+                        fx.env().as_ref(),
+                        callee_func_id,
+                        generic_args,
+                    )
+                }
+            } else {
+                (callee_func_id, generic_args)
+            };
+
         // Declare the function in the module and get its address
         let is_extern =
             matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
@@ -717,12 +743,17 @@ fn codegen_unsize_coercion(
         .expect("Unsize source must be a pointer/reference type");
 
     let metadata = match target_pointee.kind() {
-        TyKind::Dynamic(..) => {
-            let trait_id = target_pointee
-                .dyn_trait()
-                .expect("dyn unsize target pointee must have a principal trait");
-            get_or_create_vtable(fx, source_pointee.store(), trait_id)
-        }
+        TyKind::Dynamic(..) => match source_pointee.kind() {
+            TyKind::Dynamic(..) => {
+                from_meta.expect("dyn unsize from wide source requires metadata")
+            }
+            _ => {
+                let trait_id = target_pointee
+                    .dyn_trait()
+                    .expect("dyn unsize target pointee must have a principal trait");
+                get_or_create_vtable(fx, source_pointee.store(), trait_id)
+            }
+        },
         TyKind::Slice(_) | TyKind::Str => match source_pointee.kind() {
             TyKind::Array(_, len) => {
                 let len = try_const_usize(fx.db(), len)
@@ -784,9 +815,6 @@ fn get_or_create_vtable(
         .collect();
     let num_methods = method_func_ids.len();
 
-    // Find the impl for this concrete type
-    let krate = fx.local_crate();
-    let trait_impls = TraitImpls::for_crate(fx.db(), krate);
     let interner = DbInterner::new_no_crate(fx.db());
 
     // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
@@ -794,9 +822,18 @@ fn get_or_create_vtable(
     let simplified =
         simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
             .expect("cannot simplify concrete type for vtable lookup");
-    let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
-    assert!(!impl_ids.is_empty(), "no impl found for vtable");
-    let impl_id = impl_ids[0]; // Take first matching impl
+    let impl_id = find_trait_impl_for_simplified_ty(
+        fx.db(),
+        trait_id,
+        &simplified,
+        fx.local_crate(),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "no impl found for vtable: trait={:?}, concrete_ty={:?}, simplified={:?}",
+            trait_id, concrete_ty, simplified
+        )
+    });
 
     // Build unique vtable name
     let vtable_name = format!(
@@ -4134,15 +4171,17 @@ fn collect_vtable_methods(
 
     // Find the impl for this concrete type
     let interner = DbInterner::new_no_crate(db);
-    let trait_impls = TraitImpls::for_crate(db, local_crate);
     use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
     let Some(simplified) =
         simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer)
     else {
         return;
     };
-    let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
-    let Some(&impl_id) = impl_ids.first() else { return };
+    let Some(impl_id) =
+        find_trait_impl_for_simplified_ty(db, trait_id, &simplified, local_crate)
+    else {
+        return;
+    };
 
     // Add all trait method implementations to the queue
     let trait_items = trait_id.trait_items(db);
@@ -4153,13 +4192,35 @@ fn collect_vtable_methods(
         for (impl_name, impl_item) in impl_items.items.iter() {
             if impl_name == trait_method_name {
                 if let AssocItemId::FunctionId(impl_func_id) = impl_item {
-                    if impl_func_id.krate(db) == local_crate {
-                        queue.push_back((*impl_func_id, empty_args.clone()));
-                    }
+                    queue.push_back((*impl_func_id, empty_args.clone()));
                 }
             }
         }
     }
+}
+
+fn find_trait_impl_for_simplified_ty<'db>(
+    db: &'db dyn HirDatabase,
+    trait_id: TraitId,
+    simplified: &hir_ty::next_solver::SimplifiedType,
+    local_crate: base_db::Crate,
+) -> Option<hir_def::ImplId> {
+    let mut search_order: Vec<base_db::Crate> = vec![local_crate];
+    for &krate in db.all_crates().iter() {
+        if krate != local_crate {
+            search_order.push(krate);
+        }
+    }
+
+    for krate in search_order {
+        let trait_impls = TraitImpls::for_crate(db, krate);
+        let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, simplified);
+        if let Some(&impl_id) = impl_ids.first() {
+            return Some(impl_id);
+        }
+    }
+
+    None
 }
 
 /// Generate a `drop_in_place::<T>` glue function for the given type.
@@ -4638,7 +4699,29 @@ fn scan_body_for_callees(
                             let from_ty = operand_ty(db, body, &operand.kind);
                             if let TyKind::FnDef(def, callee_args) = from_ty.as_ref().kind() {
                                 if let CallableDefId::FunctionId(callee_id) = def.0 {
-                                    queue.push_back((callee_id, callee_args.store()));
+                                    let mut resolved_id = callee_id;
+                                    let mut resolved_args = callee_args;
+
+                                    if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                                        if hir_ty::method_resolution::is_dyn_method(
+                                            interner,
+                                            env.param_env(),
+                                            callee_id,
+                                            callee_args,
+                                        )
+                                        .is_none()
+                                        {
+                                            (resolved_id, resolved_args) =
+                                                hir_ty::method_resolution::lookup_impl_method(
+                                                    db,
+                                                    env.as_ref(),
+                                                    callee_id,
+                                                    callee_args,
+                                                );
+                                        }
+                                    }
+
+                                    queue.push_back((resolved_id, resolved_args.store()));
                                 }
                             }
                         }
