@@ -70,8 +70,8 @@ What is in place:
 - `ReifyFnPointer` trait-method resolution now routes static trait calls through
   `lookup_impl_method` in both codegen and reachability scanning.
   - this removed an earlier unresolved-symbol failure (`core::fmt::Debug::fmt` in
-    the `env_set_var` probe) and moved the failing edge deeper to
-    `core::fmt::num::impl::fmt` with `local layout error: HasErrorConst`.
+    the `env_set_var` probe); current env-var probe failures are now in a later
+    codegen stage (`Index on non-array/slice type`).
 - Enum discriminant lowering now uses `const_eval_discriminant` for
   `SetDiscriminant` direct-tag writes and `Rvalue::Discriminant` reads.
   - `TagEncoding::Niche` reads now remap decoded variant indices to actual
@@ -104,13 +104,16 @@ What is in place:
   - `std_jit_result_unwrap_or_smoke`
   - `std_jit_option_take_smoke`
   - `std_jit_slice_split_at_smoke`
+  - `std_jit_atomic_u32_smoke`
   - `std_jit_cmp_max_min_smoke`
   - `std_jit_array_deref_to_slice_smoke`
   - `std_jit_env_var_smoke`
   - `std_jit_str_parse_i32_smoke` (now unignored and passing)
+  - `std_jit_refcell_replace_smoke`
+  - `std_jit_once_call_once_smoke` (passes under `--run-ignored all`; ignore annotation is stale)
   - `std_jit_option_map_closure_probe` (newly unignored and passing)
-  - `std_jit_string_from_smoke` (passes under `--run-ignored only`; ignore annotation is stale)
-  - `std_jit_string_push_str_smoke` (passes under `--run-ignored only`; currently kept as probe)
+  - `std_jit_string_from_smoke` (passes under `--run-ignored all`; ignore annotation is stale)
+  - `std_jit_string_push_str_smoke` (passes under `--run-ignored all`; ignore annotation is stale)
 - Passing non-std frontier probe (current):
   - `jit_size_of_val_slice_unsized_probe` (newly unignored and passing)
   - `jit_size_of_val_dyn_trait_probe` (newly unignored and passing)
@@ -121,143 +124,93 @@ What is in place:
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
-  - `std_jit_env_set_var_smoke`
-    - currently fails while compiling `core::fmt::num::impl::fmt`
-      with `local layout error: HasErrorConst`
-  - `std_jit_env_var_roundtrip`
-    - currently fails at the same point as `env_set_var`:
-      `core::fmt::num::impl::fmt` with `local layout error: HasErrorConst`
-  - `std_jit_mutex_lock_smoke`
-    - now fails deeper in atomic internals:
-      `core::sync::atomic::atomic_compare_exchange` with
-      `NotSupported("monomorphization resulted in errors")`
-  - `std_jit_mutex_try_lock_smoke`
-    - now fails deeper in atomic internals:
-      `core::sync::atomic::atomic_compare_exchange` with
-      `NotSupported("monomorphization resulted in errors")`
-  - `std_jit_once_call_once_smoke`
-    - currently fails with `GenericArgNotProvided` on
-      `std::sys::sync::once::futex::CompletionGuard::drop`
-      (`LifetimeParamId ...`, empty generic args)
-  - `std_jit_iter_repeat_take_collect_smoke`
-    - last known failure was `no impl found for vtable` (not yet revalidated after
-      vtable-lookup merge)
-  - `std_jit_refcell_replace_smoke`
-    - last known behavior: aborts with `SIGSEGV` (not revalidated in latest batch)
-  - `std_jit_format_macro_probe`
-    - fails with `NotSupported("monomorphization resulted in errors")` while compiling
-      `core::fmt::Arguments::estimated_capacity`
-  - `std_jit_vec_sort_probe`
-    - fails in codegen with `Index on non-array/slice type`
-  - `std_jit_hashmap_insert_get_probe`
-    - fails with `NotSupported("monomorphization resulted in errors")`
-  - `std_jit_btreemap_range_probe`
-    - fails with `NotSupported("monomorphization resulted in errors")` in alloc btree
-      node-descent path (`alloc::collections::btree::node::Handle<...>::descend`)
-  - `std_jit_arc_mutex_probe`
-    - fails in codegen with `not yet implemented: static operand`
+  - Passing under `--run-ignored all` (ignore annotation is stale):
+    - `std_jit_once_call_once_smoke`
+    - `std_jit_string_from_smoke`
+    - `std_jit_string_push_str_smoke`
+  - Failing under `--run-ignored all`:
+    - `std_jit_env_set_var_smoke`
+      - fails in codegen with `Index on non-array/slice type`
+    - `std_jit_env_var_roundtrip`
+      - fails in codegen with `Index on non-array/slice type`
+    - `std_jit_mutex_lock_smoke`
+      - fails in codegen with `not yet implemented: static operand`
+    - `std_jit_mutex_try_lock_smoke`
+      - fails in codegen with `not yet implemented: static operand`
+    - `std_jit_iter_repeat_take_collect_smoke`
+      - fails with `GenericArgNotProvided` while resolving impl method MIR for vtable
+    - `std_jit_format_macro_probe`
+      - fails with `NotSupported("monomorphization resulted in errors")` while compiling
+        `core::fmt::Arguments::estimated_capacity`
+    - `std_jit_vec_sort_probe`
+      - fails in codegen with `Index on non-array/slice type`
+    - `std_jit_hashmap_insert_get_probe`
+      - fails with `NotSupported("monomorphization resulted in errors")`
+    - `std_jit_btreemap_range_probe`
+      - fails with `NotSupported("monomorphization resulted in errors")` in alloc btree
+        node-descent path (`alloc::collections::btree::node::Handle<...>::descend`)
+    - `std_jit_arc_mutex_probe`
+      - fails in codegen with `not yet implemented: static operand`
 
 Validation recently run:
 
-- `just test-clif -E 'test(std_jit_process_id_nonzero)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_str_len_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_box_new_i32_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_push_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_growth_sum_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_cell_set_get_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_pop_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_vec_with_capacity_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_result_unwrap_or_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_option_take_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_slice_split_at_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_cmp_max_min_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_array_deref_to_slice_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` passes
-- `just test-clif -E 'test(std_jit_refcell_borrow_mut_smoke)' --no-capture` passes
-- `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` passes
-- `just test-clif std_jit_string_push_str_smoke --run-ignored only --no-capture` passes
-- `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
-  `local layout error: HasErrorConst` in `core::fmt::num::impl::fmt`
-- `just test-clif -E 'test(std_jit_mutex_lock_smoke)' --no-capture` fails with
-  `NotSupported("monomorphization resulted in errors")` in
-  `core::sync::atomic::atomic_compare_exchange`
-- `just test-clif -j 24 -E 'test(std_jit_cell_set_get_smoke) or ... or test(std_jit_mutex_try_lock_smoke)' --run-ignored all --no-fail-fast`
-  runs 12 tests concurrently in ~14s total: 8 passed, 4 failed
-  (`std_jit_mutex_try_lock_smoke`, `std_jit_once_call_once_smoke`,
-  `std_jit_iter_repeat_take_collect_smoke`, `std_jit_refcell_replace_smoke`)
-- `just test-clif std_jit_env_var_roundtrip --run-ignored only --no-capture` fails with
-  `local layout error: HasErrorConst` in `core::fmt::num::impl::fmt`
-- `just test-clif -j 24 -E 'test(jit_dyn_dispatch) or test(jit_dyn_dispatch_multiple_methods) or test(jit_closure_basic) or test(jit_drop_basic) or test(jit_drop_side_effect) or test(jit_drop_no_drop_impl) or test(jit_drop_field_recursive) or test(jit_drop_generic) or test(std_jit_env_var_smoke)' --no-fail-fast`
-  runs 9 targeted tests: all pass
-- `just test-clif -j 24 -E 'test(std_jit_env_set_var_smoke) or test(std_jit_env_var_roundtrip) or test(std_jit_mutex_lock_smoke) or test(std_jit_mutex_try_lock_smoke) or test(std_jit_once_call_once_smoke)' --run-ignored all --no-fail-fast`
-  runs 5 ignored probes: all fail with current blockers listed above
-- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --no-fail-fast`
-  runs active members of the frontier set: 7 passed
-  (`jit_size_of_val_slice_unsized_probe`, `jit_size_of_val_dyn_trait_probe`,
-  `jit_explicit_enum_discriminant_probe`, `jit_float_scalar_pair_const_probe`,
-  `jit_copy_nonoverlapping_intrinsic_probe`, `jit_write_bytes_intrinsic_probe`,
-  `std_jit_option_map_closure_probe`).
-- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --run-ignored all --no-fail-fast`
-  runs full frontier set: 7 run, 7 passed.
-- `just test-clif -j 24 -E 'test(std_jit_format_macro_probe) or test(std_jit_vec_sort_probe) or test(std_jit_hashmap_insert_get_probe) or test(std_jit_btreemap_range_probe) or test(std_jit_arc_mutex_probe)' --run-ignored all --no-fail-fast`
-  runs ambitious std frontier set: 5 run, 0 passed, 5 failed (fresh rerun)
-  (`std_jit_format_macro_probe`, `std_jit_vec_sort_probe`,
-  `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`,
-  `std_jit_arc_mutex_probe`).
-  Current signatures:
-  - `std_jit_format_macro_probe`: `NotSupported("monomorphization resulted in errors")`
-    in `core::fmt::Arguments::estimated_capacity`
-  - `std_jit_vec_sort_probe`: `Index on non-array/slice type`
-  - `std_jit_hashmap_insert_get_probe`: `NotSupported("monomorphization resulted in errors")`
-  - `std_jit_btreemap_range_probe`: `NotSupported("monomorphization resulted in errors")`
-    in alloc btree node-descent path
-  - `std_jit_arc_mutex_probe`: `not yet implemented: static operand`
-- `just test-clif -E 'test(jit_size_of_val_dyn_trait_probe)' --no-fail-fast` passes
-- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --run-ignored all --no-fail-fast` passes
-- `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --no-fail-fast` passes
+- `just test-clif --run-ignored all --no-fail-fast`
+  - runs one full `cg-clif` nextest sweep in one invocation (covers all `tests.rs` cases,
+    plus `link::tests::find_libstd_so_in_sysroot`)
+  - result: 129 tests run, 119 passed, 10 failed
+  - failures:
+    - `std_jit_hashmap_insert_get_probe`
+    - `std_jit_mutex_lock_smoke`
+    - `std_jit_mutex_try_lock_smoke`
+    - `std_jit_arc_mutex_probe`
+    - `std_jit_format_macro_probe`
+    - `std_jit_iter_repeat_take_collect_smoke`
+    - `std_jit_env_set_var_smoke`
+    - `std_jit_env_var_roundtrip`
+    - `std_jit_btreemap_range_probe`
+    - `std_jit_vec_sort_probe`
 
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
 - `const_eval_select` runtime-arm signature collisions are no longer the blocker for Vec paths.
 - Primary remaining blockers now are:
-  - const/layout holes (`HasErrorConst`) in fmt/env-var paths
-    (`std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`)
-  - monomorphization-with-error consts in atomic compare-exchange paths
-    (`std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`)
-  - lifetime/generic-arg propagation for some monomorphic drop impl lookups
-    (`std_jit_once_call_once_smoke` -> `CompletionGuard::drop`)
+  - static operand codegen support gaps in sync-heavy paths
+    (`std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`, `std_jit_arc_mutex_probe`)
+  - indexing/codegen gap (`Index on non-array/slice type`) in std paths
+    (`std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`, `std_jit_vec_sort_probe`)
+  - monomorphization errors in formatting/collection-heavy generic code
+    (`std_jit_format_macro_probe`, `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`)
+  - trait-impl/vtable generic arg propagation hole
+    (`std_jit_iter_repeat_take_collect_smoke` -> `GenericArgNotProvided`)
 - Additional ambitious-blocker signals:
   - formatting-heavy paths still hit monomorphization errors in `core::fmt`
-  - algorithm/collection-heavy paths (Vec sort / HashMap / BTreeMap) surface
+  - algorithm/collection-heavy paths (Vec sort / HashMap / BTreeMap) still surface
     indexing + monomorphization gaps in deeper generic code
-  - Arc/Mutex paths still hit missing static-operand codegen support
+  - sync-heavy paths still hit missing static-operand codegen support
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
 
-1. Address `HasErrorConst` layout holes in fmt/env-var paths.
-   - Primary repro target: `std_jit_env_set_var_smoke`.
-   - Secondary repro target: `std_jit_env_var_roundtrip`.
-   - Focus: why `core::fmt::num::impl::fmt` locals still carry unresolved consts in
-     mirdataless flow.
+1. Implement static-operand codegen support in sync-heavy std paths.
+   - Primary repro targets: `std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`.
+   - Secondary repro target: `std_jit_arc_mutex_probe`.
 
-2. Handle atomic compare-exchange monomorphization failures.
-   - Repro targets: `std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`.
-   - Focus: unresolved `{const error}` in intrinsic-heavy atomic bodies.
+2. Fix `Index on non-array/slice type` codegen failures in std paths.
+   - Repro targets: `std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`,
+     `std_jit_vec_sort_probe`.
 
-3. Fix monomorphic drop call generic/lifetime propagation for std once internals.
-   - Repro target: `std_jit_once_call_once_smoke`.
+3. Handle remaining trait-impl/vtable generic-arg propagation failures.
+   - Repro target: `std_jit_iter_repeat_take_collect_smoke`.
 
-4. Fix formatting/collection frontier blockers from new ambitious probes.
+4. Fix formatting/collection frontier blockers from ambitious probes.
    - Repro targets: `std_jit_format_macro_probe`, `std_jit_vec_sort_probe`,
      `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`,
      `std_jit_arc_mutex_probe`.
 
 5. Unignore probes that now pass to keep regressions visible.
-   - Candidate unignores: `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
+   - Candidate unignores: `std_jit_once_call_once_smoke`,
+     `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
 6. Re-run and unignore probes incrementally as each blocker is fixed.
    - Current state: `str_parse` and `vec_push` are unignored; `string_from` and
@@ -280,8 +233,9 @@ Validation recently run:
 ## Next Candidate To Debug
 
 - `std_jit_env_set_var_smoke`
-  - reason: still failing with `local layout error: HasErrorConst` in
-    `core::fmt::num::impl::fmt`, and blocks environment-variable probe expansion.
+  - reason: now fails with `Index on non-array/slice type` (shared with
+    `std_jit_env_var_roundtrip` and `std_jit_vec_sort_probe`), giving one fix point
+    that can clear multiple blocked probes.
 
 ## Non-Goals (Still True)
 
