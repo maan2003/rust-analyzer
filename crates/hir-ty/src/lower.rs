@@ -40,7 +40,7 @@ use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundVarIndexKind, ConstKind, DebruijnIndex, ExistentialPredicate,
     ExistentialProjection, ExistentialTraitRef, FnSig, Interner, OutlivesPredicate, TermKind,
-    TyKind::{self},
+    TyKind::{self}, UintTy,
     TypeFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
     inherent::{Clause as _, GenericArgs as _, IntoKind as _, Region as _, Ty as _},
 };
@@ -281,7 +281,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     pub(crate) fn lower_const(&mut self, const_ref: ConstRef, const_type: Ty<'db>) -> Const<'db> {
-        let const_ref = &self.store[const_ref.expr];
+        let const_expr_id = const_ref.expr;
+        let const_ref = &self.store[const_expr_id];
         match const_ref {
             // Const-generic arguments like `{ AO::Relaxed }` are represented as a trivial block.
             hir_def::hir::Expr::Const(inner_expr) => {
@@ -319,7 +320,59 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     unknown_const(const_type)
                 }
             }
+            hir_def::hir::Expr::BinaryOp { .. }
+                if matches!(const_type.kind(), TyKind::Uint(UintTy::Usize)) =>
+            {
+                self.try_eval_const_usize_expr(const_expr_id)
+                    .map_or_else(|| unknown_const(const_type), |value| {
+                        crate::consteval::usize_const(self.db, Some(value), self.resolver.krate())
+                    })
+            }
             _ => unknown_const(const_type),
+        }
+    }
+
+    fn try_eval_const_usize_expr(&mut self, expr: hir_def::hir::ExprId) -> Option<u128> {
+        match &self.store[expr] {
+            hir_def::hir::Expr::Const(inner_expr) => self.try_eval_const_usize_expr(*inner_expr),
+            hir_def::hir::Expr::Block { statements, tail: Some(expr), label: None, .. }
+                if statements.is_empty() =>
+            {
+                self.try_eval_const_usize_expr(*expr)
+            }
+            hir_def::hir::Expr::Literal(hir_def::hir::Literal::Uint(v, _)) => Some(*v),
+            hir_def::hir::Expr::Literal(hir_def::hir::Literal::Int(v, _)) => {
+                (*v >= 0).then_some(*v as u128)
+            }
+            hir_def::hir::Expr::Path(path) => {
+                let c = self.path_to_const(path)?;
+                crate::consteval::try_const_usize(self.db, c)
+            }
+            hir_def::hir::Expr::BinaryOp {
+                lhs,
+                rhs,
+                op: Some(hir_def::hir::BinaryOp::ArithOp(op)),
+            } => {
+                let lhs = self.try_eval_const_usize_expr(*lhs)?;
+                let rhs = self.try_eval_const_usize_expr(*rhs)?;
+                match op {
+                    hir_def::hir::ArithOp::Add => lhs.checked_add(rhs),
+                    hir_def::hir::ArithOp::Sub => lhs.checked_sub(rhs),
+                    hir_def::hir::ArithOp::Mul => lhs.checked_mul(rhs),
+                    hir_def::hir::ArithOp::Div => (rhs != 0).then_some(lhs / rhs),
+                    hir_def::hir::ArithOp::Rem => (rhs != 0).then_some(lhs % rhs),
+                    hir_def::hir::ArithOp::Shl => {
+                        rhs.try_into().ok().and_then(|rhs: u32| lhs.checked_shl(rhs))
+                    }
+                    hir_def::hir::ArithOp::Shr => {
+                        rhs.try_into().ok().and_then(|rhs: u32| lhs.checked_shr(rhs))
+                    }
+                    hir_def::hir::ArithOp::BitXor => Some(lhs ^ rhs),
+                    hir_def::hir::ArithOp::BitOr => Some(lhs | rhs),
+                    hir_def::hir::ArithOp::BitAnd => Some(lhs & rhs),
+                }
+            }
+            _ => None,
         }
     }
 
