@@ -1378,6 +1378,75 @@ fn variant_id_to_idx(db: &dyn HirDatabase, variant_id: VariantId) -> VariantIdx 
     }
 }
 
+fn enum_id_from_ty(ty: &StoredTy) -> Option<hir_def::EnumId> {
+    let TyKind::Adt(adt_def, _) = ty.as_ref().kind() else {
+        return None;
+    };
+    match adt_def.inner().id {
+        hir_def::AdtId::EnumId(enum_id) => Some(enum_id),
+        _ => None,
+    }
+}
+
+fn enum_variant_discriminant_bits(
+    db: &dyn HirDatabase,
+    enum_ty: &StoredTy,
+    variant_index: VariantIdx,
+) -> u128 {
+    let enum_id = enum_id_from_ty(enum_ty)
+        .unwrap_or_else(|| panic!("expected enum type for discriminant write, got: {:?}", enum_ty));
+    let variants = &enum_id.enum_variants(db).variants;
+    let &(variant_id, _, _) = variants.get(variant_index.as_usize()).unwrap_or_else(|| {
+        panic!("variant index {} out of range for enum {:?}", variant_index.as_u32(), enum_id,)
+    });
+    let discr = db.const_eval_discriminant(variant_id).unwrap_or_else(|e| {
+        panic!(
+            "failed to evaluate discriminant for enum {:?} variant {}: {e:?}",
+            enum_id,
+            variant_index.as_u32(),
+        )
+    });
+    discr as u128
+}
+
+fn remap_variant_index_to_discriminant(
+    fx: &mut FunctionCx<'_, impl Module>,
+    enum_ty: &StoredTy,
+    variant_index_value: Value,
+) -> Value {
+    let Some(enum_id) = enum_id_from_ty(enum_ty) else {
+        return variant_index_value;
+    };
+
+    let variant_ids: Vec<_> = {
+        let db = fx.db();
+        enum_id.enum_variants(db).variants.iter().map(|&(variant_id, _, _)| variant_id).collect()
+    };
+
+    let discr_ty = fx.bcx.func.dfg.value_type(variant_index_value);
+    let mut mapped = variant_index_value;
+    for (idx, variant_id) in variant_ids.into_iter().enumerate() {
+        let discr_bits = {
+            let db = fx.db();
+            db.const_eval_discriminant(variant_id).unwrap_or_else(|e| {
+                panic!(
+                    "failed to evaluate discriminant for enum {:?} variant {}: {e:?}",
+                    enum_id, idx,
+                )
+            }) as u128
+        };
+
+        if discr_bits == idx as u128 {
+            continue;
+        }
+
+        let is_variant = codegen_icmp_imm(fx, IntCC::Equal, variant_index_value, idx as i128);
+        let discr_value = iconst_from_bits(&mut fx.bcx, discr_ty, discr_bits);
+        mapped = fx.bcx.ins().select(is_variant, discr_value, mapped);
+    }
+    mapped
+}
+
 // ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
@@ -1395,8 +1464,12 @@ fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &StatementKind)
         StatementKind::Nop | StatementKind::FakeRead(_) => {}
         StatementKind::Deinit(_) => {}
         StatementKind::SetDiscriminant { place, variant_index } => {
+            let enum_ty = {
+                let body = fx.ra_body();
+                place_ty(fx.db(), body, place)
+            };
             let dest = codegen_place(fx, place);
-            codegen_set_discriminant(fx, &dest, *variant_index);
+            codegen_set_discriminant(fx, &dest, &enum_ty, *variant_index);
         }
     }
 }
@@ -1410,7 +1483,11 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &
     // Some rvalues need to write directly to the destination place
     match rvalue {
         Rvalue::Aggregate(kind, operands) => {
-            codegen_aggregate(fx, kind, operands, dest);
+            let dest_ty = {
+                let body = fx.ra_body();
+                place_ty(fx.db(), body, place)
+            };
+            codegen_aggregate(fx, kind, operands, &dest_ty, dest);
             return;
         }
         Rvalue::Ref(_, ref_place) | Rvalue::AddressOf(_, ref_place) => {
@@ -1420,8 +1497,12 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &
             return;
         }
         Rvalue::Discriminant(disc_place) => {
+            let disc_ty = {
+                let body = fx.ra_body();
+                place_ty(fx.db(), body, disc_place)
+            };
             let disc_cplace = codegen_place(fx, disc_place);
-            let disc_val = codegen_get_discriminant(fx, &disc_cplace, &dest.layout);
+            let disc_val = codegen_get_discriminant(fx, &disc_cplace, &disc_ty, &dest.layout);
             dest.write_cvalue(fx, CValue::by_val(disc_val, dest.layout.clone()));
             return;
         }
@@ -1508,6 +1589,7 @@ fn codegen_adt_fields(
     fx: &mut FunctionCx<'_, impl Module>,
     variant_idx: VariantIdx,
     field_vals: &[CValue],
+    dest_ty: &StoredTy,
     dest: CPlace,
 ) {
     use rustc_abi::Variants;
@@ -1519,10 +1601,9 @@ fn codegen_adt_fields(
             let lanes = collect_scalar_abi_lanes(fx, field_vals);
             assert_eq!(lanes.len(), 1, "Scalar ADT expects 1 ABI scalar lane");
             dest.write_cvalue(fx, CValue::by_val(lanes[0], dest.layout.clone()));
-            codegen_set_discriminant(fx, &dest, variant_idx);
+            codegen_set_discriminant(fx, &dest, dest_ty, variant_idx);
             return;
         }
-
     }
 
     // General case: for multi-variant enums on register places,
@@ -1551,7 +1632,7 @@ fn codegen_adt_fields(
         field_place.write_cvalue(fx, field_cval.clone());
     }
 
-    codegen_set_discriminant(fx, &work_dest, variant_idx);
+    codegen_set_discriminant(fx, &work_dest, dest_ty, variant_idx);
 
     if let Some(orig) = original_dest {
         let cval = work_dest.to_cvalue(fx);
@@ -1595,6 +1676,7 @@ fn codegen_aggregate(
     fx: &mut FunctionCx<'_, impl Module>,
     kind: &hir_ty::mir::AggregateKind,
     operands: &[Operand],
+    dest_ty: &StoredTy,
     dest: CPlace,
 ) {
     use hir_ty::mir::AggregateKind;
@@ -1626,7 +1708,7 @@ fn codegen_aggregate(
             let variant_idx = variant_id_to_idx(fx.db(), *variant_id);
             let field_vals: Vec<_> =
                 operands.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
-            codegen_adt_fields(fx, variant_idx, &field_vals, dest);
+            codegen_adt_fields(fx, variant_idx, &field_vals, dest_ty, dest);
         }
         AggregateKind::Union(_, _) => {
             // Union aggregate: single active field written at offset 0.
@@ -1656,6 +1738,7 @@ fn codegen_aggregate(
 pub(crate) fn codegen_get_discriminant(
     fx: &mut FunctionCx<'_, impl Module>,
     place: &CPlace,
+    place_ty: &StoredTy,
     dest_layout: &LayoutArc,
 ) -> Value {
     use rustc_abi::Variants;
@@ -1666,9 +1749,8 @@ pub(crate) fn codegen_get_discriminant(
 
     match &place.layout.variants {
         Variants::Single { index } => {
-            // TODO: Use db.const_eval_discriminant() for explicit discriminant values
-            let discr_val = index.as_u32();
-            iconst_from_bits(&mut fx.bcx, dest_clif_ty, discr_val.into())
+            let discr_val = enum_variant_discriminant_bits(fx.db(), place_ty, *index);
+            iconst_from_bits(&mut fx.bcx, dest_clif_ty, discr_val)
         }
         Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
             use rustc_abi::TagEncoding;
@@ -1752,7 +1834,9 @@ pub(crate) fn codegen_get_discriminant(
                         dest_clif_ty,
                         untagged_variant.as_u32().into(),
                     );
-                    fx.bcx.ins().select(is_niche, tagged_discr, untagged_variant_val)
+                    let variant_index =
+                        fx.bcx.ins().select(is_niche, tagged_discr, untagged_variant_val);
+                    remap_variant_index_to_discriminant(fx, place_ty, variant_index)
                 }
             }
         }
@@ -1768,6 +1852,7 @@ pub(crate) fn codegen_get_discriminant(
 pub(crate) fn codegen_set_discriminant(
     fx: &mut FunctionCx<'_, impl Module>,
     place: &CPlace,
+    enum_ty: &StoredTy,
     variant_index: VariantIdx,
 ) {
     use rustc_abi::{TagEncoding, Variants};
@@ -1782,9 +1867,10 @@ pub(crate) fn codegen_set_discriminant(
                 TagEncoding::Direct => {
                     let ptr = place.place_field(fx, tag_field.as_usize(), tag_layout);
                     let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
-                    // TODO: Use db.const_eval_discriminant() for explicit discriminant values
-                    let discr_val = variant_index.as_u32();
-                    let to = iconst_from_bits(&mut fx.bcx, tag_clif_ty, discr_val.into());
+                    let discr_bits =
+                        enum_variant_discriminant_bits(fx.db(), enum_ty, variant_index);
+                    let discr_bits = tag.size(fx.dl).truncate(discr_bits);
+                    let to = iconst_from_bits(&mut fx.bcx, tag_clif_ty, discr_bits);
                     ptr.write_cvalue(fx, CValue::by_val(to, ptr.layout.clone()));
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
@@ -2606,9 +2692,13 @@ fn codegen_adt_constructor_call(
 ) {
     let dest = codegen_place(fx, destination);
     if !dest.layout.is_zst() {
+        let dest_ty = {
+            let body = fx.ra_body();
+            place_ty(fx.db(), body, destination)
+        };
         let variant_idx = variant_id_to_idx(fx.db(), variant_id);
         let field_vals: Vec<_> = args.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
-        codegen_adt_fields(fx, variant_idx, &field_vals, dest);
+        codegen_adt_fields(fx, variant_idx, &field_vals, &dest_ty, dest);
     }
 
     if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
