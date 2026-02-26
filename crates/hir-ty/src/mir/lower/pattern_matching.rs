@@ -531,7 +531,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             target_place.into(),
             match mode {
                 BindingMode::Move => {
-                    Operand { kind: OperandKind::Copy(cond_place), span: None }.into()
+                    Operand { kind: OperandKind::Move(cond_place), span: None }.into()
                 }
                 BindingMode::Ref(rustc_ast_ir::Mutability::Not) => {
                     Rvalue::Ref(BorrowKind::Shared, cond_place)

@@ -362,7 +362,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
             return Ok(None);
         };
-        Ok(Some((Operand { kind: OperandKind::Copy(p), span: Some(expr_id.into()) }, current)))
+        Ok(Some((Operand { kind: OperandKind::Move(p), span: Some(expr_id.into()) }, current)))
     }
 
     fn lower_expr_to_some_operand_without_adjust(
@@ -378,7 +378,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
-        Ok(Some((Operand { kind: OperandKind::Copy(p), span: Some(expr_id.into()) }, current)))
+        Ok(Some((Operand { kind: OperandKind::Move(p), span: Some(expr_id.into()) }, current)))
     }
 
     fn lower_expr_to_place_with_adjust(
@@ -538,7 +538,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         result
                     };
                 match pr {
-                    ValueNs::LocalBinding(_) | ValueNs::StaticId(_) => {
+                    ValueNs::LocalBinding(_) => {
+                        let Some((temp, current)) =
+                            self.lower_expr_as_place_without_adjust(current, expr_id, false)?
+                        else {
+                            return Ok(None);
+                        };
+                        self.push_assignment(
+                            current,
+                            place,
+                            Operand { kind: OperandKind::Move(temp), span: None }.into(),
+                            expr_id.into(),
+                        );
+                        Ok(Some(current))
+                    }
+                    ValueNs::StaticId(_) => {
                         let Some((temp, current)) =
                             self.lower_expr_as_place_without_adjust(current, expr_id, false)?
                         else {
