@@ -2230,12 +2230,7 @@ fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: Bas
 
     let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
         // Simple case: just call Drop::drop directly
-        let adt_subst = match ty.as_ref().kind() {
-            TyKind::Adt(_, subst) => Some(subst.store()),
-            _ => None,
-        };
-        let interner = DbInterner::new_no_crate(fx.db());
-        let generic_args = adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+        let generic_args = drop_impl_generic_args(fx.db(), fx.local_crate(), &ty);
         symbol_mangling::mangle_function(
             fx.db(),
             drop_func_id,
@@ -2365,6 +2360,26 @@ fn resolve_drop_impl(
     }
 
     None
+}
+
+/// Build generic args for calling a resolved `Drop::drop` impl method.
+///
+/// `TyKind::Adt` substitutions include regions, but impl-method
+/// monomorphization expects type/const entries only.
+fn drop_impl_generic_args(
+    db: &dyn HirDatabase,
+    local_crate: base_db::Crate,
+    ty: &StoredTy,
+) -> StoredGenericArgs {
+    let interner = DbInterner::new_with(db, local_crate);
+    match ty.as_ref().kind() {
+        TyKind::Adt(_, subst) => GenericArgs::new_from_iter(
+            interner,
+            subst.iter().filter(|arg| arg.region().is_none()),
+        )
+        .store(),
+        _ => GenericArgs::empty(interner).store(),
+    }
 }
 
 fn codegen_call(
@@ -4210,12 +4225,7 @@ fn compile_drop_in_place(
                 let mut drop_sig = Signature::new(isa.default_call_conv());
                 drop_sig.params.push(AbiParam::new(pointer_type));
 
-                let adt_subst = match ty.as_ref().kind() {
-                    TyKind::Adt(_, subst) => Some(subst.store()),
-                    _ => None,
-                };
-                let generic_args =
-                    adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+                let generic_args = drop_impl_generic_args(db, local_crate, ty);
                 let drop_fn_name = symbol_mangling::mangle_function(
                     db,
                     drop_func_id,
@@ -4536,10 +4546,7 @@ fn collect_drop_info(
     let lang_items = hir_def::lang_item::lang_items(db, local_crate);
     if let Some(drop_trait) = lang_items.Drop {
         if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
-            let drop_args = match ty.as_ref().kind() {
-                TyKind::Adt(_, subst) => subst.store(),
-                _ => GenericArgs::empty(interner).store(),
-            };
+            let drop_args = drop_impl_generic_args(db, local_crate, ty);
             fn_queue.push_back((drop_func_id, drop_args));
         }
     }
