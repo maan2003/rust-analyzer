@@ -1189,6 +1189,37 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
             ProjectionElem::Index(index_local) => {
                 let index_place = fx.local_place(*index_local).clone();
                 let index_val = index_place.to_cvalue(fx).load_scalar(fx);
+
+                // r-a MIR can emit `Index` directly on `&[T]` / `&[T; N]` without an
+                // explicit preceding `Deref` projection.
+                if !matches!(cur_ty.as_ref().kind(), TyKind::Array(_, _) | TyKind::Slice(_)) {
+                    if let Some(inner_ty) = cur_ty.as_ref().builtin_deref(true)
+                        && matches!(inner_ty.kind(), TyKind::Array(_, _) | TyKind::Slice(_))
+                    {
+                        let inner_layout = fx
+                            .db()
+                            .layout_of_ty(inner_ty.store(), fx.env().clone())
+                            .expect("index autoderef layout error");
+
+                        let cval = cplace.to_cvalue(fx);
+                        cplace = match cval.layout.backend_repr {
+                            BackendRepr::ScalarPair(_, _) => {
+                                let (data_ptr, meta) = cval.load_scalar_pair(fx);
+                                CPlace::for_ptr_with_extra(
+                                    pointer::Pointer::new(data_ptr),
+                                    meta,
+                                    inner_layout,
+                                )
+                            }
+                            _ => {
+                                let ptr_val = cval.load_scalar(fx);
+                                CPlace::for_ptr(pointer::Pointer::new(ptr_val), inner_layout)
+                            }
+                        };
+                        cur_ty = inner_ty.store();
+                    }
+                }
+
                 let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
@@ -1211,6 +1242,37 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 cur_ty = elem_ty;
             }
             ProjectionElem::ConstantIndex { offset, from_end } => {
+
+                // r-a MIR can emit `ConstantIndex` directly on `&[T]` / `&[T; N]`
+                // without an explicit `Deref` projection.
+                if !matches!(cur_ty.as_ref().kind(), TyKind::Array(_, _) | TyKind::Slice(_)) {
+                    if let Some(inner_ty) = cur_ty.as_ref().builtin_deref(true)
+                        && matches!(inner_ty.kind(), TyKind::Array(_, _) | TyKind::Slice(_))
+                    {
+                        let inner_layout = fx
+                            .db()
+                            .layout_of_ty(inner_ty.store(), fx.env().clone())
+                            .expect("constant index autoderef layout error");
+
+                        let cval = cplace.to_cvalue(fx);
+                        cplace = match cval.layout.backend_repr {
+                            BackendRepr::ScalarPair(_, _) => {
+                                let (data_ptr, meta) = cval.load_scalar_pair(fx);
+                                CPlace::for_ptr_with_extra(
+                                    pointer::Pointer::new(data_ptr),
+                                    meta,
+                                    inner_layout,
+                                )
+                            }
+                            _ => {
+                                let ptr_val = cval.load_scalar(fx);
+                                CPlace::for_ptr(pointer::Pointer::new(ptr_val), inner_layout)
+                            }
+                        };
+                        cur_ty = inner_ty.store();
+                    }
+                }
+
                 let is_slice = matches!(cur_ty.as_ref().kind(), TyKind::Slice(_));
                 let elem_ty = match cur_ty.as_ref().kind() {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
