@@ -19,10 +19,11 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use either::Either;
+use hir_def::builtin_derive::BuiltinDeriveImplMethod;
 use hir_def::signatures::{FunctionSignature, StaticFlags};
 use hir_def::{
-    AssocItemId, CallableDefId, GeneralConstId, HasModule, ItemContainerId, Lookup, StaticId,
-    TraitId, VariantId,
+    AssocItemId, BuiltinDeriveImplId, CallableDefId, GeneralConstId, HasModule, ItemContainerId,
+    Lookup, StaticId, TraitId, VariantId,
 };
 use hir_ty::PointerCast;
 use hir_ty::consteval::{try_const_usize, usize_const};
@@ -32,6 +33,7 @@ use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
     Rvalue, StatementKind, TerminatorKind, UnOp,
 };
+use hir_ty::next_solver::infer::DbInternerInferExt;
 use hir_ty::next_solver::{
     Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
     ValueConst,
@@ -612,31 +614,35 @@ fn codegen_cast(
         let CallableDefId::FunctionId(callee_func_id) = def.0 else {
             panic!("ReifyFnPointer on non-function: {:?}", def);
         };
-        let (callee_func_id, generic_args) =
-            if let ItemContainerId::TraitId(_) = callee_func_id.loc(fx.db()).container {
-                let interner = DbInterner::new_no_crate(fx.db());
-                if hir_ty::method_resolution::is_dyn_method(
-                    interner,
-                    fx.env().param_env(),
-                    callee_func_id,
-                    generic_args,
-                )
-                .is_some()
-                {
-                    // Keep trait item identity for dyn methods; they don't have a
-                    // concrete impl target at reify time.
-                    (callee_func_id, generic_args)
-                } else {
-                    hir_ty::method_resolution::lookup_impl_method(
-                        fx.db(),
-                        fx.env().as_ref(),
-                        callee_func_id,
-                        generic_args,
-                    )
-                }
-            } else {
+        let (callee_func_id, generic_args) = if let ItemContainerId::TraitId(_) =
+            callee_func_id.loc(fx.db()).container
+        {
+            let interner = DbInterner::new_no_crate(fx.db());
+            if hir_ty::method_resolution::is_dyn_method(
+                interner,
+                fx.env().param_env(),
+                callee_func_id,
+                generic_args,
+            )
+            .is_some()
+            {
+                // Keep trait item identity for dyn methods; they don't have a
+                // concrete impl target at reify time.
                 (callee_func_id, generic_args)
-            };
+            } else {
+                match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, generic_args) {
+                    (Either::Left(resolved_id), resolved_args) => (resolved_id, resolved_args),
+                    (Either::Right((derive_impl_id, derive_method)), _) => {
+                        panic!(
+                            "cannot reify builtin-derive method pointer: {:?}::{:?}",
+                            derive_impl_id, derive_method
+                        );
+                    }
+                }
+            }
+        } else {
+            (callee_func_id, generic_args)
+        };
 
         // Declare the function in the module and get its address
         let is_extern =
@@ -2982,6 +2988,74 @@ fn codegen_closure_call(
     store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
+/// Lower calls that resolve to builtin-derive pseudo methods.
+///
+/// These methods do not have concrete MIR bodies or symbols, so codegen must
+/// handle them directly.
+fn codegen_builtin_derive_method_call(
+    fx: &mut FunctionCx<'_, impl Module>,
+    derive_impl_id: BuiltinDeriveImplId,
+    derive_method: BuiltinDeriveImplMethod,
+    generic_args: GenericArgs<'_>,
+    args: &[Operand],
+    destination: &Place,
+    target: &Option<BasicBlockId>,
+) {
+    match derive_method {
+        BuiltinDeriveImplMethod::clone => {
+            assert_eq!(args.len(), 1, "builtin Clone::clone expects one receiver argument");
+
+            let self_ty = if generic_args.is_empty() {
+                let receiver_ref_ty = operand_ty(fx.db(), fx.ra_body(), &args[0].kind);
+                receiver_ref_ty
+                    .as_ref()
+                    .builtin_deref(true)
+                    .expect("builtin Clone::clone receiver must be a reference")
+            } else {
+                generic_args.type_at(0)
+            };
+            let interner = DbInterner::new_with(fx.db(), fx.local_crate());
+            let infcx = interner.infer_ctxt().build(hir_ty::next_solver::TypingMode::PostAnalysis);
+            assert!(
+                infcx.type_is_copy_modulo_regions(fx.env().param_env(), self_ty),
+                "builtin Clone::clone for non-Copy Self is not supported yet: {:?}",
+                self_ty
+            );
+
+            let self_layout = fx
+                .db()
+                .layout_of_ty(self_ty.store(), fx.env().clone())
+                .expect("layout for builtin Clone::clone receiver");
+            let self_ref = codegen_operand(fx, &args[0].kind);
+            let BackendRepr::Scalar(_) = self_ref.layout.backend_repr else {
+                panic!("builtin Clone::clone expects a thin &Self receiver");
+            };
+            let self_ptr = self_ref.load_scalar(fx);
+            let self_val = CValue::by_ref(pointer::Pointer::new(self_ptr), self_layout);
+
+            let dest = codegen_place(fx, destination);
+            dest.write_cvalue(fx, self_val);
+
+            if target.is_some()
+                && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+            {
+                fx.set_drop_flag(destination.local);
+            }
+
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            } else {
+                fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            }
+        }
+        _ => panic!(
+            "unsupported builtin-derive method during codegen: {:?}::{:?}",
+            derive_impl_id, derive_method
+        ),
+    }
+}
+
 fn codegen_direct_call(
     fx: &mut FunctionCx<'_, impl Module>,
     callee_func_id: hir_def::FunctionId,
@@ -3088,14 +3162,32 @@ fn codegen_direct_call(
             }
 
             // Static trait dispatch: resolve to concrete impl method when possible.
-            hir_ty::method_resolution::lookup_impl_method(
-                fx.db(),
-                fx.env().as_ref(),
-                callee_func_id,
-                generic_args,
-            )
+            let resolved_method =
+                match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, generic_args) {
+                    (Either::Left(resolved_id), resolved_args) => {
+                        Either::Left((resolved_id, resolved_args.store()))
+                    }
+                    (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
+                        Either::Right((derive_impl_id, derive_method, resolved_args.store()))
+                    }
+                };
+            match resolved_method {
+                Either::Left((resolved_id, resolved_args)) => (resolved_id, resolved_args),
+                Either::Right((derive_impl_id, derive_method, resolved_args)) => {
+                    codegen_builtin_derive_method_call(
+                        fx,
+                        derive_impl_id,
+                        derive_method,
+                        resolved_args.as_ref(),
+                        args,
+                        destination,
+                        target,
+                    );
+                    return;
+                }
+            }
         } else {
-            (callee_func_id, generic_args)
+            (callee_func_id, generic_args.store())
         };
 
     // Check if this is an extern function (no MIR available)
@@ -3114,7 +3206,7 @@ fn codegen_direct_call(
         (sig, name)
     } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
         callee_func_id.into(),
-        generic_args.store(),
+        generic_args.clone(),
         fx.env().clone(),
     ) {
         // Prefer r-a MIR whenever available, including cross-crate bodies.
@@ -3122,19 +3214,25 @@ fn codegen_direct_call(
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
-            generic_args,
+            generic_args.as_ref(),
             fx.ext_crate_disambiguators(),
         );
         (sig, name)
     } else if is_cross_crate {
         // Fall back to symbol-only cross-crate calls when MIR lowering is unavailable.
-        let sig =
-            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
-                .expect("cross-crate fn sig");
+        let sig = build_fn_sig_from_ty(
+            fx.isa,
+            fx.db(),
+            fx.dl,
+            fx.env(),
+            callee_func_id,
+            generic_args.as_ref(),
+        )
+        .expect("cross-crate fn sig");
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
-            generic_args,
+            generic_args.as_ref(),
             fx.ext_crate_disambiguators(),
         );
         (sig, name)
@@ -5199,13 +5297,19 @@ fn scan_body_for_callees(
                                         )
                                         .is_none()
                                         {
-                                            (resolved_id, resolved_args) =
-                                                hir_ty::method_resolution::lookup_impl_method(
-                                                    db,
-                                                    env.as_ref(),
-                                                    callee_id,
-                                                    callee_args,
-                                                );
+                                            match db.lookup_impl_method(
+                                                env.as_ref(),
+                                                callee_id,
+                                                callee_args,
+                                            ) {
+                                                (Either::Left(impl_id), impl_args) => {
+                                                    resolved_id = impl_id;
+                                                    resolved_args = impl_args;
+                                                }
+                                                (Either::Right(_), _) => {
+                                                    continue;
+                                                }
+                                            }
                                         }
                                     }
 
@@ -5282,13 +5386,15 @@ fn scan_body_for_callees(
                             }
                         }
 
-                        (resolved_id, resolved_args) =
-                            hir_ty::method_resolution::lookup_impl_method(
-                                db,
-                                env.as_ref(),
-                                callee_id,
-                                callee_args,
-                            );
+                        match db.lookup_impl_method(env.as_ref(), callee_id, callee_args) {
+                            (Either::Left(impl_id), impl_args) => {
+                                resolved_id = impl_id;
+                                resolved_args = impl_args;
+                            }
+                            (Either::Right(_), _) => {
+                                continue;
+                            }
+                        }
                     }
                     queue.push_back((resolved_id, resolved_args.store()));
                 }

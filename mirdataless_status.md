@@ -86,6 +86,13 @@ What is in place:
   - static operand type discovery now builds `&'static T` from static body inference.
   - codegen now imports extern + external-crate statics and defines local const-eval-backed statics,
     removing the `not yet implemented: static operand` panic path.
+- Trait-method impl resolution in `cg-clif` now consumes
+  `db.lookup_impl_method`'s `Either` result directly in call lowering and
+  reachability scanning.
+  - builtin-derive `Clone::clone` pseudo methods now lower as direct `*self`
+    copies for `Self: Copy`, without falling back to unresolved trait-item symbols.
+  - this fixes Arc allocator clone paths that previously imported an unresolved
+    `core::clone::Clone::clone::<alloc::alloc::Global>` symbol.
 
 ## Tests Revived
 
@@ -116,6 +123,7 @@ What is in place:
   - `std_jit_refcell_replace_smoke`
   - `std_jit_mutex_lock_smoke` (newly unignored and passing)
   - `std_jit_mutex_try_lock_smoke` (newly unignored and passing)
+  - `std_jit_arc_mutex_probe` (newly unignored and passing)
   - `std_jit_once_call_once_smoke` (passes under `--run-ignored all`; ignore annotation is stale)
   - `std_jit_option_map_closure_probe` (newly unignored and passing)
   - `std_jit_string_from_smoke` (passes under `--run-ignored all`; ignore annotation is stale)
@@ -151,13 +159,12 @@ What is in place:
     - `std_jit_btreemap_range_probe`
       - fails with `NotSupported("monomorphization resulted in errors")` in alloc btree
         node-descent path (`alloc::collections::btree::node::Handle<...>::descend`)
-    - `std_jit_arc_mutex_probe`
-      - fails at JIT finalize with unresolved imported symbol in Arc clone path
-        (`can't resolve symbol ... core::clone::Clone::clone::<alloc::alloc::Global>`)
 
 Validation recently run:
 
 - `just test-clif --run-ignored all --no-fail-fast`
+  - historical snapshot from before the sync builtin-derive impl-resolution fix;
+    use the targeted sync run below for current mutex/arc status
   - runs one full `cg-clif` nextest sweep in one invocation (covers all `tests.rs` cases,
     plus `link::tests::find_libstd_so_in_sysroot`)
   - result: 129 tests run, 119 passed, 10 failed
@@ -174,37 +181,35 @@ Validation recently run:
     - `std_jit_vec_sort_probe`
 
 - `just test-clif -j 24 -E 'test(std_jit_mutex_lock_smoke) or test(std_jit_mutex_try_lock_smoke) or test(std_jit_arc_mutex_probe)' --run-ignored all --no-fail-fast`
-  - targeted sync triage after static-operand lowering
-  - result: 3 tests run, 2 passed, 1 failed
-  - passing: `std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`
-  - failing: `std_jit_arc_mutex_probe` with unresolved imported symbol in Arc clone path
+  - targeted sync triage after builtin-derive `Clone` lowering fix
+  - result: 3 tests run, 3 passed
+  - passing: `std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`, `std_jit_arc_mutex_probe`
 
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
 - `const_eval_select` runtime-arm signature collisions are no longer the blocker for Vec paths.
 - Primary remaining blockers now are:
-  - unresolved imported symbol in sync-heavy Arc path
-    (`std_jit_arc_mutex_probe` -> unresolved `Clone::clone::<alloc::alloc::Global>`)
   - indexing/codegen gap (`Index on non-array/slice type`) in std paths
     (`std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`, `std_jit_vec_sort_probe`)
   - monomorphization errors in formatting/collection-heavy generic code
     (`std_jit_format_macro_probe`, `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`)
   - trait-impl/vtable generic arg propagation hole
     (`std_jit_iter_repeat_take_collect_smoke` -> `GenericArgNotProvided`)
+  - builtin-derive pseudo methods in call lowering are only implemented for
+    `Clone::clone`; other builtin-derive methods currently fail fast if reached.
 - Additional ambitious-blocker signals:
   - formatting-heavy paths still hit monomorphization errors in `core::fmt`
   - algorithm/collection-heavy paths (Vec sort / HashMap / BTreeMap) still surface
     indexing + monomorphization gaps in deeper generic code
-  - sync-heavy paths now moved past static-operand lowering; remaining Arc probe failure is
-    in imported-symbol resolution
+  - sync-heavy probes (`mutex_lock`, `mutex_try_lock`, `arc_mutex`) now pass in targeted runs;
+    remaining blockers are in formatting/collections and indexing paths
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
 
 1. Implement static-operand codegen support in sync-heavy std paths.
-   - Status: done for `std_jit_mutex_lock_smoke` and `std_jit_mutex_try_lock_smoke`.
-   - Remaining sync repro target: `std_jit_arc_mutex_probe` (unresolved imported symbol).
+   - Status: done (including `std_jit_arc_mutex_probe` after builtin-derive `Clone` lowering).
 
 2. Fix `Index on non-array/slice type` codegen failures in std paths.
    - Repro targets: `std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`,
@@ -215,16 +220,15 @@ Validation recently run:
 
 4. Fix formatting/collection frontier blockers from ambitious probes.
    - Repro targets: `std_jit_format_macro_probe`, `std_jit_vec_sort_probe`,
-     `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`,
-     `std_jit_arc_mutex_probe`.
+     `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`.
 
 5. Unignore probes that now pass to keep regressions visible.
    - Candidate unignores: `std_jit_once_call_once_smoke`,
      `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
 6. Re-run and unignore probes incrementally as each blocker is fixed.
-   - Current state: `str_parse`, `vec_push`, `mutex_lock`, and `mutex_try_lock` are unignored;
-     `string_from` and `string_push_str` now pass but are still marked ignored.
+   - Current state: `str_parse`, `vec_push`, `mutex_lock`, `mutex_try_lock`, and `arc_mutex`
+     are unignored; `string_from` and `string_push_str` now pass but are still marked ignored.
    - New state: `std_jit_option_map_closure_probe`,
      `jit_float_scalar_pair_const_probe`, `jit_size_of_val_dyn_trait_probe`,
      `jit_explicit_enum_discriminant_probe`, `jit_copy_nonoverlapping_intrinsic_probe`, and
@@ -242,10 +246,9 @@ Validation recently run:
 
 ## Next Candidate To Debug
 
-- `std_jit_arc_mutex_probe`
-  - reason: now that static-operand lowering is in place, sync-heavy coverage is blocked by
-    unresolved imported symbol handling in Arc clone path
-    (`can't resolve symbol ... Clone::clone::<alloc::alloc::Global>`).
+- `std_jit_env_set_var_smoke`
+  - reason: representative repro for the current indexing/codegen blocker
+    (`Index on non-array/slice type`) that also affects other std probes.
 
 ## Non-Goals (Still True)
 

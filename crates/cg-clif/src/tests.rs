@@ -3075,7 +3075,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: unresolved imported symbol in Arc clone path"]
 fn std_jit_arc_mutex_probe() {
     let result: i32 = jit_run_with_std(
         r#"
