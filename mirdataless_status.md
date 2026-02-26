@@ -71,6 +71,8 @@ What is in place:
   - `std_jit_box_new_i32_smoke`
   - `std_jit_vec_new_smoke` (now unignored and passing)
   - `std_jit_vec_push_smoke` (now unignored and passing)
+  - `std_jit_vec_growth_sum_smoke`
+  - `std_jit_refcell_borrow_mut_smoke`
   - `std_jit_array_deref_to_slice_smoke`
   - `std_jit_env_var_smoke`
   - `std_jit_str_parse_i32_smoke` (now unignored and passing)
@@ -84,6 +86,8 @@ What is in place:
       with `local layout error: HasErrorType`
   - `std_jit_env_var_roundtrip`
     - fails with `non-value const in ScalarPair constant`
+  - `std_jit_mutex_lock_smoke`
+    - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
 
 Validation recently run:
 
@@ -92,13 +96,17 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_box_new_i32_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_push_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_vec_growth_sum_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_array_deref_to_slice_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_refcell_borrow_mut_smoke)' --no-capture` passes
 - `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` aborts with
   `free(): double free detected in tcache 2`
 - `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
   `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
+- `just test-clif -E 'test(std_jit_mutex_lock_smoke)' --no-capture` fails with
+  `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
 
 ## What Is Still Missing
 

@@ -2467,6 +2467,54 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails: GenericArgNotProvided in std::sync::poison::mutex::MutexGuard::drop"]
+fn std_jit_mutex_lock_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let m = std::sync::Mutex::new(10_i32);
+
+    {
+        match m.lock() {
+            Ok(mut guard) => {
+                *guard += 32;
+            }
+            Err(_) => return 0,
+        }
+    }
+
+    match m.lock() {
+        Ok(guard) => (*guard == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_refcell_borrow_mut_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let cell = std::cell::RefCell::new(5_i32);
+
+    {
+        let mut value = cell.borrow_mut();
+        *value += 37;
+    }
+
+    (*cell.borrow() == 42) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails: runtime double-free in String path"]
 fn std_jit_string_from_smoke() {
     let result: i32 = jit_run_with_std(
