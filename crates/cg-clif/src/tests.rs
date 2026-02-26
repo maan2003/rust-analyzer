@@ -2425,7 +2425,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: to_ptr on unsized CPlace; use to_ptr_unsized"]
 fn std_jit_vec_push_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2441,13 +2440,29 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: const_eval_select runtime callee signature mismatch"]
+#[ignore = "currently fails: runtime double-free in String path"]
 fn std_jit_string_from_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
 fn foo() -> i32 {
     let value = String::from("hello");
     ((value.len() == 5) && (value == "hello")) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_array_deref_to_slice_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let arr = [7_i32];
+    let arr_ref: &[i32; 1] = &arr;
+    let slice: &[i32] = &*arr_ref;
+    ((slice.len() == 1) && (slice[0] == 7)) as i32
 }
 "#,
         "foo",
@@ -2486,7 +2501,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: to_ptr on unsized CPlace; use to_ptr_unsized"]
 fn std_jit_str_parse_i32_smoke() {
     let result: i32 = jit_run_with_std(
         r#"

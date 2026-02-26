@@ -181,7 +181,13 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     _ => false,
                 };
                 if !is_builtin {
-                    let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
+                    // Overloaded deref (`Deref::deref`) performs its own autoref.
+                    // Lowering the base expression with adjustments can inject an
+                    // extra borrow first (`&T`), which then gets borrowed again
+                    // here, effectively calling `deref` with `&&T`.
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_without_adjust(current, *expr, true)?
+                    else {
                         return Ok(None);
                     };
                     return self.lower_overloaded_deref(

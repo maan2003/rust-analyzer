@@ -50,6 +50,13 @@ What is in place:
   (Scalar / ScalarPair) instead of assuming "2 non-ZST fields".
   - this fixes the `ScalarPair ADT expects 2 non-ZST fields` panic in `codegen_adt_fields`
     and aligns behavior with upstream `cg_clif`'s field-wise aggregate writes.
+- `PointerCoercion::Unsize` now handles slice metadata in addition to dyn-trait metadata:
+  - array-to-slice / str-like unsizing now builds `(data_ptr, len)` fat pointers.
+  - fixes the panic `Unsize target pointee must be dyn Trait` on array->slice deref paths.
+- MIR lowering for overloaded unary deref no longer injects an extra borrow before
+  `Deref::deref` calls.
+  - avoids lowering `*v` (where `v: Vec<T>`) as an effective `deref(&&Vec<T>)` call.
+  - fixes incorrect fat-pointer results on `&*v` paths used by `Vec` indexing.
 
 ## Tests Revived
 
@@ -63,17 +70,15 @@ What is in place:
   - `std_jit_option_expect_smoke`
   - `std_jit_box_new_i32_smoke`
   - `std_jit_vec_new_smoke` (now unignored and passing)
+  - `std_jit_vec_push_smoke` (now unignored and passing)
+  - `std_jit_array_deref_to_slice_smoke`
   - `std_jit_env_var_smoke`
-  - `std_jit_str_parse_i32_smoke` (now passes when run ignored)
+  - `std_jit_str_parse_i32_smoke` (now unignored and passing)
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
-  - `std_jit_vec_push_smoke`
-    - now fails later with `const_eval_select` runtime-callee signature mismatch
-      (`core::ub_checks::runtime` signature clash at `declare_function`)
   - `std_jit_string_from_smoke`
-    - fails with `const_eval_select` runtime callee signature mismatch
-      (`core::ub_checks::runtime` signature clash at `declare_function`)
+    - currently aborts at runtime with allocator double-free (`free(): double free detected in tcache 2`)
   - `std_jit_env_set_var_smoke`
     - fails while compiling `std::io::error::repr_bitpacked::Repr::drop`
       with `local layout error: HasErrorType`
@@ -88,22 +93,20 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_str_len_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_box_new_i32_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_vec_push_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_array_deref_to_slice_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
-- `just test-clif std_jit_str_parse_i32_smoke --run-ignored only --no-capture` passes
-- `just test-clif std_jit_vec_push_smoke --run-ignored only --no-capture` fails with
-  `const_eval_select` runtime-callee signature mismatch
-  (`core::ub_checks::runtime`: `() -> bool` vs `(usize, usize) -> bool`)
-- `just test-clif -E 'test(std_jit_string_from_smoke)' --no-capture` fails with
-  `const_eval_select` runtime-callee signature mismatch
+- `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` passes
+- `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` aborts with
+  `free(): double free detected in tcache 2`
 - `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
   `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
 
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
-- `const_eval_select` runtime-arm call lowering still has signature mismatch cases.
-  - currently blocks `Vec::push` and `String::from` probes via `core::ub_checks::runtime`.
-  - likely related to local helper symbol collisions for same-named `runtime` shims.
+- `const_eval_select` runtime-arm signature collisions are no longer the blocker for Vec paths.
+- `String::from` still hits a runtime ownership/deallocation bug (double free).
 - ScalarPair constant materialization is still incomplete for non-value const forms.
   - currently blocks `std_jit_env_var_roundtrip`.
 - Some std paths still hit `HasErrorType` layout failures in deeper std internals.
@@ -112,10 +115,9 @@ Validation recently run:
 
 ## Recommended Fix Order
 
-1. Fix `const_eval_select` runtime-arm signature mismatches.
-   - Repro targets: `std_jit_vec_push_smoke`, `std_jit_string_from_smoke`.
-   - Focus: runtime callable signature construction + symbol/disambiguation consistency
-     for `core::ub_checks::runtime`-style local helper callees.
+1. Fix the `String::from` runtime double-free.
+   - Repro target: `std_jit_string_from_smoke`.
+   - Focus: ownership/drop paths across std string construction and drop glue.
 
 2. Complete ScalarPair constant lowering for non-value const forms.
    - Repro target: `std_jit_env_var_roundtrip`.
@@ -126,7 +128,7 @@ Validation recently run:
    - Focus: why `repr_bitpacked::Repr::drop` local layout still unresolved in mirdataless flow.
 
 4. Re-run and unignore probes incrementally as each blocker is fixed.
-   - Unignore order: `str_parse` (ready now) -> `vec_push`/`string_from` -> `env_var_roundtrip` -> `env_set_var`.
+   - Current state: `str_parse` and `vec_push` are unignored; `string_from` remains blocked.
 
 5. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.

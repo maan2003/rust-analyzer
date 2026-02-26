@@ -683,8 +683,11 @@ pub(crate) fn clif_bitcast(
     if src_ty == dst_ty { val } else { fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val) }
 }
 
-/// Handle `PointerCoercion(Unsize)`: `&T → &dyn Trait`.
-/// Produces a fat pointer `(data_ptr, vtable_ptr)`.
+/// Handle `PointerCoercion(Unsize)`.
+///
+/// Produces a fat pointer `(data_ptr, metadata)` for:
+/// - `&T -> &dyn Trait` / `*const T -> *const dyn Trait` (vtable metadata)
+/// - `&[T; N] -> &[T]` / `*const [T; N] -> *const [T]` (length metadata)
 /// Reference: cg_clif/src/unsize.rs `coerce_unsized_into`
 fn codegen_unsize_coercion(
     fx: &mut FunctionCx<'_, impl Module>,
@@ -694,25 +697,55 @@ fn codegen_unsize_coercion(
 ) -> CValue {
     let body = fx.ra_body();
     let from_cval = codegen_operand(fx, &operand.kind);
-    let data_ptr = from_cval.load_scalar(fx);
+    let (data_ptr, from_meta) = match from_cval.layout.backend_repr {
+        BackendRepr::ScalarPair(_, _) => {
+            let (ptr, meta) = from_cval.load_scalar_pair(fx);
+            (ptr, Some(meta))
+        }
+        _ => (from_cval.load_scalar(fx), None),
+    };
 
-    // Extract the trait from the target type (&dyn Trait → Dyn → trait_id)
-    let pointee_ty = target_ty
+    // Extract source/target pointee types.
+    let target_pointee = target_ty
         .as_ref()
         .builtin_deref(true)
         .expect("Unsize target must be a pointer/reference type");
-    let trait_id = pointee_ty.dyn_trait().expect("Unsize target pointee must be dyn Trait");
-
-    // Extract the concrete source type (what's behind the thin pointer)
     let from_ty = operand_ty(fx.db(), body, &operand.kind);
     let source_pointee = from_ty
         .as_ref()
         .builtin_deref(true)
         .expect("Unsize source must be a pointer/reference type");
 
-    let vtable_ptr = get_or_create_vtable(fx, source_pointee.store(), trait_id);
+    let metadata = match target_pointee.kind() {
+        TyKind::Dynamic(..) => {
+            let trait_id = target_pointee
+                .dyn_trait()
+                .expect("dyn unsize target pointee must have a principal trait");
+            get_or_create_vtable(fx, source_pointee.store(), trait_id)
+        }
+        TyKind::Slice(_) | TyKind::Str => match source_pointee.kind() {
+            TyKind::Array(_, len) => {
+                let len = try_const_usize(fx.db(), len)
+                    .expect("array->slice unsize requires monomorphic array length")
+                    as i64;
+                fx.bcx.ins().iconst(fx.pointer_type, len)
+            }
+            TyKind::Slice(_) | TyKind::Str => {
+                from_meta.expect("slice/str unsize from wide source requires metadata")
+            }
+            _ => panic!(
+                "unsupported unsize to slice/str: source pointee kind {:?}",
+                source_pointee.kind()
+            ),
+        },
+        _ => panic!(
+            "unsupported unsize target pointee kind {:?} (source {:?})",
+            target_pointee.kind(),
+            source_pointee.kind()
+        ),
+    };
 
-    CValue::by_val_pair(data_ptr, vtable_ptr, result_layout.clone())
+    CValue::by_val_pair(data_ptr, metadata, result_layout.clone())
 }
 
 /// Build or retrieve a vtable for `concrete_ty` implementing `trait_id`.
