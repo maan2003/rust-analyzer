@@ -7,6 +7,7 @@ cg_clif/ is the original rustc cranelift backend (git subtree). Read-only refere
 Always reference the upstream cg_clif/ when working on our codegen.
 
 crates/cg-clif/ is our MIR->Cranelift codegen crate using r-a types. This is where active development happens. See crates/cg-clif/NOTES.md for architecture notes and porting status.
+For debugging workflow, see crates/cg-clif/debugging.md (use two-commit `fix` + `wip-debug` flow, and limit noisy command output with `... | tee /tmp/clif.log | tail -n 120`).
 
 rustc/ is the rust tree, but not a subtree. it is read only.
 
