@@ -2742,6 +2742,62 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn std_jit_mangling_matches_libstd_once_call_symbol() {
+    let libstd_handle = load_libstd_global();
+    let disambiguators = crate::link::extract_crate_disambiguators()
+        .expect("failed to load crate disambiguators; run via `just test-clif`");
+
+    let (db, file_id, local_crate) = load_sysroot_and_user_code(
+        r#"
+fn foo() {
+    let once = std::sync::Once::new();
+    once.call_once(|| {});
+}
+"#,
+    );
+
+    attach_db(&db, || {
+        let entry_func_id = find_fn(&db, file_id, "foo");
+        let env = hir_ty::ParamEnvAndCrate {
+            param_env: db.trait_environment(entry_func_id.into()),
+            krate: local_crate,
+        }
+        .store();
+
+        let (reachable_fns, _, _) = crate::collect_reachable_fns_with_body_filter(
+            &db,
+            &env,
+            entry_func_id,
+            local_crate,
+            |_, _| true,
+        );
+
+        let once_call_symbol = reachable_fns
+            .iter()
+            .filter(|(func_id, generic_args)| {
+                func_id.krate(&db) != local_crate && generic_args.as_ref().is_empty()
+            })
+            .map(|(func_id, generic_args)| {
+                crate::symbol_mangling::mangle_function(
+                    &db,
+                    *func_id,
+                    generic_args.as_ref(),
+                    &disambiguators,
+                )
+            })
+            .find(|name| name.contains("once5futex") && name.ends_with("4call"))
+            .expect("failed to find std::sys::sync::once::futex::Once::call in reachable set");
+
+        // Regression check: this used to miss due non-rustc impl-path mangling.
+        assert!(
+            libstd_exports_symbol(libstd_handle, &once_call_symbol),
+            "libstd should export Once::call symbol `{once_call_symbol}`"
+        );
+    });
+}
+
+#[test]
 #[ignore = "investigation probe: sync Once path"]
 fn std_jit_once_call_once_smoke() {
     let result: i32 = jit_run_with_std(
