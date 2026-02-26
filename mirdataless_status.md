@@ -84,8 +84,6 @@ What is in place:
       with `local layout error: HasErrorType`
   - `std_jit_env_var_roundtrip`
     - fails with `non-value const in ScalarPair constant`
-  - `std_jit_vec_new_forget_smoke`
-    - still marked as investigation probe
 
 Validation recently run:
 

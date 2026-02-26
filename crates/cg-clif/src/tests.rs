@@ -2440,6 +2440,33 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_vec_growth_sum_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v: Vec<i32> = Vec::new();
+    let mut i = 0_i32;
+    while i < 32 {
+        v.push(i);
+        i += 1;
+    }
+
+    let mut sum = 0_i32;
+    let mut j = 0_usize;
+    while j < v.len() {
+        sum += v[j];
+        j += 1;
+    }
+
+    (sum == 496) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails: runtime double-free in String path"]
 fn std_jit_string_from_smoke() {
     let result: i32 = jit_run_with_std(
@@ -2463,23 +2490,6 @@ fn foo() -> i32 {
     let arr_ref: &[i32; 1] = &arr;
     let slice: &[i32] = &*arr_ref;
     ((slice.len() == 1) && (slice[0] == 7)) as i32
-}
-"#,
-        "foo",
-    );
-    assert_eq!(result, 1);
-}
-
-#[test]
-#[ignore = "investigation: vec smoke with mem::forget"]
-fn std_jit_vec_new_forget_smoke() {
-    let result: i32 = jit_run_with_std(
-        r#"
-fn foo() -> i32 {
-    let v: Vec<i32> = Vec::new();
-    let ok = (v.len() == 0) as i32;
-    std::mem::forget(v);
-    ok
 }
 "#,
         "foo",
