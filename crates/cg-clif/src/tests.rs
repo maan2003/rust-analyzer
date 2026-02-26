@@ -3002,6 +3002,111 @@ fn foo() -> i32 {
     assert_eq!(result, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Ambitious std-JIT frontier probes
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "currently fails: monomorphization errors in core::fmt::Arguments::estimated_capacity"]
+fn std_jit_format_macro_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let s = format!("{}:{}", 12_i32, 30_i32);
+    (s == "12:30") as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: Index on non-array/slice type in Vec::sort path"]
+fn std_jit_vec_sort_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v = vec![9_i32, 1, 5, 3, 7];
+    v.sort();
+    ((v[0] == 1) && (v[4] == 9)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: monomorphization resulted in errors in HashMap path"]
+fn std_jit_hashmap_insert_get_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    map.insert(1, 10);
+    map.insert(2, 32);
+    match map.get(&2) {
+        Some(v) => ((*v == 32) && (map.len() == 2)) as i32,
+        None => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: monomorphization errors in alloc::collections::btree node descent"]
+fn std_jit_btreemap_range_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::BTreeMap<i32, i32> = std::collections::BTreeMap::new();
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+
+    let mut sum = 0_i32;
+    for (_, value) in map.range(2..=3) {
+        sum += *value;
+    }
+    (sum == 50) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: static operand not yet implemented in Arc/Mutex path"]
+fn std_jit_arc_mutex_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(40_i32));
+    let shared2 = std::sync::Arc::clone(&shared);
+
+    match shared2.lock() {
+        Ok(mut guard) => {
+            *guard += 2;
+        }
+        Err(_) => return 0,
+    }
+
+    match shared.lock() {
+        Ok(guard) => (*guard == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
 #[test]
 fn jit_closure_basic() {
     let result: i32 = jit_run_reachable(

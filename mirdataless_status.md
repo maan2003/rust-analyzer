@@ -144,6 +144,18 @@ What is in place:
       vtable-lookup merge)
   - `std_jit_refcell_replace_smoke`
     - last known behavior: aborts with `SIGSEGV` (not revalidated in latest batch)
+  - `std_jit_format_macro_probe`
+    - fails with `NotSupported("monomorphization resulted in errors")` while compiling
+      `core::fmt::Arguments::estimated_capacity`
+  - `std_jit_vec_sort_probe`
+    - fails in codegen with `Index on non-array/slice type`
+  - `std_jit_hashmap_insert_get_probe`
+    - fails with `NotSupported("monomorphization resulted in errors")`
+  - `std_jit_btreemap_range_probe`
+    - fails with `NotSupported("monomorphization resulted in errors")` in alloc btree
+      node-descent path (`alloc::collections::btree::node::Handle<...>::descend`)
+  - `std_jit_arc_mutex_probe`
+    - fails in codegen with `not yet implemented: static operand`
 
 Validation recently run:
 
@@ -189,6 +201,19 @@ Validation recently run:
   `std_jit_option_map_closure_probe`).
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --run-ignored all --no-fail-fast`
   runs full frontier set: 7 run, 7 passed.
+- `just test-clif -j 24 -E 'test(std_jit_format_macro_probe) or test(std_jit_vec_sort_probe) or test(std_jit_hashmap_insert_get_probe) or test(std_jit_btreemap_range_probe) or test(std_jit_arc_mutex_probe)' --run-ignored all --no-fail-fast`
+  runs ambitious std frontier set: 5 run, 0 passed, 5 failed (fresh rerun)
+  (`std_jit_format_macro_probe`, `std_jit_vec_sort_probe`,
+  `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`,
+  `std_jit_arc_mutex_probe`).
+  Current signatures:
+  - `std_jit_format_macro_probe`: `NotSupported("monomorphization resulted in errors")`
+    in `core::fmt::Arguments::estimated_capacity`
+  - `std_jit_vec_sort_probe`: `Index on non-array/slice type`
+  - `std_jit_hashmap_insert_get_probe`: `NotSupported("monomorphization resulted in errors")`
+  - `std_jit_btreemap_range_probe`: `NotSupported("monomorphization resulted in errors")`
+    in alloc btree node-descent path
+  - `std_jit_arc_mutex_probe`: `not yet implemented: static operand`
 - `just test-clif -E 'test(jit_size_of_val_dyn_trait_probe)' --no-fail-fast` passes
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --run-ignored all --no-fail-fast` passes
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --no-fail-fast` passes
@@ -204,6 +229,11 @@ Validation recently run:
     (`std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`)
   - lifetime/generic-arg propagation for some monomorphic drop impl lookups
     (`std_jit_once_call_once_smoke` -> `CompletionGuard::drop`)
+- Additional ambitious-blocker signals:
+  - formatting-heavy paths still hit monomorphization errors in `core::fmt`
+  - algorithm/collection-heavy paths (Vec sort / HashMap / BTreeMap) surface
+    indexing + monomorphization gaps in deeper generic code
+  - Arc/Mutex paths still hit missing static-operand codegen support
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
@@ -221,10 +251,15 @@ Validation recently run:
 3. Fix monomorphic drop call generic/lifetime propagation for std once internals.
    - Repro target: `std_jit_once_call_once_smoke`.
 
-4. Unignore probes that now pass to keep regressions visible.
+4. Fix formatting/collection frontier blockers from new ambitious probes.
+   - Repro targets: `std_jit_format_macro_probe`, `std_jit_vec_sort_probe`,
+     `std_jit_hashmap_insert_get_probe`, `std_jit_btreemap_range_probe`,
+     `std_jit_arc_mutex_probe`.
+
+5. Unignore probes that now pass to keep regressions visible.
    - Candidate unignores: `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
-5. Re-run and unignore probes incrementally as each blocker is fixed.
+6. Re-run and unignore probes incrementally as each blocker is fixed.
    - Current state: `str_parse` and `vec_push` are unignored; `string_from` and
      `string_push_str` now pass but are still marked ignored.
    - New state: `std_jit_option_map_closure_probe`,
@@ -232,14 +267,14 @@ Validation recently run:
      `jit_explicit_enum_discriminant_probe`, `jit_copy_nonoverlapping_intrinsic_probe`, and
      `jit_write_bytes_intrinsic_probe` are unignored and passing.
 
-6. Expand coverage with more deterministic std probes once blockers are cleared.
+7. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.
 
-7. Improve sysroot loading ergonomics/perf for tests.
+8. Improve sysroot loading ergonomics/perf for tests.
    - Cache file discovery and/or loaded roots across tests when feasible.
    - Keep wall-time reasonable as std-smoke coverage grows.
 
-8. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
+9. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
    - Make it easy to run only mirdataless std-JIT smoke tests locally.
 
 ## Next Candidate To Debug
