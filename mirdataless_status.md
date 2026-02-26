@@ -57,6 +57,13 @@ What is in place:
   `Deref::deref` calls.
   - avoids lowering `*v` (where `v: Vec<T>`) as an effective `deref(&&Vec<T>)` call.
   - fixes incorrect fat-pointer results on `&*v` paths used by `Vec` indexing.
+- `Drop::drop` impl monomorphization now strips region generic args before
+  symbol/mir queries in drop-call paths.
+  - fixes the previous `GenericArgNotProvided` failure in
+    `std::sync::poison::mutex::MutexGuard::drop`.
+- Vtable impl lookup now uses shared cross-crate search (`find_trait_impl_for_simplified_ty`)
+  and includes closure-trait fallback wiring in `get_or_create_vtable`.
+  - resolves prior merge-conflict drift around dyn-trait/closure vtable construction.
 
 ## Tests Revived
 
@@ -89,21 +96,28 @@ What is in place:
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
   - `std_jit_env_set_var_smoke`
-    - fails while compiling `std::io::error::repr_bitpacked::Repr::drop`
-      with `local layout error: HasErrorType`
+    - currently fails while compiling `core::fmt::num::impl::fmt`
+      with `local layout error: HasErrorConst`
   - `std_jit_env_var_roundtrip`
     - currently fails at the same point as `env_set_var`:
-      `std::io::error::repr_bitpacked::Repr::drop` with `local layout error: HasErrorType`
+      `core::fmt::num::impl::fmt` with `local layout error: HasErrorConst`
   - `std_jit_mutex_lock_smoke`
-    - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+    - now fails deeper in atomic internals:
+      `core::sync::atomic::atomic_compare_exchange` with
+      `NotSupported("monomorphization resulted in errors")`
   - `std_jit_mutex_try_lock_smoke`
-    - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+    - now fails deeper in atomic internals:
+      `core::sync::atomic::atomic_compare_exchange` with
+      `NotSupported("monomorphization resulted in errors")`
   - `std_jit_once_call_once_smoke`
-    - fails with `no impl found for vtable`
+    - currently fails with `GenericArgNotProvided` on
+      `std::sys::sync::once::futex::CompletionGuard::drop`
+      (`LifetimeParamId ...`, empty generic args)
   - `std_jit_iter_repeat_take_collect_smoke`
-    - fails with `no impl found for vtable`
+    - last known failure was `no impl found for vtable` (not yet revalidated after
+      vtable-lookup merge)
   - `std_jit_refcell_replace_smoke`
-    - aborts with `SIGSEGV`
+    - last known behavior: aborts with `SIGSEGV` (not revalidated in latest batch)
 
 Validation recently run:
 
@@ -127,54 +141,71 @@ Validation recently run:
 - `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` passes
 - `just test-clif std_jit_string_push_str_smoke --run-ignored only --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
-  `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
+  `local layout error: HasErrorConst` in `core::fmt::num::impl::fmt`
 - `just test-clif -E 'test(std_jit_mutex_lock_smoke)' --no-capture` fails with
-  `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+  `NotSupported("monomorphization resulted in errors")` in
+  `core::sync::atomic::atomic_compare_exchange`
 - `just test-clif -j 24 -E 'test(std_jit_cell_set_get_smoke) or ... or test(std_jit_mutex_try_lock_smoke)' --run-ignored all --no-fail-fast`
   runs 12 tests concurrently in ~14s total: 8 passed, 4 failed
   (`std_jit_mutex_try_lock_smoke`, `std_jit_once_call_once_smoke`,
   `std_jit_iter_repeat_take_collect_smoke`, `std_jit_refcell_replace_smoke`)
 - `just test-clif std_jit_env_var_roundtrip --run-ignored only --no-capture` fails with
-  `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
+  `local layout error: HasErrorConst` in `core::fmt::num::impl::fmt`
+- `just test-clif -j 24 -E 'test(jit_dyn_dispatch) or test(jit_dyn_dispatch_multiple_methods) or test(jit_closure_basic) or test(jit_drop_basic) or test(jit_drop_side_effect) or test(jit_drop_no_drop_impl) or test(jit_drop_field_recursive) or test(jit_drop_generic) or test(std_jit_env_var_smoke)' --no-fail-fast`
+  runs 9 targeted tests: all pass
+- `just test-clif -j 24 -E 'test(std_jit_env_set_var_smoke) or test(std_jit_env_var_roundtrip) or test(std_jit_mutex_lock_smoke) or test(std_jit_mutex_try_lock_smoke) or test(std_jit_once_call_once_smoke)' --run-ignored all --no-fail-fast`
+  runs 5 ignored probes: all fail with current blockers listed above
 
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
 - `const_eval_select` runtime-arm signature collisions are no longer the blocker for Vec paths.
-- Primary remaining blocker is `HasErrorType` local-layout failures in deeper std internals.
-  - currently blocks both `std_jit_env_set_var_smoke` and `std_jit_env_var_roundtrip`
-    at `std::io::error::repr_bitpacked::Repr::drop`.
+- Primary remaining blockers now are:
+  - const/layout holes (`HasErrorConst`) in fmt/env-var paths
+    (`std_jit_env_set_var_smoke`, `std_jit_env_var_roundtrip`)
+  - monomorphization-with-error consts in atomic compare-exchange paths
+    (`std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`)
+  - lifetime/generic-arg propagation for some monomorphic drop impl lookups
+    (`std_jit_once_call_once_smoke` -> `CompletionGuard::drop`)
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
 
-1. Address `HasErrorType` layout holes in std IO error paths.
+1. Address `HasErrorConst` layout holes in fmt/env-var paths.
    - Primary repro target: `std_jit_env_set_var_smoke`.
-   - Secondary repro target: `std_jit_env_var_roundtrip` (now fails at the same site).
-   - Focus: why `repr_bitpacked::Repr::drop` local layout remains unresolved in mirdataless flow.
+   - Secondary repro target: `std_jit_env_var_roundtrip`.
+   - Focus: why `core::fmt::num::impl::fmt` locals still carry unresolved consts in
+     mirdataless flow.
 
-2. Unignore probes that now pass to keep regressions visible.
+2. Handle atomic compare-exchange monomorphization failures.
+   - Repro targets: `std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`.
+   - Focus: unresolved `{const error}` in intrinsic-heavy atomic bodies.
+
+3. Fix monomorphic drop call generic/lifetime propagation for std once internals.
+   - Repro target: `std_jit_once_call_once_smoke`.
+
+4. Unignore probes that now pass to keep regressions visible.
    - Candidate unignores: `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
-3. Re-run and unignore probes incrementally as each blocker is fixed.
+5. Re-run and unignore probes incrementally as each blocker is fixed.
    - Current state: `str_parse` and `vec_push` are unignored; `string_from` and
      `string_push_str` now pass but are still marked ignored.
 
-4. Expand coverage with more deterministic std probes once blockers are cleared.
+6. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.
 
-5. Improve sysroot loading ergonomics/perf for tests.
+7. Improve sysroot loading ergonomics/perf for tests.
    - Cache file discovery and/or loaded roots across tests when feasible.
    - Keep wall-time reasonable as std-smoke coverage grows.
 
-6. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
+8. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
    - Make it easy to run only mirdataless std-JIT smoke tests locally.
 
 ## Next Candidate To Debug
 
 - `std_jit_env_set_var_smoke`
-  - reason: smallest direct reproducer for the shared blocker in
-    `std::io::error::repr_bitpacked::Repr::drop` (`local layout error: HasErrorType`),
+  - reason: smallest direct reproducer for the current const/layout blocker in
+    `core::fmt::num::impl::fmt` (`local layout error: HasErrorConst`),
     and fixes here should also unblock `std_jit_env_var_roundtrip`.
 
 ## Non-Goals (Still True)

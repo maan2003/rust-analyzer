@@ -815,6 +815,8 @@ fn get_or_create_vtable(
         .collect();
     let num_methods = method_func_ids.len();
 
+    // Find the impl for this concrete type.
+    let krate = fx.local_crate();
     let interner = DbInterner::new_no_crate(fx.db());
 
     // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
@@ -822,18 +824,27 @@ fn get_or_create_vtable(
     let simplified =
         simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
             .expect("cannot simplify concrete type for vtable lookup");
-    let impl_id = find_trait_impl_for_simplified_ty(
-        fx.db(),
+    let impl_id = find_trait_impl_for_simplified_ty(fx.db(), trait_id, &simplified, krate);
+
+    // Closure traits (`Fn` / `FnMut` / `FnOnce`) are built-in and often don't
+    // show up as explicit impl items in TraitImpls. In that case, wire the
+    // vtable method slot directly to the closure body symbol.
+    let closure_fallback = if impl_id.is_none() {
+        match concrete_ty.as_ref().kind() {
+            TyKind::Closure(closure_id, closure_subst) => Some((closure_id.0, closure_subst.store())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    assert!(
+        impl_id.is_some() || closure_fallback.is_some(),
+        "no impl found for vtable: trait={:?}, concrete_ty={:?}, simplified={:?}",
         trait_id,
-        &simplified,
-        fx.local_crate(),
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "no impl found for vtable: trait={:?}, concrete_ty={:?}, simplified={:?}",
-            trait_id, concrete_ty, simplified
-        )
-    });
+        concrete_ty,
+        simplified
+    );
 
     // Build unique vtable name
     let vtable_name = format!(
@@ -872,49 +883,73 @@ fn get_or_create_vtable(
     data.define(vtable_bytes.into_boxed_slice());
 
     // Slot 3+: trait method fn ptrs — emit as relocations
-    let impl_items = impl_id.impl_items(fx.db());
-    for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
-        // Find the corresponding impl method by name
-        let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
-        let impl_func_id = impl_items
-            .items
-            .iter()
-            .find_map(|(name, item)| {
-                if *name == trait_method_name {
-                    match item {
-                        AssocItemId::FunctionId(fid) => Some(*fid),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                panic!("impl method `{}` not found for vtable", trait_method_name.as_str())
-            });
-
-        // Declare/import the impl function
-        let impl_body = fx
+    let impl_items = impl_id.map(|id| id.impl_items(fx.db()));
+    let closure_func_id = closure_fallback.map(|(closure_id, closure_subst)| {
+        let closure_body = fx
             .db()
-            .monomorphized_mir_body(
-                impl_func_id.into(),
-                GenericArgs::empty(interner).store(),
-                fx.env().clone(),
-            )
-            .expect("failed to get impl method MIR for vtable");
-        let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
-            .expect("impl method sig for vtable");
-        let impl_fn_name = symbol_mangling::mangle_function(
-            fx.db(),
-            impl_func_id,
-            GenericArgs::empty(interner),
-            fx.ext_crate_disambiguators(),
-        );
+            .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
+            .expect("failed to get closure MIR for vtable");
+        let closure_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
+            .expect("closure sig for vtable");
+        let closure_name =
+            symbol_mangling::mangle_closure(fx.db(), closure_id, fx.ext_crate_disambiguators());
+        fx.module
+            .declare_function(&closure_name, Linkage::Import, &closure_sig)
+            .expect("declare closure vtable method")
+    });
 
-        let func_id = fx
-            .module
-            .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
-            .expect("declare vtable method");
+    for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
+        let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
+        let func_id = if let Some(impl_items) = impl_items {
+            // Find the corresponding impl method by name.
+            let impl_func_id = impl_items
+                .items
+                .iter()
+                .find_map(|(name, item)| {
+                    if *name == trait_method_name {
+                        match item {
+                            AssocItemId::FunctionId(fid) => Some(*fid),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("impl method `{}` not found for vtable", trait_method_name.as_str())
+                });
+
+            // Declare/import the impl function.
+            let impl_body = fx
+                .db()
+                .monomorphized_mir_body(
+                    impl_func_id.into(),
+                    GenericArgs::empty(interner).store(),
+                    fx.env().clone(),
+                )
+                .expect("failed to get impl method MIR for vtable");
+            let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
+                .expect("impl method sig for vtable");
+            let impl_fn_name = symbol_mangling::mangle_function(
+                fx.db(),
+                impl_func_id,
+                GenericArgs::empty(interner),
+                fx.ext_crate_disambiguators(),
+            );
+
+            fx.module
+                .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
+                .expect("declare vtable method")
+        } else {
+            let closure_func_id = closure_func_id.expect("closure vtable method func id");
+            assert!(
+                matches!(trait_method_name.as_str(), "call" | "call_mut" | "call_once"),
+                "closure fallback cannot build vtable entry for trait method `{}`",
+                trait_method_name.as_str()
+            );
+            closure_func_id
+        };
+
         let func_ref = fx.module.declare_func_in_data(func_id, &mut data);
         data.write_function_addr(((3 + method_idx) * ptr_size) as u32, func_ref);
     }
@@ -2146,6 +2181,7 @@ fn store_call_result_and_jump(
     call: cranelift_codegen::ir::Inst,
     sret_slot: Option<CPlace>,
     dest: CPlace,
+    destination_place: &Place,
     target: &Option<BasicBlockId>,
 ) {
     if let Some(sret_slot) = sret_slot {
@@ -2168,6 +2204,12 @@ fn store_call_result_and_jump(
                 _ => {}
             }
         }
+    }
+
+    if target.is_some()
+        && destination_place.projection.lookup(&fx.ra_body().projection_store).is_empty()
+    {
+        fx.set_drop_flag(destination_place.local);
     }
 
     if let Some(target) = target {
@@ -2267,12 +2309,7 @@ fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: Bas
 
     let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
         // Simple case: just call Drop::drop directly
-        let adt_subst = match ty.as_ref().kind() {
-            TyKind::Adt(_, subst) => Some(subst.store()),
-            _ => None,
-        };
-        let interner = DbInterner::new_no_crate(fx.db());
-        let generic_args = adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+        let generic_args = drop_impl_generic_args(fx.db(), fx.local_crate(), &ty);
         symbol_mangling::mangle_function(
             fx.db(),
             drop_func_id,
@@ -2404,6 +2441,26 @@ fn resolve_drop_impl(
     None
 }
 
+/// Build generic args for calling a resolved `Drop::drop` impl method.
+///
+/// `TyKind::Adt` substitutions include regions, but impl-method
+/// monomorphization expects type/const entries only.
+fn drop_impl_generic_args(
+    db: &dyn HirDatabase,
+    local_crate: base_db::Crate,
+    ty: &StoredTy,
+) -> StoredGenericArgs {
+    let interner = DbInterner::new_with(db, local_crate);
+    match ty.as_ref().kind() {
+        TyKind::Adt(_, subst) => GenericArgs::new_from_iter(
+            interner,
+            subst.iter().filter(|arg| arg.region().is_none()),
+        )
+        .store(),
+        _ => GenericArgs::empty(interner).store(),
+    }
+}
+
 fn codegen_call(
     fx: &mut FunctionCx<'_, impl Module>,
     func: &Operand,
@@ -2473,6 +2530,10 @@ fn codegen_adt_constructor_call(
         let variant_idx = variant_id_to_idx(fx.db(), variant_id);
         let field_vals: Vec<_> = args.iter().map(|op| codegen_operand(fx, &op.kind)).collect();
         codegen_adt_fields(fx, variant_idx, &field_vals, dest);
+    }
+
+    if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+        fx.set_drop_flag(destination.local);
     }
 
     if let Some(target) = target {
@@ -2579,7 +2640,7 @@ fn codegen_fn_ptr_call(
 
     // Emit indirect call
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 /// Call a closure body directly.
@@ -2654,7 +2715,7 @@ fn codegen_closure_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 fn codegen_direct_call(
@@ -2740,6 +2801,24 @@ fn codegen_direct_call(
                         destination,
                         target,
                     );
+                    return;
+                }
+
+                // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often
+                // resolve to the blanket reference impl in `core::ops::function::impls`,
+                // but the actual runtime dispatch must still happen through the inner
+                // dyn vtable. Route those straight to virtual dispatch.
+                if let Some(self_pointee) = self_ty.builtin_deref(true)
+                    && self_pointee.dyn_trait() == Some(trait_id)
+                    && matches!(
+                        fx.db()
+                            .layout_of_ty(self_ty.store(), fx.env().clone())
+                            .expect("self layout for dyn ref dispatch")
+                            .backend_repr,
+                        BackendRepr::ScalarPair(_, _)
+                    )
+                {
+                    codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
                     return;
                 }
             }
@@ -2853,7 +2932,7 @@ fn codegen_direct_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -2975,7 +3054,7 @@ fn codegen_virtual_call(
     // Emit indirect call
     let sig_ref = fx.bcx.import_signature(sig);
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, target);
+    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
 }
 
 fn codegen_intrinsic_call(
@@ -3324,7 +3403,7 @@ fn codegen_intrinsic_call(
             }
 
             let call = fx.bcx.ins().call(callee_ref, &call_args);
-            store_call_result_and_jump(fx, call, sret_slot, dest, target);
+            store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
             return true;
         }
 
@@ -3650,6 +3729,9 @@ fn codegen_intrinsic_call(
             let ptr = src.force_stack(fx);
             let dest_val = CValue::by_ref(ptr, dest.layout.clone());
             dest.write_cvalue(fx, dest_val);
+            if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                fx.set_drop_flag(destination.local);
+            }
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
                 fx.bcx.ins().jump(block, &[]);
@@ -3689,6 +3771,10 @@ fn codegen_intrinsic_call(
         if !dest.layout.is_zst() {
             dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
         }
+    }
+
+    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+        fx.set_drop_flag(destination.local);
     }
 
     if let Some(target) = target {
@@ -4271,12 +4357,7 @@ fn compile_drop_in_place(
                 let mut drop_sig = Signature::new(isa.default_call_conv());
                 drop_sig.params.push(AbiParam::new(pointer_type));
 
-                let adt_subst = match ty.as_ref().kind() {
-                    TyKind::Adt(_, subst) => Some(subst.store()),
-                    _ => None,
-                };
-                let generic_args =
-                    adt_subst.unwrap_or_else(|| GenericArgs::empty(interner).store());
+                let generic_args = drop_impl_generic_args(db, local_crate, ty);
                 let drop_fn_name = symbol_mangling::mangle_function(
                     db,
                     drop_func_id,
@@ -4597,10 +4678,7 @@ fn collect_drop_info(
     let lang_items = hir_def::lang_item::lang_items(db, local_crate);
     if let Some(drop_trait) = lang_items.Drop {
         if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
-            let drop_args = match ty.as_ref().kind() {
-                TyKind::Adt(_, subst) => subst.store(),
-                _ => GenericArgs::empty(interner).store(),
-            };
+            let drop_args = drop_impl_generic_args(db, local_crate, ty);
             fn_queue.push_back((drop_func_id, drop_args));
         }
     }
