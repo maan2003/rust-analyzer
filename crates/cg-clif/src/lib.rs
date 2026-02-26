@@ -10,7 +10,8 @@ use std::sync::Arc;
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, ArgumentPurpose, Block, InstBuilder, MemFlags, Signature, Type, Value, types,
+    AbiParam, ArgumentPurpose, AtomicRmwOp, Block, InstBuilder, MemFlags, Signature, Type, Value,
+    types,
 };
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -462,6 +463,25 @@ pub(crate) fn bin_op_to_floatcc(op: &BinOp) -> FloatCC {
 
 fn ty_is_signed_int(ty: StoredTy) -> bool {
     matches!(ty.as_ref().kind(), TyKind::Int(_))
+}
+
+fn ty_is_atomic_int_or_ptr(ty: &StoredTy) -> bool {
+    matches!(ty.as_ref().kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::RawPtr(_, _))
+}
+
+fn ty_is_atomic_int(ty: &StoredTy) -> bool {
+    matches!(ty.as_ref().kind(), TyKind::Int(_) | TyKind::Uint(_))
+}
+
+fn ty_is_atomic_unsigned_int(ty: &StoredTy) -> bool {
+    matches!(ty.as_ref().kind(), TyKind::Uint(_))
+}
+
+fn atomic_scalar_clif_ty(dl: &TargetDataLayout, layout: &Layout) -> Type {
+    let BackendRepr::Scalar(scalar) = layout.backend_repr else {
+        panic!("atomic intrinsic expects scalar layout, got {:?}", layout.backend_repr);
+    };
+    scalar_to_clif_type(dl, &scalar)
 }
 
 pub(crate) fn codegen_intcast(
@@ -3780,17 +3800,192 @@ fn codegen_intrinsic_call(
             return true;
         }
 
-        // --- atomic fence (no-op for single-threaded JIT) ---
-        "atomic_fence_seqcst"
-        | "atomic_fence_acquire"
-        | "atomic_fence_release"
-        | "atomic_fence_acqrel"
-        | "atomic_singlethreadfence_seqcst"
-        | "atomic_singlethreadfence_acquire"
-        | "atomic_singlethreadfence_release"
-        | "atomic_singlethreadfence_acqrel" => {
+        // --- atomics ---
+        _ if name == "atomic_fence"
+            || name.starts_with("atomic_fence_")
+            || name == "atomic_singlethreadfence"
+            || name.starts_with("atomic_singlethreadfence_") =>
+        {
+            assert_eq!(args.len(), 0, "{name} intrinsic expects 0 args");
             fx.bcx.ins().fence();
             None
+        }
+        "atomic_load" => {
+            assert_eq!(args.len(), 1, "atomic_load intrinsic expects 1 arg");
+
+            let ty = generic_ty.expect("atomic_load requires a type generic arg");
+            if !ty_is_atomic_int_or_ptr(&ty) {
+                panic!("atomic_load requires integer or raw pointer type, got {:?}", ty);
+            }
+            let layout = generic_ty_layout.clone().expect("atomic_load: layout error");
+            let clif_ty = atomic_scalar_clif_ty(fx.dl, &layout);
+            if clif_ty == types::I128 {
+                panic!("128-bit atomics are not yet supported");
+            }
+
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            Some(fx.bcx.ins().atomic_load(clif_ty, MemFlags::trusted(), ptr))
+        }
+        "atomic_store" => {
+            assert_eq!(args.len(), 2, "atomic_store intrinsic expects 2 args");
+
+            let ty = generic_ty.expect("atomic_store requires a type generic arg");
+            if !ty_is_atomic_int_or_ptr(&ty) {
+                panic!("atomic_store requires integer or raw pointer type, got {:?}", ty);
+            }
+            let layout = generic_ty_layout.clone().expect("atomic_store: layout error");
+            let clif_ty = atomic_scalar_clif_ty(fx.dl, &layout);
+            if clif_ty == types::I128 {
+                panic!("128-bit atomics are not yet supported");
+            }
+
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let val = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            if fx.bcx.func.dfg.value_type(val) != clif_ty {
+                panic!(
+                    "atomic_store value type mismatch: expected {clif_ty:?}, got {:?}",
+                    fx.bcx.func.dfg.value_type(val)
+                );
+            }
+
+            fx.bcx.ins().atomic_store(MemFlags::trusted(), val, ptr);
+            None
+        }
+        "atomic_xchg" => {
+            assert_eq!(args.len(), 2, "atomic_xchg intrinsic expects 2 args");
+
+            let ty = generic_ty.expect("atomic_xchg requires a type generic arg");
+            if !ty_is_atomic_int_or_ptr(&ty) {
+                panic!("atomic_xchg requires integer or raw pointer type, got {:?}", ty);
+            }
+            let layout = generic_ty_layout.clone().expect("atomic_xchg: layout error");
+            let clif_ty = atomic_scalar_clif_ty(fx.dl, &layout);
+            if clif_ty == types::I128 {
+                panic!("128-bit atomics are not yet supported");
+            }
+
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let new = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            if fx.bcx.func.dfg.value_type(new) != clif_ty {
+                panic!(
+                    "atomic_xchg value type mismatch: expected {clif_ty:?}, got {:?}",
+                    fx.bcx.func.dfg.value_type(new)
+                );
+            }
+
+            Some(fx.bcx.ins().atomic_rmw(clif_ty, MemFlags::trusted(), AtomicRmwOp::Xchg, ptr, new))
+        }
+        "atomic_cxchg" | "atomic_cxchgweak" => {
+            assert_eq!(args.len(), 3, "{name} intrinsic expects 3 args");
+
+            let ty = generic_ty.expect("atomic_cxchg requires a type generic arg");
+            if !ty_is_atomic_int_or_ptr(&ty) {
+                panic!("{name} requires integer or raw pointer type, got {:?}", ty);
+            }
+            let layout = generic_ty_layout.clone().expect("atomic_cxchg: layout error");
+            let clif_ty = atomic_scalar_clif_ty(fx.dl, &layout);
+            if clif_ty == types::I128 {
+                panic!("128-bit atomics are not yet supported");
+            }
+
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let test_old = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let new = codegen_operand(fx, &args[2].kind).load_scalar(fx);
+            if fx.bcx.func.dfg.value_type(test_old) != clif_ty {
+                panic!(
+                    "{name} expected compare value type {clif_ty:?}, got {:?}",
+                    fx.bcx.func.dfg.value_type(test_old)
+                );
+            }
+            if fx.bcx.func.dfg.value_type(new) != clif_ty {
+                panic!(
+                    "{name} expected new value type {clif_ty:?}, got {:?}",
+                    fx.bcx.func.dfg.value_type(new)
+                );
+            }
+
+            let old = fx.bcx.ins().atomic_cas(MemFlags::trusted(), ptr, test_old, new);
+            let is_eq = fx.bcx.ins().icmp(IntCC::Equal, old, test_old);
+
+            let dest = codegen_place(fx, destination);
+            let BackendRepr::ScalarPair(_, success_scalar) = dest.layout.backend_repr else {
+                panic!("{name} intrinsic must return ScalarPair");
+            };
+            let success_ty = scalar_to_clif_type(fx.dl, &success_scalar);
+            let success = if fx.bcx.func.dfg.value_type(is_eq) == success_ty {
+                is_eq
+            } else {
+                let one = fx.bcx.ins().iconst(success_ty, 1);
+                let zero = fx.bcx.ins().iconst(success_ty, 0);
+                fx.bcx.ins().select(is_eq, one, zero)
+            };
+
+            dest.write_cvalue(fx, CValue::by_val_pair(old, success, dest.layout.clone()));
+            if target.is_some()
+                && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+            {
+                fx.set_drop_flag(destination.local);
+            }
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
+        "atomic_xadd"
+        | "atomic_xsub"
+        | "atomic_and"
+        | "atomic_or"
+        | "atomic_xor"
+        | "atomic_nand"
+        | "atomic_max"
+        | "atomic_umax"
+        | "atomic_min"
+        | "atomic_umin" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+
+            let ty = generic_ty.expect("atomic rmw intrinsic requires a type generic arg");
+            let valid_ty = match name {
+                "atomic_xadd" | "atomic_xsub" | "atomic_and" | "atomic_or" | "atomic_xor"
+                | "atomic_nand" => ty_is_atomic_int(&ty),
+                "atomic_max" | "atomic_min" => ty_is_signed_int(ty.clone()),
+                "atomic_umax" | "atomic_umin" => ty_is_atomic_unsigned_int(&ty),
+                _ => unreachable!(),
+            };
+            if !valid_ty {
+                panic!("{name} received unsupported type {:?}", ty);
+            }
+
+            let layout = generic_ty_layout.clone().expect("atomic rmw: layout error");
+            let clif_ty = atomic_scalar_clif_ty(fx.dl, &layout);
+            if clif_ty == types::I128 {
+                panic!("128-bit atomics are not yet supported");
+            }
+
+            let ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let src = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            if fx.bcx.func.dfg.value_type(src) != clif_ty {
+                panic!(
+                    "{name} value type mismatch: expected {clif_ty:?}, got {:?}",
+                    fx.bcx.func.dfg.value_type(src)
+                );
+            }
+
+            let op = match name {
+                "atomic_xadd" => AtomicRmwOp::Add,
+                "atomic_xsub" => AtomicRmwOp::Sub,
+                "atomic_and" => AtomicRmwOp::And,
+                "atomic_or" => AtomicRmwOp::Or,
+                "atomic_xor" => AtomicRmwOp::Xor,
+                "atomic_nand" => AtomicRmwOp::Nand,
+                "atomic_max" => AtomicRmwOp::Smax,
+                "atomic_umax" => AtomicRmwOp::Umax,
+                "atomic_min" => AtomicRmwOp::Smin,
+                "atomic_umin" => AtomicRmwOp::Umin,
+                _ => unreachable!(),
+            };
+
+            Some(fx.bcx.ins().atomic_rmw(clif_ty, MemFlags::trusted(), op, ptr, src))
         }
 
         _ => {

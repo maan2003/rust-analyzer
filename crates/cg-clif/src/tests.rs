@@ -2727,6 +2727,24 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_atomic_u32_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::sync::atomic::{AtomicU32, Ordering};
+
+fn foo() -> i32 {
+    let x = AtomicU32::new(5);
+    let prev = x.fetch_add(3, Ordering::AcqRel);
+    let exchanged = x.compare_exchange(8, 9, Ordering::SeqCst, Ordering::Relaxed).is_ok();
+    ((prev == 5) && exchanged && (x.load(Ordering::Acquire) == 9)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn std_jit_cmp_max_min_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
