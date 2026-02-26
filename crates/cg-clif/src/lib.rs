@@ -1006,6 +1006,8 @@ fn get_or_create_vtable(
 
     // Slot 3+: trait method fn ptrs — emit as relocations
     let impl_items = impl_id.map(|id| id.impl_items(fx.db()));
+    let impl_generic_args = impl_id
+        .map(|id| infer_impl_generic_args_from_concrete_self_ty(fx.db(), krate, id, &concrete_ty));
     let closure_func_id = closure_fallback.map(|(closure_id, closure_subst)| {
         let closure_body = fx
             .db()
@@ -1042,11 +1044,13 @@ fn get_or_create_vtable(
                 });
 
             // Declare/import the impl function.
+            let impl_generic_args =
+                impl_generic_args.as_ref().expect("missing impl generic args for vtable").as_ref();
             let impl_body = fx
                 .db()
                 .monomorphized_mir_body(
                     impl_func_id.into(),
-                    GenericArgs::empty(interner).store(),
+                    impl_generic_args.store(),
                     fx.env().clone(),
                 )
                 .expect("failed to get impl method MIR for vtable");
@@ -1055,7 +1059,7 @@ fn get_or_create_vtable(
             let impl_fn_name = symbol_mangling::mangle_function(
                 fx.db(),
                 impl_func_id,
-                GenericArgs::empty(interner),
+                impl_generic_args,
                 fx.ext_crate_disambiguators(),
             );
 
@@ -2725,6 +2729,126 @@ fn drop_impl_generic_args(
         }
         _ => GenericArgs::empty(interner).store(),
     }
+}
+
+/// Infer impl generic args by matching impl `Self` type parameters against a
+/// concrete `Self` type. This is used for vtable method monomorphization.
+fn infer_impl_generic_args_from_concrete_self_ty(
+    db: &dyn HirDatabase,
+    local_crate: base_db::Crate,
+    impl_id: hir_def::ImplId,
+    concrete_self_ty: &StoredTy,
+) -> StoredGenericArgs {
+    fn record_param_arg<'db>(
+        args_by_index: &mut Vec<Option<hir_ty::next_solver::GenericArg<'db>>>,
+        index: u32,
+        arg: hir_ty::next_solver::GenericArg<'db>,
+    ) {
+        let idx = index as usize;
+        if args_by_index.len() <= idx {
+            args_by_index.resize_with(idx + 1, || None);
+        }
+        if let Some(existing) = args_by_index[idx]
+            && existing != arg
+        {
+            return;
+        }
+        args_by_index[idx] = Some(arg);
+    }
+
+    fn collect_const_param_args<'db>(
+        pattern: Const<'db>,
+        concrete: Const<'db>,
+        args_by_index: &mut Vec<Option<hir_ty::next_solver::GenericArg<'db>>>,
+    ) {
+        if let ConstKind::Param(param) = pattern.kind() {
+            record_param_arg(args_by_index, param.index, concrete.into());
+        }
+    }
+
+    fn collect_ty_param_args<'db>(
+        pattern: hir_ty::next_solver::Ty<'db>,
+        concrete: hir_ty::next_solver::Ty<'db>,
+        args_by_index: &mut Vec<Option<hir_ty::next_solver::GenericArg<'db>>>,
+    ) {
+        if let TyKind::Param(param) = pattern.kind() {
+            record_param_arg(args_by_index, param.index, concrete.into());
+            return;
+        }
+
+        match (pattern.kind(), concrete.kind()) {
+            (TyKind::Adt(pattern_adt, pattern_args), TyKind::Adt(concrete_adt, concrete_args))
+                if pattern_adt == concrete_adt =>
+            {
+                for (pattern_arg, concrete_arg) in pattern_args.iter().zip(concrete_args.iter()) {
+                    match (pattern_arg.ty(), concrete_arg.ty()) {
+                        (Some(pattern_ty), Some(concrete_ty)) => {
+                            collect_ty_param_args(pattern_ty, concrete_ty, args_by_index);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    match (pattern_arg.konst(), concrete_arg.konst()) {
+                        (Some(pattern_const), Some(concrete_const)) => {
+                            collect_const_param_args(pattern_const, concrete_const, args_by_index);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (TyKind::Tuple(pattern_tys), TyKind::Tuple(concrete_tys)) => {
+                for (pattern_ty, concrete_ty) in pattern_tys.iter().zip(concrete_tys.iter()) {
+                    collect_ty_param_args(pattern_ty, concrete_ty, args_by_index);
+                }
+            }
+            (
+                TyKind::Ref(_, pattern_inner, pattern_mut),
+                TyKind::Ref(_, concrete_inner, concrete_mut),
+            ) if pattern_mut == concrete_mut => {
+                collect_ty_param_args(pattern_inner, concrete_inner, args_by_index);
+            }
+            (
+                TyKind::RawPtr(pattern_inner, pattern_mut),
+                TyKind::RawPtr(concrete_inner, concrete_mut),
+            ) if pattern_mut == concrete_mut => {
+                collect_ty_param_args(pattern_inner, concrete_inner, args_by_index);
+            }
+            (
+                TyKind::Array(pattern_elem, pattern_len),
+                TyKind::Array(concrete_elem, concrete_len),
+            ) => {
+                collect_ty_param_args(pattern_elem, concrete_elem, args_by_index);
+                collect_const_param_args(pattern_len, concrete_len, args_by_index);
+            }
+            (TyKind::Slice(pattern_elem), TyKind::Slice(concrete_elem)) => {
+                collect_ty_param_args(pattern_elem, concrete_elem, args_by_index);
+            }
+            _ => {}
+        }
+    }
+
+    let interner = DbInterner::new_with(db, local_crate);
+    let mut args_by_index: Vec<Option<hir_ty::next_solver::GenericArg<'_>>> = Vec::new();
+    collect_ty_param_args(
+        db.impl_self_ty(impl_id).skip_binder(),
+        concrete_self_ty.as_ref(),
+        &mut args_by_index,
+    );
+
+    if args_by_index.iter().any(Option::is_none) {
+        // Fallback for common impls where `Self` is an ADT and all impl type/const
+        // params come directly from ADT substitutions.
+        if let TyKind::Adt(_, subst) = concrete_self_ty.as_ref().kind() {
+            return GenericArgs::new_from_iter(
+                interner,
+                subst.iter().filter(|arg| arg.region().is_none()),
+            )
+            .store();
+        }
+        return GenericArgs::empty(interner).store();
+    }
+
+    GenericArgs::new_from_iter(interner, args_by_index.into_iter().flatten()).store()
 }
 
 fn codegen_call(
@@ -4752,7 +4876,6 @@ fn collect_vtable_methods(
     operand: &Operand,
     target_ty: &StoredTy,
     local_crate: base_db::Crate,
-    empty_args: &StoredGenericArgs,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
 ) {
     // Extract the trait from the target type
@@ -4766,6 +4889,7 @@ fn collect_vtable_methods(
     // Find the impl for this concrete type
     let interner = DbInterner::new_no_crate(db);
     use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
+    let source_pointee_stored = source_pointee.store();
     let Some(simplified) =
         simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer)
     else {
@@ -4775,6 +4899,12 @@ fn collect_vtable_methods(
     else {
         return;
     };
+    let impl_generic_args = infer_impl_generic_args_from_concrete_self_ty(
+        db,
+        local_crate,
+        impl_id,
+        &source_pointee_stored,
+    );
 
     // Add all trait method implementations to the queue
     let trait_items = trait_id.trait_items(db);
@@ -4785,7 +4915,7 @@ fn collect_vtable_methods(
         for (impl_name, impl_item) in impl_items.items.iter() {
             if impl_name == trait_method_name {
                 if let AssocItemId::FunctionId(impl_func_id) = impl_item {
-                    queue.push_back((*impl_func_id, empty_args.clone()));
+                    queue.push_back((*impl_func_id, impl_generic_args.clone()));
                 }
             }
         }
@@ -5034,7 +5164,6 @@ where
 
     let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
     let empty_args = GenericArgs::empty(interner).store();
-    let empty_args_stored = empty_args.clone();
 
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -5086,7 +5215,6 @@ where
             &body,
             interner,
             local_crate,
-            &empty_args_stored,
             &mut queue,
             &mut closure_visited,
             &mut closure_result,
@@ -5110,7 +5238,6 @@ where
             &closure_body,
             interner,
             local_crate,
-            &empty_args_stored,
             &mut queue,
             &mut closure_visited,
             &mut closure_result,
@@ -5148,7 +5275,6 @@ where
                 &body,
                 interner,
                 local_crate,
-                &empty_args_stored,
                 &mut queue,
                 &mut closure_visited,
                 &mut closure_result,
@@ -5249,7 +5375,6 @@ fn scan_body_for_callees(
     body: &MirBody,
     interner: DbInterner,
     local_crate: base_db::Crate,
-    empty_args_stored: &StoredGenericArgs,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
     closure_visited: &mut std::collections::HashSet<(
         hir_ty::db::InternedClosureId,
@@ -5275,7 +5400,6 @@ fn scan_body_for_callees(
                                 operand,
                                 target_ty,
                                 local_crate,
-                                empty_args_stored,
                                 queue,
                             );
                         }
