@@ -399,7 +399,7 @@ fn cfg_select_expand(
     let cfg_options = loc.krate.cfg_options(db);
 
     let mut iter = tt.iter();
-    let mut expand_to = None;
+    let mut expand_to: Option<tt::TopSubtree> = None;
     while let Some(next) = iter.peek() {
         let active = if let tt::TtElement::Leaf(tt::Leaf::Ident(ident)) = next
             && ident.sym == sym::underscore
@@ -420,7 +420,16 @@ fn cfg_select_expand(
             }
         }
         let expand_to_if_active = match iter.next() {
-            Some(tt::TtElement::Subtree(_, tt)) => tt.remaining(),
+            Some(tt::TtElement::Subtree(_, tt)) => {
+                let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
+                builder.extend_with_tt(tt.remaining());
+                builder.build()
+            }
+            Some(tt::TtElement::Leaf(leaf)) => {
+                let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
+                builder.push(leaf);
+                builder.build()
+            }
             _ => {
                 let err_span = iter.peek().map(|it| it.first_span()).unwrap_or(span);
                 return ExpandResult::new(
@@ -433,17 +442,16 @@ fn cfg_select_expand(
         if expand_to.is_none() && active {
             expand_to = Some(expand_to_if_active);
         }
+
+        // `cfg_select!` arms may be comma-separated (including a trailing comma).
+        if let Some(tt::TtElement::Leaf(tt::Leaf::Punct(punct))) = iter.peek()
+            && punct.char == ','
+        {
+            iter.next();
+        }
     }
     match expand_to {
-        Some(expand_to) => {
-            let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter {
-                kind: tt::DelimiterKind::Invisible,
-                open: span,
-                close: span,
-            });
-            builder.extend_with_tt(expand_to);
-            ExpandResult::ok(builder.build())
-        }
+        Some(expand_to) => ExpandResult::ok(expand_to),
         None => ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
             ExpandError::other(

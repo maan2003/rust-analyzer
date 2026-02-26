@@ -569,6 +569,18 @@ cfg_select! {
 }
 
 cfg_select! {
+    false => { fn false_2_comma() {} },
+    _ => { fn true_2_comma() {} },
+}
+
+fn leaf_expr_case() {
+    let _ = cfg_select! {
+        false => 1,
+        _ => 2,
+    };
+}
+
+cfg_select! {
     false => { fn false_3() {} }
 }
 
@@ -588,6 +600,12 @@ pub macro cfg_select($($tt:tt)*) {}
 fn true_1() {}
 
 fn true_2() {}
+
+fn true_2_comma() {}
+
+fn leaf_expr_case() {
+    let _ = 2;
+}
 
 /* error: none of the predicates in this `cfg_select` evaluated to true */
 
