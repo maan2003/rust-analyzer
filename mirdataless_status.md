@@ -83,17 +83,17 @@ What is in place:
   - `std_jit_array_deref_to_slice_smoke`
   - `std_jit_env_var_smoke`
   - `std_jit_str_parse_i32_smoke` (now unignored and passing)
+  - `std_jit_string_from_smoke` (passes under `--run-ignored only`; ignore annotation is stale)
+  - `std_jit_string_push_str_smoke` (passes under `--run-ignored only`; currently kept as probe)
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
-  - `std_jit_string_from_smoke`
-    - currently aborts at runtime with allocator double-free (`free(): double free detected in tcache 2`)
   - `std_jit_env_set_var_smoke`
     - fails while compiling `std::io::error::repr_bitpacked::Repr::drop`
       with `local layout error: HasErrorType`
   - `std_jit_env_var_roundtrip`
-    - currently fails in `std::io::error::repr_bitpacked::Repr::drop`
-      with `local layout error: HasErrorType`
+    - currently fails at the same point as `env_set_var`:
+      `std::io::error::repr_bitpacked::Repr::drop` with `local layout error: HasErrorType`
   - `std_jit_mutex_lock_smoke`
     - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
   - `std_jit_mutex_try_lock_smoke`
@@ -124,8 +124,8 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_refcell_borrow_mut_smoke)' --no-capture` passes
-- `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` aborts with
-  `free(): double free detected in tcache 2`
+- `just test-clif std_jit_string_from_smoke --run-ignored only --no-capture` passes
+- `just test-clif std_jit_string_push_str_smoke --run-ignored only --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_set_var_smoke)' --no-capture` fails with
   `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
 - `just test-clif -E 'test(std_jit_mutex_lock_smoke)' --no-capture` fails with
@@ -134,44 +134,48 @@ Validation recently run:
   runs 12 tests concurrently in ~14s total: 8 passed, 4 failed
   (`std_jit_mutex_try_lock_smoke`, `std_jit_once_call_once_smoke`,
   `std_jit_iter_repeat_take_collect_smoke`, `std_jit_refcell_replace_smoke`)
+- `just test-clif std_jit_env_var_roundtrip --run-ignored only --no-capture` fails with
+  `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
 
 ## What Is Still Missing
 
 - Coverage improved, but many real std paths are still gated by a few backend gaps.
 - `const_eval_select` runtime-arm signature collisions are no longer the blocker for Vec paths.
-- `String::from` still hits a runtime ownership/deallocation bug (double free).
-- ScalarPair constant materialization is still incomplete for non-value const forms.
-  - currently blocks `std_jit_env_var_roundtrip`.
-- Some std paths still hit `HasErrorType` layout failures in deeper std internals.
-  - currently blocks `std_jit_env_set_var_smoke` (`std::io::error::repr_bitpacked::Repr::drop`).
+- Primary remaining blocker is `HasErrorType` local-layout failures in deeper std internals.
+  - currently blocks both `std_jit_env_set_var_smoke` and `std_jit_env_var_roundtrip`
+    at `std::io::error::repr_bitpacked::Repr::drop`.
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
 
-1. Fix the `String::from` runtime double-free.
-   - Repro target: `std_jit_string_from_smoke`.
-   - Focus: ownership/drop paths across std string construction and drop glue.
+1. Address `HasErrorType` layout holes in std IO error paths.
+   - Primary repro target: `std_jit_env_set_var_smoke`.
+   - Secondary repro target: `std_jit_env_var_roundtrip` (now fails at the same site).
+   - Focus: why `repr_bitpacked::Repr::drop` local layout remains unresolved in mirdataless flow.
 
-2. Complete ScalarPair constant lowering for non-value const forms.
-   - Repro target: `std_jit_env_var_roundtrip`.
-   - Goal: support the const shapes used by `std::env` result/error paths.
+2. Unignore probes that now pass to keep regressions visible.
+   - Candidate unignores: `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
-3. Address `HasErrorType` layout holes in std IO error paths.
-   - Repro target: `std_jit_env_set_var_smoke`.
-   - Focus: why `repr_bitpacked::Repr::drop` local layout still unresolved in mirdataless flow.
+3. Re-run and unignore probes incrementally as each blocker is fixed.
+   - Current state: `str_parse` and `vec_push` are unignored; `string_from` and
+     `string_push_str` now pass but are still marked ignored.
 
-4. Re-run and unignore probes incrementally as each blocker is fixed.
-   - Current state: `str_parse` and `vec_push` are unignored; `string_from` remains blocked.
-
-5. Expand coverage with more deterministic std probes once blockers are cleared.
+4. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.
 
-6. Improve sysroot loading ergonomics/perf for tests.
+5. Improve sysroot loading ergonomics/perf for tests.
    - Cache file discovery and/or loaded roots across tests when feasible.
    - Keep wall-time reasonable as std-smoke coverage grows.
 
-7. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
+6. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
    - Make it easy to run only mirdataless std-JIT smoke tests locally.
+
+## Next Candidate To Debug
+
+- `std_jit_env_set_var_smoke`
+  - reason: smallest direct reproducer for the shared blocker in
+    `std::io::error::repr_bitpacked::Repr::drop` (`local layout error: HasErrorType`),
+    and fixes here should also unblock `std_jit_env_var_roundtrip`.
 
 ## Non-Goals (Still True)
 
