@@ -16,13 +16,13 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use either::Either;
-use hir_def::signatures::FunctionSignature;
+use hir_def::signatures::{FunctionSignature, StaticFlags};
 use hir_def::{
-    AssocItemId, CallableDefId, GeneralConstId, HasModule, ItemContainerId, Lookup, TraitId,
-    VariantId,
+    AssocItemId, CallableDefId, GeneralConstId, HasModule, ItemContainerId, Lookup, StaticId,
+    TraitId, VariantId,
 };
 use hir_ty::PointerCast;
 use hir_ty::consteval::{try_const_usize, usize_const};
@@ -40,7 +40,7 @@ use hir_ty::traits::StoredParamEnvAndCrate;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 use rustc_type_ir::elaborate::supertrait_def_ids;
-use rustc_type_ir::inherent::{GenericArgs as _, Ty as _};
+use rustc_type_ir::inherent::{GenericArgs as _, Region as _, Ty as _};
 use triomphe::Arc as TArc;
 
 pub mod link;
@@ -314,8 +314,24 @@ fn operand_ty(db: &dyn HirDatabase, body: &MirBody, kind: &OperandKind) -> Store
     match kind {
         OperandKind::Constant { ty, .. } => ty.clone(),
         OperandKind::Copy(place) | OperandKind::Move(place) => place_ty(db, body, place),
-        OperandKind::Static(_) => todo!("static operand type"),
+        OperandKind::Static(static_id) => static_operand_ty(db, *static_id),
     }
+}
+
+fn static_pointee_ty(db: &dyn HirDatabase, static_id: StaticId) -> hir_ty::next_solver::Ty<'_> {
+    hir_ty::InferenceResult::for_body(db, static_id.into())
+        .expr_ty(db.body(static_id.into()).body_expr)
+}
+
+fn static_operand_ty(db: &dyn HirDatabase, static_id: StaticId) -> StoredTy {
+    let interner = DbInterner::new_no_crate(db);
+    hir_ty::next_solver::Ty::new_ref(
+        interner,
+        hir_ty::next_solver::Region::new_static(interner),
+        static_pointee_ty(db, static_id),
+        hir_ty::next_solver::Mutability::Not,
+    )
+    .store()
 }
 
 fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
@@ -386,7 +402,8 @@ fn size_and_align_of_pointee(
     metadata: Option<Value>,
 ) -> (Value, Value) {
     let static_size = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.size.bytes() as i64);
-    let static_align = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
+    let static_align =
+        fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
 
     let tail_ty = unsized_tail_ty(fx.db(), pointee_ty);
     let (tail_size, tail_align) = match tail_ty.as_ref().kind() {
@@ -394,10 +411,7 @@ fn size_and_align_of_pointee(
             let vtable = metadata.expect("size/align_of_val(dyn) requires metadata");
             let ptr_size = fx.dl.pointer_size().bytes() as i32;
             let size = fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), vtable, ptr_size);
-            let align = fx
-                .bcx
-                .ins()
-                .load(fx.pointer_type, vtable_memflags(), vtable, ptr_size * 2);
+            let align = fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), vtable, ptr_size * 2);
             (Some(size), Some(align))
         }
         TyKind::Slice(elem_ty) => {
@@ -899,7 +913,9 @@ fn get_or_create_vtable(
     // vtable method slot directly to the closure body symbol.
     let closure_fallback = if impl_id.is_none() {
         match concrete_ty.as_ref().kind() {
-            TyKind::Closure(closure_id, closure_subst) => Some((closure_id.0, closure_subst.store())),
+            TyKind::Closure(closure_id, closure_subst) => {
+                Some((closure_id.0, closure_subst.store()))
+            }
             _ => None,
         }
     } else {
@@ -1221,66 +1237,68 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 );
                 cur_ty = elem_ty;
             }
-            ProjectionElem::Subslice { from, to } => {
-                match cur_ty.as_ref().kind() {
-                    TyKind::Array(elem_ty, len) => {
-                        let elem_layout = fx
-                            .db()
-                            .layout_of_ty(elem_ty.store(), fx.env().clone())
-                            .expect("array subslice elem layout");
+            ProjectionElem::Subslice { from, to } => match cur_ty.as_ref().kind() {
+                TyKind::Array(elem_ty, len) => {
+                    let elem_layout = fx
+                        .db()
+                        .layout_of_ty(elem_ty.store(), fx.env().clone())
+                        .expect("array subslice elem layout");
 
-                        if cplace.is_register() {
-                            let cval = cplace.to_cvalue(fx);
-                            let ptr = cval.force_stack(fx);
-                            cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
-                        }
-
-                        let from_bytes = i64::try_from(*from)
-                            .unwrap()
-                            .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
-                            .expect("array subslice offset overflow");
-                        let base_ptr = cplace.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
-
-                        let new_len = try_const_usize(fx.db(), len)
-                            .and_then(|n| n.checked_sub(u128::from(*from + *to)));
-                        let new_len_const = usize_const(fx.db(), new_len, fx.local_crate());
-                        let interner = DbInterner::new_no_crate(fx.db());
-                        let subslice_ty =
-                            hir_ty::next_solver::Ty::new_array_with_const_len(interner, elem_ty, new_len_const);
-                        let subslice_layout = fx
-                            .db()
-                            .layout_of_ty(subslice_ty.store(), fx.env().clone())
-                            .expect("array subslice layout");
-
-                        cplace = CPlace::for_ptr(base_ptr, subslice_layout);
-                        cur_ty = subslice_ty.store();
+                    if cplace.is_register() {
+                        let cval = cplace.to_cvalue(fx);
+                        let ptr = cval.force_stack(fx);
+                        cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                     }
-                    TyKind::Slice(elem_ty) => {
-                        let elem_layout = fx
-                            .db()
-                            .layout_of_ty(elem_ty.store(), fx.env().clone())
-                            .expect("slice subslice elem layout");
-                        let (ptr, len) = cplace.to_ptr_unsized();
-                        let from_bytes = i64::try_from(*from)
-                            .unwrap()
-                            .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
-                            .expect("slice subslice offset overflow");
-                        let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
-                        let total_trim = i64::try_from(*from + *to).unwrap();
-                        let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
-                        cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
-                    }
-                    TyKind::Str => {
-                        let (ptr, len) = cplace.to_ptr_unsized();
-                        let from_bytes = i64::try_from(*from).unwrap();
-                        let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
-                        let total_trim = i64::try_from(*from + *to).unwrap();
-                        let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
-                        cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
-                    }
-                    _ => panic!("Subslice projection on non-array/slice/str type"),
+
+                    let from_bytes = i64::try_from(*from)
+                        .unwrap()
+                        .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
+                        .expect("array subslice offset overflow");
+                    let base_ptr =
+                        cplace.to_ptr().offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+
+                    let new_len = try_const_usize(fx.db(), len)
+                        .and_then(|n| n.checked_sub(u128::from(*from + *to)));
+                    let new_len_const = usize_const(fx.db(), new_len, fx.local_crate());
+                    let interner = DbInterner::new_no_crate(fx.db());
+                    let subslice_ty = hir_ty::next_solver::Ty::new_array_with_const_len(
+                        interner,
+                        elem_ty,
+                        new_len_const,
+                    );
+                    let subslice_layout = fx
+                        .db()
+                        .layout_of_ty(subslice_ty.store(), fx.env().clone())
+                        .expect("array subslice layout");
+
+                    cplace = CPlace::for_ptr(base_ptr, subslice_layout);
+                    cur_ty = subslice_ty.store();
                 }
-            }
+                TyKind::Slice(elem_ty) => {
+                    let elem_layout = fx
+                        .db()
+                        .layout_of_ty(elem_ty.store(), fx.env().clone())
+                        .expect("slice subslice elem layout");
+                    let (ptr, len) = cplace.to_ptr_unsized();
+                    let from_bytes = i64::try_from(*from)
+                        .unwrap()
+                        .checked_mul(i64::try_from(elem_layout.size.bytes()).unwrap())
+                        .expect("slice subslice offset overflow");
+                    let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+                    let total_trim = i64::try_from(*from + *to).unwrap();
+                    let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
+                    cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
+                }
+                TyKind::Str => {
+                    let (ptr, len) = cplace.to_ptr_unsized();
+                    let from_bytes = i64::try_from(*from).unwrap();
+                    let new_ptr = ptr.offset_i64(&mut fx.bcx, fx.pointer_type, from_bytes);
+                    let total_trim = i64::try_from(*from + *to).unwrap();
+                    let new_len = fx.bcx.ins().iadd_imm(len, -total_trim);
+                    cplace = CPlace::for_ptr_with_extra(new_ptr, new_len, cplace.layout.clone());
+                }
+                _ => panic!("Subslice projection on non-array/slice/str type"),
+            },
             ProjectionElem::OpaqueCast(_) => todo!("OpaqueCast projection"),
         }
     }
@@ -2203,6 +2221,63 @@ fn codegen_unop(
     CValue::by_val(result, result_layout.clone())
 }
 
+fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: StaticId) -> CValue {
+    let db = fx.db();
+    let static_sig = db.static_signature(static_id);
+    let is_mutable = static_sig.flags.contains(StaticFlags::MUTABLE);
+    let is_extern = static_sig.flags.contains(StaticFlags::EXTERN);
+    let is_local_static = static_id.krate(db) == fx.local_crate();
+    let symbol_name = if static_sig.flags.contains(StaticFlags::EXTERN) {
+        static_sig.name.as_str().to_owned()
+    } else {
+        symbol_mangling::mangle_static(db, static_id, fx.ext_crate_disambiguators())
+    };
+
+    let static_ref_ty = static_operand_ty(db, static_id);
+    let layout =
+        db.layout_of_ty(static_ref_ty, fx.env().clone()).expect("layout error for static operand");
+
+    let ptr = if is_extern || !is_local_static {
+        let data_id = fx
+            .module
+            .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
+            .unwrap_or_else(|e| panic!("declare imported static `{symbol_name}` failed: {e}"));
+        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+        fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+    } else {
+        let data_id = fx
+            .module
+            .declare_data(&symbol_name, Linkage::Local, is_mutable, false)
+            .unwrap_or_else(|e| panic!("declare static `{symbol_name}` failed: {e}"));
+
+        match db.const_eval_static(static_id) {
+            Ok(konst) => {
+                let const_value = resolve_const_value(db, konst);
+                let mut data_desc = DataDescription::new();
+                data_desc.define(const_value.value.inner().memory.clone());
+
+                let pointee_layout = db
+                    .layout_of_ty(static_pointee_ty(db, static_id).store(), fx.env().clone())
+                    .expect("layout error for static pointee");
+                data_desc.set_align(pointee_layout.align.abi.bytes());
+
+                match fx.module.define_data(data_id, &data_desc) {
+                    Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
+                    Err(e) => panic!("define static `{symbol_name}` failed: {e}"),
+                }
+            }
+            Err(err) => {
+                panic!("const_eval_static failed for local static `{symbol_name}`: {err:?}",);
+            }
+        }
+
+        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+        fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+    };
+
+    CValue::by_val(ptr, layout)
+}
+
 fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> CValue {
     match kind {
         OperandKind::Constant { konst, ty } => {
@@ -2290,7 +2365,7 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
             }
             val
         }
-        OperandKind::Static(_) => todo!("static operand"),
+        OperandKind::Static(static_id) => codegen_static_operand(fx, *static_id),
     }
 }
 
@@ -2638,11 +2713,10 @@ fn drop_impl_generic_args(
 ) -> StoredGenericArgs {
     let interner = DbInterner::new_with(db, local_crate);
     match ty.as_ref().kind() {
-        TyKind::Adt(_, subst) => GenericArgs::new_from_iter(
-            interner,
-            subst.iter().filter(|arg| arg.region().is_none()),
-        )
-        .store(),
+        TyKind::Adt(_, subst) => {
+            GenericArgs::new_from_iter(interner, subst.iter().filter(|arg| arg.region().is_none()))
+                .store()
+        }
         _ => GenericArgs::empty(interner).store(),
     }
 }
@@ -3376,8 +3450,7 @@ fn codegen_intrinsic_call(
                 _ => None,
             };
 
-            let (_, align) =
-                size_and_align_of_pointee(fx, pointee_ty, &pointee_layout, metadata);
+            let (_, align) = size_and_align_of_pointee(fx, pointee_ty, &pointee_layout, metadata);
             Some(align)
         }
         "needs_drop" => {
@@ -3824,10 +3897,7 @@ fn codegen_intrinsic_call(
                 fx.bcx.ins().select(has_overflow, one, zero)
             };
 
-            dest.write_cvalue(
-                fx,
-                CValue::by_val_pair(result, has_overflow, dest.layout.clone()),
-            );
+            dest.write_cvalue(fx, CValue::by_val_pair(result, has_overflow, dest.layout.clone()));
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
                 fx.bcx.ins().jump(block, &[]);
@@ -4043,16 +4113,8 @@ fn codegen_intrinsic_call(
             }
             return true;
         }
-        "atomic_xadd"
-        | "atomic_xsub"
-        | "atomic_and"
-        | "atomic_or"
-        | "atomic_xor"
-        | "atomic_nand"
-        | "atomic_max"
-        | "atomic_umax"
-        | "atomic_min"
-        | "atomic_umin" => {
+        "atomic_xadd" | "atomic_xsub" | "atomic_and" | "atomic_or" | "atomic_xor"
+        | "atomic_nand" | "atomic_max" | "atomic_umax" | "atomic_min" | "atomic_umin" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
 
             let ty = generic_ty.expect("atomic rmw intrinsic requires a type generic arg");
@@ -4120,7 +4182,8 @@ fn codegen_intrinsic_call(
         }
     }
 
-    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+    {
         fx.set_drop_flag(destination.local);
     }
 
@@ -4610,8 +4673,7 @@ fn collect_vtable_methods(
     else {
         return;
     };
-    let Some(impl_id) =
-        find_trait_impl_for_simplified_ty(db, trait_id, &simplified, local_crate)
+    let Some(impl_id) = find_trait_impl_for_simplified_ty(db, trait_id, &simplified, local_crate)
     else {
         return;
     };
@@ -5127,7 +5189,8 @@ fn scan_body_for_callees(
                                     let mut resolved_id = callee_id;
                                     let mut resolved_args = callee_args;
 
-                                    if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                                    if let ItemContainerId::TraitId(_) = callee_id.loc(db).container
+                                    {
                                         if hir_ty::method_resolution::is_dyn_method(
                                             interner,
                                             env.param_env(),

@@ -12,7 +12,7 @@ use std::fmt::Write;
 
 use base_db::Crate;
 use hir_def::{
-    AdtId, FunctionId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
+    AdtId, FunctionId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, StaticId, TraitId,
 };
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::Mutability;
@@ -77,6 +77,37 @@ pub fn mangle_function(
         m.out.push_str("E");
     }
 
+    m.out
+}
+
+/// Produce a v0-mangled symbol name for a static item.
+///
+/// For extern statics declared in an extern block, this returns the declared
+/// symbol name directly. Otherwise this encodes a value namespace path.
+pub fn mangle_static(
+    db: &dyn HirDatabase,
+    static_id: StaticId,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> String {
+    let static_loc = static_id.loc(db);
+    let static_name = db.static_signature(static_id).name.as_str().to_owned();
+    if matches!(static_loc.container, ItemContainerId::ExternBlockId(_)) {
+        return static_name;
+    }
+
+    let out = String::from("_R");
+    let mut m = SymbolMangler {
+        db,
+        start_offset: out.len(),
+        out,
+        ext_crate_disambiguators,
+        module_paths: HashMap::new(),
+    };
+
+    m.out.push_str("N");
+    m.out.push('v'); // ValueNs
+    m.print_container_path(static_loc.container);
+    m.push_ident(&static_name);
     m.out
 }
 

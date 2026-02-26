@@ -1869,14 +1869,12 @@ fn parse_libc_version_from_sysroot_lock() -> Option<String> {
     None
 }
 
-fn pick_highest_semver(mut versions: Vec<(String, std::path::PathBuf)>) -> Option<std::path::PathBuf> {
+fn pick_highest_semver(
+    mut versions: Vec<(String, std::path::PathBuf)>,
+) -> Option<std::path::PathBuf> {
     fn parse(v: &str) -> (u32, u32, u32) {
         let mut it = v.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
-        (
-            it.next().unwrap_or(0),
-            it.next().unwrap_or(0),
-            it.next().unwrap_or(0),
-        )
+        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
     }
 
     versions.sort_by_key(|(v, _)| parse(v));
@@ -1884,9 +1882,10 @@ fn pick_highest_semver(mut versions: Vec<(String, std::path::PathBuf)>) -> Optio
 }
 
 fn find_libc_src_dir() -> Option<std::path::PathBuf> {
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo")))?;
+    let cargo_home =
+        std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
+        })?;
     let registry_src = cargo_home.join("registry/src");
 
     let desired_version = parse_libc_version_from_sysroot_lock();
@@ -2350,11 +2349,8 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             )
             .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
             if trace_enabled {
-                let drop_name = crate::symbol_mangling::mangle_drop_in_place(
-                    &db,
-                    ty.as_ref(),
-                    &disambiguators,
-                );
+                let drop_name =
+                    crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &disambiguators);
                 finalized_symbol_ids.push((drop_name, drop_id));
             }
         }
@@ -2564,7 +2560,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: GenericArgNotProvided in std::sync::poison::mutex::MutexGuard::drop"]
 fn std_jit_mutex_lock_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2867,7 +2862,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "investigation probe: GenericArgNotProvided in MutexGuard drop path"]
 fn std_jit_mutex_try_lock_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3081,7 +3075,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: static operand not yet implemented in Arc/Mutex path"]
+#[ignore = "currently fails: unresolved imported symbol in Arc clone path"]
 fn std_jit_arc_mutex_probe() {
     let result: i32 = jit_run_with_std(
         r#"
