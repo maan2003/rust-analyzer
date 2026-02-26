@@ -2515,6 +2515,214 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_cell_set_get_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let cell = std::cell::Cell::new(5_i32);
+    cell.set(42);
+    (cell.get() == 42) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "investigation probe: currently SIGSEGV in RefCell::replace path"]
+fn std_jit_refcell_replace_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let cell = std::cell::RefCell::new(5_i32);
+    let old = cell.replace(11);
+    ((old == 5) && (*cell.borrow() == 11)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_vec_pop_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+
+    match v.pop() {
+        Some(last) => ((last == 3) && (v.len() == 2) && (v[1] == 2)) as i32,
+        None => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_vec_with_capacity_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v: Vec<i32> = Vec::with_capacity(2);
+    v.push(4);
+    v.push(5);
+    ((v.len() == 2) && (v[0] == 4) && (v[1] == 5)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_result_unwrap_or_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ok: Result<i32, i32> = Ok(7);
+    let err: Result<i32, i32> = Err(2);
+    ok.unwrap_or(0) + err.unwrap_or(40)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 47);
+}
+
+#[test]
+fn std_jit_option_take_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut opt = Some(9_i32);
+    let taken = opt.take();
+    match (opt, taken) {
+        (None, Some(v)) => (v == 9) as i32,
+        _ => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_slice_split_at_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let arr = [10_i32, 20, 30, 40];
+    let (left, right) = arr.split_at(2);
+    ((left.len() == 2) && (right.len() == 2) && (left[1] == 20) && (right[0] == 30)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_cmp_max_min_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let hi = std::cmp::max(3_i32, 9_i32);
+    let lo = std::cmp::min(3_i32, 9_i32);
+    (hi - lo == 6) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "investigation probe: sync Once path"]
+fn std_jit_once_call_once_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let once = std::sync::Once::new();
+    let mut value = 0_i32;
+    once.call_once(|| {
+        value = 1;
+    });
+    (value == 1) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "investigation probe: iterator collect path"]
+fn std_jit_iter_repeat_take_collect_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let v: Vec<u8> = std::iter::repeat(7_u8).take(4).collect();
+    ((v.len() == 4) && (v[0] == 7) && (v[3] == 7)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "investigation probe: String allocation/drop path"]
+fn std_jit_string_push_str_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut s = String::new();
+    s.push_str("hi");
+    s.push('!');
+    ((s.len() == 3) && (s == "hi!")) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "investigation probe: GenericArgNotProvided in MutexGuard drop path"]
+fn std_jit_mutex_try_lock_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let m = std::sync::Mutex::new(41_i32);
+
+    match m.try_lock() {
+        Ok(mut guard) => {
+            *guard += 1;
+        }
+        Err(_) => return 0,
+    }
+
+    match m.try_lock() {
+        Ok(guard) => (*guard == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 #[ignore = "currently fails: runtime double-free in String path"]
 fn std_jit_string_from_smoke() {
     let result: i32 = jit_run_with_std(

@@ -73,6 +73,13 @@ What is in place:
   - `std_jit_vec_push_smoke` (now unignored and passing)
   - `std_jit_vec_growth_sum_smoke`
   - `std_jit_refcell_borrow_mut_smoke`
+  - `std_jit_cell_set_get_smoke`
+  - `std_jit_vec_pop_smoke`
+  - `std_jit_vec_with_capacity_smoke`
+  - `std_jit_result_unwrap_or_smoke`
+  - `std_jit_option_take_smoke`
+  - `std_jit_slice_split_at_smoke`
+  - `std_jit_cmp_max_min_smoke`
   - `std_jit_array_deref_to_slice_smoke`
   - `std_jit_env_var_smoke`
   - `std_jit_str_parse_i32_smoke` (now unignored and passing)
@@ -85,9 +92,18 @@ What is in place:
     - fails while compiling `std::io::error::repr_bitpacked::Repr::drop`
       with `local layout error: HasErrorType`
   - `std_jit_env_var_roundtrip`
-    - fails with `non-value const in ScalarPair constant`
+    - currently fails in `std::io::error::repr_bitpacked::Repr::drop`
+      with `local layout error: HasErrorType`
   - `std_jit_mutex_lock_smoke`
     - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+  - `std_jit_mutex_try_lock_smoke`
+    - fails with `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+  - `std_jit_once_call_once_smoke`
+    - fails with `no impl found for vtable`
+  - `std_jit_iter_repeat_take_collect_smoke`
+    - fails with `no impl found for vtable`
+  - `std_jit_refcell_replace_smoke`
+    - aborts with `SIGSEGV`
 
 Validation recently run:
 
@@ -97,6 +113,13 @@ Validation recently run:
 - `just test-clif -E 'test(std_jit_vec_new_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_push_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_vec_growth_sum_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_cell_set_get_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_vec_pop_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_vec_with_capacity_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_result_unwrap_or_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_option_take_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_slice_split_at_smoke)' --no-capture` passes
+- `just test-clif -E 'test(std_jit_cmp_max_min_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_array_deref_to_slice_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_env_var_smoke)' --no-capture` passes
 - `just test-clif -E 'test(std_jit_str_parse_i32_smoke)' --no-capture` passes
@@ -107,6 +130,10 @@ Validation recently run:
   `local layout error: HasErrorType` in `std::io::error::repr_bitpacked::Repr::drop`
 - `just test-clif -E 'test(std_jit_mutex_lock_smoke)' --no-capture` fails with
   `GenericArgNotProvided` in `std::sync::poison::mutex::MutexGuard::drop`
+- `just test-clif -j 24 -E 'test(std_jit_cell_set_get_smoke) or ... or test(std_jit_mutex_try_lock_smoke)' --run-ignored all --no-fail-fast`
+  runs 12 tests concurrently in ~14s total: 8 passed, 4 failed
+  (`std_jit_mutex_try_lock_smoke`, `std_jit_once_call_once_smoke`,
+  `std_jit_iter_repeat_take_collect_smoke`, `std_jit_refcell_replace_smoke`)
 
 ## What Is Still Missing
 
