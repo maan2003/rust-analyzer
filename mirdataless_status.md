@@ -67,6 +67,11 @@ What is in place:
 - Vtable impl lookup now uses shared cross-crate search (`find_trait_impl_for_simplified_ty`)
   and includes closure-trait fallback wiring in `get_or_create_vtable`.
   - resolves prior merge-conflict drift around dyn-trait/closure vtable construction.
+- `ReifyFnPointer` trait-method resolution now routes static trait calls through
+  `lookup_impl_method` in both codegen and reachability scanning.
+  - this removed an earlier unresolved-symbol failure (`core::fmt::Debug::fmt` in
+    the `env_set_var` probe) and moved the failing edge deeper to
+    `core::fmt::num::impl::fmt` with `local layout error: HasErrorConst`.
 
 ## Tests Revived
 

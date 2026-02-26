@@ -4,15 +4,16 @@
 //! char mapping) are ported from `rustc_symbol_mangling/src/v0.rs` (RFC 2603).
 //! We keep them close to the originals for easier future syncing.
 //!
-//! Deferred: backref caching, const generic encoding (uses `p` placeholder),
-//! `dyn Trait` / fn-pointer encoding, punycode, trait-impl paths (`X`),
-//! closure/coroutine encoding.
+//! Deferred: const generic encoding (uses `p` placeholder), `dyn Trait` /
+//! fn-pointer encoding, punycode, closure/coroutine encoding.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use base_db::Crate;
-use hir_def::{AdtId, FunctionId, HasModule, ImplId, ItemContainerId, ModuleDefId};
+use hir_def::{
+    AdtId, FunctionId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
+};
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::Mutability;
 use hir_ty::next_solver::{GenericArgKind, GenericArgs, IntoKind, Ty, TyKind};
@@ -33,7 +34,14 @@ pub fn mangle_function(
     generic_args: GenericArgs<'_>,
     ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> String {
-    let mut m = SymbolMangler { db, out: String::from("_R"), ext_crate_disambiguators };
+    let out = String::from("_R");
+    let mut m = SymbolMangler {
+        db,
+        start_offset: out.len(),
+        out,
+        ext_crate_disambiguators,
+        module_paths: HashMap::new(),
+    };
 
     let container = func_id.loc(db).container;
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
@@ -106,7 +114,14 @@ pub fn mangle_drop_in_place(
     ty: Ty<'_>,
     ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> String {
-    let mut m = SymbolMangler { db, out: String::from("_Rdrop_"), ext_crate_disambiguators };
+    let out = String::from("_Rdrop_");
+    let mut m = SymbolMangler {
+        db,
+        start_offset: out.len(),
+        out,
+        ext_crate_disambiguators,
+        module_paths: HashMap::new(),
+    };
     m.print_type(ty);
     m.out
 }
@@ -117,8 +132,12 @@ pub fn mangle_drop_in_place(
 
 struct SymbolMangler<'a> {
     db: &'a dyn HirDatabase,
+    /// Start offset for backref indexes.
+    start_offset: usize,
     out: String,
     ext_crate_disambiguators: &'a HashMap<String, u64>,
+    /// Cache of printed module paths to emit rustc-style `B..._` backrefs.
+    module_paths: HashMap<ModuleId, usize>,
 }
 
 impl<'a> SymbolMangler<'a> {
@@ -147,6 +166,12 @@ impl<'a> SymbolMangler<'a> {
 
     fn push_ident(&mut self, ident: &str) {
         push_ident(ident, &mut self.out)
+    }
+
+    fn print_backref(&mut self, i: usize) {
+        debug_assert!(i >= self.start_offset);
+        self.out.push('B');
+        self.push_integer_62((i - self.start_offset) as u64);
     }
 
     fn function_disambiguator(
@@ -206,6 +231,15 @@ impl<'a> SymbolMangler<'a> {
             .unwrap_or(0)
     }
 
+    /// Match rustc's impl-path disambiguator behavior closely by using the
+    /// deterministic order of impl blocks within the containing module scope.
+    fn impl_disambiguator(&self, impl_id: ImplId) -> u64 {
+        let module = impl_id.module(self.db);
+        let def_map = module.def_map(self.db);
+        let scope = &def_map[module].scope;
+        scope.impls().position(|id| id == impl_id).map(|idx| idx as u64).unwrap_or(0)
+    }
+
     // -- Path encoding ------------------------------------------------------
 
     fn print_crate(&mut self, krate: Crate) {
@@ -232,6 +266,11 @@ impl<'a> SymbolMangler<'a> {
     }
 
     fn print_module_path(&mut self, module: hir_def::ModuleId) {
+        if let Some(&start) = self.module_paths.get(&module) {
+            self.print_backref(start);
+            return;
+        }
+        let start = self.out.len();
         match module.containing_module(self.db) {
             None => {
                 // Crate root module.
@@ -249,6 +288,7 @@ impl<'a> SymbolMangler<'a> {
                 self.push_ident(&name);
             }
         }
+        self.module_paths.insert(module, start);
     }
 
     /// Anonymous/block modules need a disambiguator; otherwise all local-item
@@ -275,13 +315,7 @@ impl<'a> SymbolMangler<'a> {
                 self.print_impl_path(impl_id);
             }
             ItemContainerId::TraitId(trait_id) => {
-                let module = trait_id.module(self.db);
-                let name = self.db.trait_signature(trait_id).name.as_str().to_owned();
-                self.out.push('N');
-                self.out.push('t'); // TypeNs
-                self.print_module_path(module);
-                self.push_disambiguator(0);
-                self.push_ident(&name);
+                self.print_trait_path(trait_id, None);
             }
             ItemContainerId::ExternBlockId(extern_id) => {
                 // Skip to parent module (matches rustc's ForeignMod handling).
@@ -292,13 +326,68 @@ impl<'a> SymbolMangler<'a> {
     }
 
     fn print_impl_path(&mut self, impl_id: ImplId) {
-        // Inherent impl: M + disambiguator + parent_path + self_ty
+        let disambiguator = self.impl_disambiguator(impl_id);
         let module = impl_id.module(self.db);
-        self.out.push('M');
-        self.push_disambiguator(0);
-        self.print_module_path(module);
         let self_ty = self.db.impl_self_ty(impl_id).skip_binder();
-        self.print_type(self_ty);
+
+        if let Some(trait_ref) = self.db.impl_trait(impl_id).map(|it| it.skip_binder()) {
+            // Trait impl: X + disambiguator + parent_path + self_ty + trait_path.
+            self.out.push('X');
+            self.push_disambiguator(disambiguator);
+            self.print_module_path(module);
+            self.print_type(self_ty);
+            self.print_trait_path(trait_ref.def_id.0, Some(trait_ref.args));
+        } else {
+            // Inherent impl: M + disambiguator + parent_path + self_ty.
+            self.out.push('M');
+            self.push_disambiguator(disambiguator);
+            self.print_module_path(module);
+            self.print_type(self_ty);
+        }
+    }
+
+    fn print_trait_path(&mut self, trait_id: TraitId, args: Option<GenericArgs<'_>>) {
+        let print_simple = |this: &mut Self| {
+            let module = trait_id.module(this.db);
+            let name = this.db.trait_signature(trait_id).name.as_str().to_owned();
+            this.out.push('N');
+            this.out.push('t'); // TypeNs
+            this.print_module_path(module);
+            this.push_disambiguator(0);
+            this.push_ident(&name);
+        };
+
+        let Some(args) = args else {
+            print_simple(self);
+            return;
+        };
+
+        // TraitRef args are `[Self, ..trait params]`; mangle only real params.
+        let ty_args: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| {
+                if idx == 0 {
+                    return None;
+                }
+                match arg.kind() {
+                    GenericArgKind::Type(ty) => Some(ty),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if ty_args.is_empty() {
+            print_simple(self);
+            return;
+        }
+
+        self.out.push('I');
+        print_simple(self);
+        for ty in &ty_args {
+            self.print_type(*ty);
+        }
+        self.out.push('E');
     }
 
     // -- Type encoding ------------------------------------------------------
