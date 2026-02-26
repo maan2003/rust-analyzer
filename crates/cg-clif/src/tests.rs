@@ -3639,7 +3639,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: monomorphization errors in copy_nonoverlapping intrinsic lowering"]
 fn jit_copy_nonoverlapping_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"
@@ -3664,7 +3663,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: write_bytes hits bitcast size mismatch in value_and_place"]
 fn jit_write_bytes_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"

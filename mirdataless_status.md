@@ -78,6 +78,10 @@ What is in place:
     discriminant values before producing the MIR discriminant result.
   - this fixes explicit-discriminant enum casts that previously returned
     variant indices.
+- Type inference indexing now has a builtin array/slice fast path for
+  `usize` indices in `lookup_indexing`.
+  - this avoids `{type error}` propagation in cast+index expressions,
+    which previously caused monomorphization failures in memory-intrinsic probes.
 
 ## Tests Revived
 
@@ -112,6 +116,8 @@ What is in place:
   - `jit_size_of_val_dyn_trait_probe` (newly unignored and passing)
   - `jit_explicit_enum_discriminant_probe` (newly unignored and passing)
   - `jit_float_scalar_pair_const_probe` (newly unignored and passing)
+  - `jit_copy_nonoverlapping_intrinsic_probe` (newly unignored and passing)
+  - `jit_write_bytes_intrinsic_probe` (newly unignored and passing)
 - `std_jit_process_id_is_stable_across_calls` is currently non-ignored in `tests.rs`
   (historically flaky; keep watching for intermittent regressions)
 - Additional probes present and currently ignored:
@@ -138,10 +144,6 @@ What is in place:
       vtable-lookup merge)
   - `std_jit_refcell_replace_smoke`
     - last known behavior: aborts with `SIGSEGV` (not revalidated in latest batch)
-  - `jit_copy_nonoverlapping_intrinsic_probe`
-    - fails in MIR lowering with `NotSupported("monomorphization resulted in errors")`
-  - `jit_write_bytes_intrinsic_probe`
-    - panics in codegen: `bitcast size mismatch` (`value_and_place.rs`)
 
 Validation recently run:
 
@@ -180,14 +182,13 @@ Validation recently run:
 - `just test-clif -j 24 -E 'test(std_jit_env_set_var_smoke) or test(std_jit_env_var_roundtrip) or test(std_jit_mutex_lock_smoke) or test(std_jit_mutex_try_lock_smoke) or test(std_jit_once_call_once_smoke)' --run-ignored all --no-fail-fast`
   runs 5 ignored probes: all fail with current blockers listed above
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --no-fail-fast`
-  runs active members of the frontier set: 5 passed
+  runs active members of the frontier set: 7 passed
   (`jit_size_of_val_slice_unsized_probe`, `jit_size_of_val_dyn_trait_probe`,
   `jit_explicit_enum_discriminant_probe`, `jit_float_scalar_pair_const_probe`,
-  `std_jit_option_map_closure_probe`),
-  ignored members skipped.
+  `jit_copy_nonoverlapping_intrinsic_probe`, `jit_write_bytes_intrinsic_probe`,
+  `std_jit_option_map_closure_probe`).
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe) or test(jit_size_of_val_dyn_trait_probe) or test(jit_explicit_enum_discriminant_probe) or test(jit_float_scalar_pair_const_probe) or test(jit_copy_nonoverlapping_intrinsic_probe) or test(jit_write_bytes_intrinsic_probe) or test(std_jit_option_map_closure_probe)' --run-ignored all --no-fail-fast`
-  runs full frontier set: 7 run, 5 passed, 2 failed
-  (`jit_copy_nonoverlapping_intrinsic_probe`, `jit_write_bytes_intrinsic_probe`).
+  runs full frontier set: 7 run, 7 passed.
 - `just test-clif -E 'test(jit_size_of_val_dyn_trait_probe)' --no-fail-fast` passes
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --run-ignored all --no-fail-fast` passes
 - `just test-clif -j 24 -E 'test(jit_size_of_val_slice_unsized_probe)' --no-fail-fast` passes
@@ -203,9 +204,6 @@ Validation recently run:
     (`std_jit_mutex_lock_smoke`, `std_jit_mutex_try_lock_smoke`)
   - lifetime/generic-arg propagation for some monomorphic drop impl lookups
     (`std_jit_once_call_once_smoke` -> `CompletionGuard::drop`)
-- Additional backend gaps tracked by current frontier probes:
-  - intrinsic lowering gaps remain for `copy_nonoverlapping` (monomorphization errors)
-    and `write_bytes` (`bitcast size mismatch`)
 - Runtime symbol resolution relies on process-global `dlopen` behavior; robustness improvements are possible.
 
 ## Recommended Fix Order
@@ -223,34 +221,32 @@ Validation recently run:
 3. Fix monomorphic drop call generic/lifetime propagation for std once internals.
    - Repro target: `std_jit_once_call_once_smoke`.
 
-4. Fix memory intrinsic lowering gaps.
-   - Repro targets: `jit_copy_nonoverlapping_intrinsic_probe`, `jit_write_bytes_intrinsic_probe`.
-
-5. Unignore probes that now pass to keep regressions visible.
+4. Unignore probes that now pass to keep regressions visible.
    - Candidate unignores: `std_jit_string_from_smoke`, `std_jit_string_push_str_smoke`.
 
-6. Re-run and unignore probes incrementally as each blocker is fixed.
+5. Re-run and unignore probes incrementally as each blocker is fixed.
    - Current state: `str_parse` and `vec_push` are unignored; `string_from` and
      `string_push_str` now pass but are still marked ignored.
    - New state: `std_jit_option_map_closure_probe`,
-     `jit_float_scalar_pair_const_probe`, `jit_size_of_val_dyn_trait_probe`, and
-     `jit_explicit_enum_discriminant_probe` are unignored and passing.
+     `jit_float_scalar_pair_const_probe`, `jit_size_of_val_dyn_trait_probe`,
+     `jit_explicit_enum_discriminant_probe`, `jit_copy_nonoverlapping_intrinsic_probe`, and
+     `jit_write_bytes_intrinsic_probe` are unignored and passing.
 
-7. Expand coverage with more deterministic std probes once blockers are cleared.
+6. Expand coverage with more deterministic std probes once blockers are cleared.
    - Candidate families: `std::thread::current`, `std::time`, and light `std::sync` probes.
 
-8. Improve sysroot loading ergonomics/perf for tests.
+7. Improve sysroot loading ergonomics/perf for tests.
    - Cache file discovery and/or loaded roots across tests when feasible.
    - Keep wall-time reasonable as std-smoke coverage grows.
 
-9. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
+8. Introduce a focused std-JIT test group in `just test-clif` docs/comments.
    - Make it easy to run only mirdataless std-JIT smoke tests locally.
 
 ## Next Candidate To Debug
 
-- `jit_copy_nonoverlapping_intrinsic_probe`
-  - reason: now one of the two remaining frontier failures under
-    `--run-ignored all`, and likely the next unblocker for memory intrinsics.
+- `std_jit_env_set_var_smoke`
+  - reason: still failing with `local layout error: HasErrorConst` in
+    `core::fmt::num::impl::fmt`, and blocks environment-variable probe expansion.
 
 ## Non-Goals (Still True)
 

@@ -133,6 +133,31 @@ impl<'a, 'db> InferenceContext<'a, 'db> {
                 }
             }
 
+            // Builtin indexing for arrays/slices by `usize`.
+            //
+            // Keep this fast path before trait probing so we can still infer
+            // element types even when operator trait lookup is unavailable or
+            // incomplete for the current context.
+            if matches!(index_ty.kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize)) {
+                let element_ty = match self_ty.kind() {
+                    TyKind::Array(element_ty, _) | TyKind::Slice(element_ty) => Some(element_ty),
+                    _ => None,
+                };
+                if let Some(element_ty) = element_ty {
+                    let infer_ok = autoderef.adjust_steps_as_infer_ok();
+                    let mut adjustments = autoderef.ctx().table.register_infer_ok(infer_ok);
+                    if unsize {
+                        adjustments.push(Adjustment {
+                            kind: Adjust::Pointer(PointerCast::Unsize),
+                            target: self_ty.store(),
+                        });
+                    }
+                    autoderef.ctx().write_expr_adj(base_expr, adjustments.into_boxed_slice());
+
+                    return Some((autoderef.ctx().types.types.usize, element_ty));
+                }
+            }
+
             // If some lookup succeeds, write callee into table and extract index/element
             // type from the method signature.
             // If some lookup succeeded, install method in table
