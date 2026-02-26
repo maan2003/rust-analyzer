@@ -224,11 +224,7 @@ impl<'a> SymbolMangler<'a> {
         }
 
         same_named.sort_by_key(|fid| format!("{fid:?}"));
-        same_named
-            .iter()
-            .position(|fid| *fid == func_id)
-            .map(|idx| idx as u64)
-            .unwrap_or(0)
+        same_named.iter().position(|fid| *fid == func_id).map(|idx| idx as u64).unwrap_or(0)
     }
 
     /// Match rustc's impl-path disambiguator behavior closely by using the
