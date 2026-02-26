@@ -786,7 +786,6 @@ fn get_or_create_vtable(
 
     // Find the impl for this concrete type
     let krate = fx.local_crate();
-    let trait_impls = TraitImpls::for_crate(fx.db(), krate);
     let interner = DbInterner::new_no_crate(fx.db());
 
     // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
@@ -794,9 +793,30 @@ fn get_or_create_vtable(
     let simplified =
         simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
             .expect("cannot simplify concrete type for vtable lookup");
-    let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
-    assert!(!impl_ids.is_empty(), "no impl found for vtable");
-    let impl_id = impl_ids[0]; // Take first matching impl
+    let impl_id = TraitImpls::for_crate_and_deps(fx.db(), krate).iter().find_map(|trait_impls| {
+        let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, &simplified);
+        impl_ids.first().copied()
+    });
+
+    // Closure traits (`Fn` / `FnMut` / `FnOnce`) are built-in and often don't
+    // show up as explicit impl items in TraitImpls. In that case, wire the
+    // vtable method slot directly to the closure body symbol.
+    let closure_fallback = if impl_id.is_none() {
+        match concrete_ty.as_ref().kind() {
+            TyKind::Closure(closure_id, closure_subst) => Some((closure_id.0, closure_subst.store())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    assert!(
+        impl_id.is_some() || closure_fallback.is_some(),
+        "no impl found for vtable: trait={:?}, concrete={:?}, simplified={:?}",
+        trait_id,
+        concrete_ty,
+        simplified
+    );
 
     // Build unique vtable name
     let vtable_name = format!(
@@ -835,49 +855,73 @@ fn get_or_create_vtable(
     data.define(vtable_bytes.into_boxed_slice());
 
     // Slot 3+: trait method fn ptrs — emit as relocations
-    let impl_items = impl_id.impl_items(fx.db());
-    for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
-        // Find the corresponding impl method by name
-        let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
-        let impl_func_id = impl_items
-            .items
-            .iter()
-            .find_map(|(name, item)| {
-                if *name == trait_method_name {
-                    match item {
-                        AssocItemId::FunctionId(fid) => Some(*fid),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                panic!("impl method `{}` not found for vtable", trait_method_name.as_str())
-            });
-
-        // Declare/import the impl function
-        let impl_body = fx
+    let impl_items = impl_id.map(|id| id.impl_items(fx.db()));
+    let closure_func_id = closure_fallback.map(|(closure_id, closure_subst)| {
+        let closure_body = fx
             .db()
-            .monomorphized_mir_body(
-                impl_func_id.into(),
-                GenericArgs::empty(interner).store(),
-                fx.env().clone(),
-            )
-            .expect("failed to get impl method MIR for vtable");
-        let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
-            .expect("impl method sig for vtable");
-        let impl_fn_name = symbol_mangling::mangle_function(
-            fx.db(),
-            impl_func_id,
-            GenericArgs::empty(interner),
-            fx.ext_crate_disambiguators(),
-        );
+            .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
+            .expect("failed to get closure MIR for vtable");
+        let closure_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
+            .expect("closure sig for vtable");
+        let closure_name =
+            symbol_mangling::mangle_closure(fx.db(), closure_id, fx.ext_crate_disambiguators());
+        fx.module
+            .declare_function(&closure_name, Linkage::Import, &closure_sig)
+            .expect("declare closure vtable method")
+    });
 
-        let func_id = fx
-            .module
-            .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
-            .expect("declare vtable method");
+    for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
+        let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
+        let func_id = if let Some(impl_items) = impl_items {
+            // Find the corresponding impl method by name.
+            let impl_func_id = impl_items
+                .items
+                .iter()
+                .find_map(|(name, item)| {
+                    if *name == trait_method_name {
+                        match item {
+                            AssocItemId::FunctionId(fid) => Some(*fid),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("impl method `{}` not found for vtable", trait_method_name.as_str())
+                });
+
+            // Declare/import the impl function.
+            let impl_body = fx
+                .db()
+                .monomorphized_mir_body(
+                    impl_func_id.into(),
+                    GenericArgs::empty(interner).store(),
+                    fx.env().clone(),
+                )
+                .expect("failed to get impl method MIR for vtable");
+            let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
+                .expect("impl method sig for vtable");
+            let impl_fn_name = symbol_mangling::mangle_function(
+                fx.db(),
+                impl_func_id,
+                GenericArgs::empty(interner),
+                fx.ext_crate_disambiguators(),
+            );
+
+            fx.module
+                .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
+                .expect("declare vtable method")
+        } else {
+            let closure_func_id = closure_func_id.expect("closure vtable method func id");
+            assert!(
+                matches!(trait_method_name.as_str(), "call" | "call_mut" | "call_once"),
+                "closure fallback cannot build vtable entry for trait method `{}`",
+                trait_method_name.as_str()
+            );
+            closure_func_id
+        };
+
         let func_ref = fx.module.declare_func_in_data(func_id, &mut data);
         data.write_function_addr(((3 + method_idx) * ptr_size) as u32, func_ref);
     }
@@ -2703,6 +2747,24 @@ fn codegen_direct_call(
                         destination,
                         target,
                     );
+                    return;
+                }
+
+                // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often
+                // resolve to the blanket reference impl in `core::ops::function::impls`,
+                // but the actual runtime dispatch must still happen through the inner
+                // dyn vtable. Route those straight to virtual dispatch.
+                if let Some(self_pointee) = self_ty.builtin_deref(true)
+                    && self_pointee.dyn_trait() == Some(trait_id)
+                    && matches!(
+                        fx.db()
+                            .layout_of_ty(self_ty.store(), fx.env().clone())
+                            .expect("self layout for dyn ref dispatch")
+                            .backend_repr,
+                        BackendRepr::ScalarPair(_, _)
+                    )
+                {
+                    codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
                     return;
                 }
             }

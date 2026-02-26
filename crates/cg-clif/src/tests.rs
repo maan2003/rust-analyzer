@@ -2530,7 +2530,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "investigation probe: currently SIGSEGV in RefCell::replace path"]
 fn std_jit_refcell_replace_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
