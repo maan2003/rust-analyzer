@@ -54,6 +54,7 @@ use crate::{
     consteval::intern_const_ref,
     db::{HirDatabase, InternedOpaqueTyId},
     generics::{Generics, generics},
+    MemoryMap, ParamEnvAndCrate,
     next_solver::{
         AliasTy, Binder, BoundExistentialPredicates, Clause, ClauseKind, Clauses, Const,
         DbInterner, EarlyBinder, EarlyParamRegion, ErrorGuaranteed, FxIndexMap, GenericArg,
@@ -282,9 +283,16 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     pub(crate) fn lower_const(&mut self, const_ref: ConstRef, const_type: Ty<'db>) -> Const<'db> {
         let const_ref = &self.store[const_ref.expr];
         match const_ref {
-            hir_def::hir::Expr::Path(path) => {
-                self.path_to_const(path).unwrap_or_else(|| unknown_const(const_type))
+            // Const-generic arguments like `{ AO::Relaxed }` are represented as a trivial block.
+            hir_def::hir::Expr::Const(inner_expr) => {
+                self.lower_const(ConstRef { expr: *inner_expr }, const_type)
             }
+            hir_def::hir::Expr::Block { statements, tail: Some(expr), label: None, .. }
+                if statements.is_empty() =>
+            {
+                self.lower_const(ConstRef { expr: *expr }, const_type)
+            }
+            hir_def::hir::Expr::Path(path) => self.lower_path_as_const(path, const_type),
             hir_def::hir::Expr::Literal(literal) => {
                 intern_const_ref(self.db, literal, const_type, self.resolver.krate())
             }
@@ -347,7 +355,34 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     pub(crate) fn lower_path_as_const(&mut self, path: &Path, const_type: Ty<'db>) -> Const<'db> {
-        self.path_to_const(path).unwrap_or_else(|| unknown_const(const_type))
+        if let Some(c) = self.path_to_const(path) {
+            return c;
+        }
+
+        let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, HygieneId::ROOT);
+        if let Some(ValueNs::EnumVariantId(variant)) = resolved
+            && variant.fields(self.db).shape == FieldsShape::Unit
+            && let Ok(discriminant) = self.db.const_eval_discriminant(variant)
+        {
+            let env = ParamEnvAndCrate {
+                param_env: self.db.trait_environment(self.def),
+                krate: self.resolver.krate(),
+            };
+            if let Ok(layout) = self.db.layout_of_ty(const_type.store(), env.store()) {
+                let size = layout.size.bytes_usize();
+                if size <= mem::size_of::<i128>() {
+                    let bytes = discriminant.to_le_bytes()[..size].to_vec().into_boxed_slice();
+                    return Const::new_valtree(
+                        self.interner,
+                        const_type,
+                        bytes,
+                        MemoryMap::default(),
+                    );
+                }
+            }
+        }
+
+        unknown_const(const_type)
     }
 
     fn generics(&self) -> &Generics {
