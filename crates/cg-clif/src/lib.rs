@@ -3321,6 +3321,21 @@ fn codegen_intrinsic_call(
             fx.bcx.call_memset(tc, dst, val, byte_amount);
             None
         }
+        "compare_bytes" => {
+            assert_eq!(args.len(), 3, "compare_bytes expects 3 args");
+            let lhs_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let rhs_ptr = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let byte_count = codegen_operand(fx, &args[2].kind).load_scalar(fx);
+
+            // Match upstream cg_clif behavior: lower to a memcmp libcall.
+            Some(codegen_libcall1(
+                fx,
+                "memcmp",
+                &[fx.pointer_type, fx.pointer_type, fx.pointer_type],
+                types::I32,
+                &[lhs_ptr, rhs_ptr, byte_count],
+            ))
+        }
         "read_via_copy" => {
             assert_eq!(args.len(), 1, "read_via_copy expects 1 arg");
             let src_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
