@@ -2847,6 +2847,136 @@ fn foo() -> i32 {
     assert_eq!(result, 1);
 }
 
+#[test]
+#[ignore = "currently fails: unresolved std fs closure symbol in metadata path"]
+fn std_jit_fs_metadata_current_dir_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    match std::fs::metadata(".") {
+        Ok(meta) => meta.is_dir() as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: unresolved HasErrorType in fs create-dir path"]
+fn std_jit_fs_create_dir_metadata_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut dir = std::env::temp_dir();
+    dir.push("cg_clif_std_jit_fs_create_dir_metadata_smoke");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if std::fs::create_dir(&dir).is_err() {
+        return 0;
+    }
+
+    let is_dir = match std::fs::metadata(&dir) {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return 0;
+        }
+    };
+
+    let removed = std::fs::remove_dir_all(&dir).is_ok();
+    (is_dir && removed) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: unsized drop glue in std::sync::mpsc path"]
+fn std_jit_mpsc_channel_send_recv_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let (tx, rx) = std::sync::mpsc::channel::<i32>();
+    if tx.send(42).is_err() {
+        return 0;
+    }
+
+    match rx.recv() {
+        Ok(value) => (value == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: IncompleteExpr in std::sys::fs::unix debug fd assert"]
+fn std_jit_fs_write_read_remove_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut path = std::env::temp_dir();
+    path.push("cg_clif_std_jit_fs_write_read_remove_probe.txt");
+    let _ = std::fs::remove_file(&path);
+
+    if std::fs::write(&path, b"hello-from-jit").is_err() {
+        return 0;
+    }
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return 0;
+        }
+    };
+
+    let removed = std::fs::remove_file(&path).is_ok();
+    ((content == "hello-from-jit") && removed) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_time_duration_decompose_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let d = std::time::Duration::from_millis(1234);
+    ((d.as_secs() == 1) && (d.subsec_millis() == 234)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_ipv4_octets_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    let octets = ip.octets();
+    ((octets[0] == 127) && (octets[3] == 1)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Ambitious std-JIT frontier probes
 // ---------------------------------------------------------------------------
