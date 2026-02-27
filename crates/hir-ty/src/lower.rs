@@ -41,6 +41,7 @@ use rustc_type_ir::{
     AliasTyKind, BoundVarIndexKind, ConstKind, DebruijnIndex, ExistentialPredicate,
     ExistentialProjection, ExistentialTraitRef, FnSig, Interner, OutlivesPredicate, TermKind,
     TyKind::{self}, UintTy,
+    fast_reject::{TreatParams, simplify_type},
     TypeFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
     inherent::{Clause as _, GenericArgs as _, IntoKind as _, Region as _, Ty as _},
 };
@@ -464,6 +465,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             return c;
         }
 
+        if let Some(c) = self.try_lower_inherent_assoc_const_path(path) {
+            return c;
+        }
+
         let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, HygieneId::ROOT);
         if let Some(ValueNs::EnumVariantId(variant)) = resolved
             && variant.fields(self.db).shape == FieldsShape::Unit
@@ -488,6 +493,77 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         }
 
         unknown_const(const_type)
+    }
+
+    fn try_lower_inherent_assoc_const_path(&mut self, path: &Path) -> Option<Const<'db>> {
+        let assoc_name = path.segments().last()?.name;
+        let qualifier = path.qualifier()?;
+        let (type_ns, unresolved, _, _) =
+            self.resolver.resolve_path_in_type_ns_with_prefix_info(self.db, &qualifier)?;
+        if unresolved.is_some() {
+            return None;
+        }
+
+        let self_ty = match type_ns {
+            TypeNs::SelfType(impl_id) => self.db.impl_self_ty(impl_id).skip_binder(),
+            TypeNs::AdtSelfType(adt) => {
+                let args = GenericArgs::identity_for_item(self.interner, adt.into());
+                Ty::new_adt(self.interner, adt, args)
+            }
+            TypeNs::AdtId(adt) => ty_query(self.db, adt.into()).instantiate_identity(),
+            TypeNs::BuiltinType(it) => ty_query(self.db, it.into()).instantiate_identity(),
+            TypeNs::TypeAliasId(it) => ty_query(self.db, it.into()).instantiate_identity(),
+            _ => return None,
+        };
+
+        let simplified = simplify_type(self.interner, self_ty, TreatParams::InstantiateWithInfer)?;
+        let module = crate::method_resolution::simplified_type_module(self.db, &simplified)?;
+
+        let mut resolved_const = None;
+        let mut ambiguous = false;
+        crate::method_resolution::InherentImpls::for_each_crate_and_block(
+            self.db,
+            module.krate(self.db),
+            module.block(self.db),
+            &mut |impls| {
+                for &impl_id in impls.for_self_ty(&simplified) {
+                    for &(ref name, item) in impl_id.impl_items(self.db).items.iter() {
+                        if name != assoc_name {
+                            continue;
+                        }
+                        let AssocItemId::ConstId(const_id) = item else { continue };
+
+                        if let Some(existing) = resolved_const {
+                            if existing != const_id {
+                                ambiguous = true;
+                                return;
+                            }
+                        } else {
+                            resolved_const = Some(const_id);
+                        }
+                    }
+                    if ambiguous {
+                        return;
+                    }
+                }
+            },
+        );
+        if ambiguous {
+            return None;
+        }
+
+        let const_id = resolved_const?;
+        if !generics(self.db, const_id.into()).is_empty() {
+            return None;
+        }
+
+        Some(Const::new(
+            self.interner,
+            ConstKind::Unevaluated(UnevaluatedConst {
+                def: GeneralConstId::ConstId(const_id).into(),
+                args: GenericArgs::empty(self.interner),
+            }),
+        ))
     }
 
     fn generics(&self) -> &Generics {
