@@ -967,6 +967,96 @@ fn trait_method_substs_for_receiver<'db>(
     )
 }
 
+fn declare_builtin_derive_vtable_shim(
+    fx: &mut FunctionCx<'_, impl Module>,
+    trait_method_func_id: hir_def::FunctionId,
+    derive_impl_id: BuiltinDeriveImplId,
+    derive_method: BuiltinDeriveImplMethod,
+    resolved_args: GenericArgs<'_>,
+) -> FuncId {
+    assert!(
+        matches!(derive_method, BuiltinDeriveImplMethod::fmt),
+        "unsupported builtin-derive vtable method: {:?}::{:?}",
+        derive_impl_id,
+        derive_method
+    );
+
+    let sig = build_fn_sig_from_ty(
+        fx.isa,
+        fx.db(),
+        fx.dl,
+        fx.env(),
+        trait_method_func_id,
+        resolved_args,
+    )
+    .expect("builtin-derive vtable method sig");
+    assert!(
+        !sig.params.iter().any(|param| param.purpose == ArgumentPurpose::StructReturn),
+        "builtin-derive vtable shim with sret return is unsupported: {:?}::{:?}",
+        derive_impl_id,
+        derive_method
+    );
+
+    let trait_method_name = symbol_mangling::mangle_function(
+        fx.db(),
+        trait_method_func_id,
+        resolved_args,
+        fx.ext_crate_disambiguators(),
+    );
+    let shim_name = format!("__builtin_derive_vtable_shim_{trait_method_name}");
+
+    let shim_id = fx
+        .module
+        .declare_function(&shim_name, Linkage::Local, &sig)
+        .expect("declare builtin-derive vtable shim");
+
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, shim_id.as_u32()),
+        sig.clone(),
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let entry_block = bcx.create_block();
+        bcx.switch_to_block(entry_block);
+        bcx.append_block_params_for_function_params(entry_block);
+
+        // Builtin derive `Debug::fmt` is modeled as always succeeding here;
+        // `fmt::Result` uses discriminant 0 for `Ok(())`.
+        let mut ret_values = Vec::with_capacity(sig.returns.len());
+        for ret in &sig.returns {
+            let ty = ret.value_type;
+            let zero = if ty.is_int() {
+                bcx.ins().iconst(ty, 0)
+            } else if ty == types::F32 {
+                bcx.ins().f32const(0.0)
+            } else if ty == types::F64 {
+                bcx.ins().f64const(0.0)
+            } else {
+                panic!(
+                    "builtin-derive vtable shim return type is unsupported: {:?}::{:?} ret_ty={:?}",
+                    derive_impl_id,
+                    derive_method,
+                    ty
+                );
+            };
+            ret_values.push(zero);
+        }
+        bcx.ins().return_(&ret_values);
+
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::for_function(func);
+    match fx.module.define_function(shim_id, &mut ctx) {
+        Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
+        Err(e) => panic!("define builtin-derive vtable shim: {e}"),
+    }
+
+    shim_id
+}
+
 fn get_or_create_vtable(
     fx: &mut FunctionCx<'_, impl Module>,
     concrete_ty: StoredTy,
@@ -991,29 +1081,14 @@ fn get_or_create_vtable(
     let simplified =
         simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
             .expect("cannot simplify concrete type for vtable lookup");
-    let impl_id = find_trait_impl_for_simplified_ty(fx.db(), trait_id, &simplified, krate);
 
     // Closure traits (`Fn` / `FnMut` / `FnOnce`) are built-in and often don't
     // show up as explicit impl items in TraitImpls. In that case, wire the
     // vtable method slot directly to the closure body symbol.
-    let closure_fallback = if impl_id.is_none() {
-        match concrete_ty.as_ref().kind() {
-            TyKind::Closure(closure_id, closure_subst) => {
-                Some((closure_id.0, closure_subst.store()))
-            }
-            _ => None,
-        }
-    } else {
-        None
+    let closure_fallback = match concrete_ty.as_ref().kind() {
+        TyKind::Closure(closure_id, closure_subst) => Some((closure_id.0, closure_subst.store())),
+        _ => None,
     };
-
-    assert!(
-        impl_id.is_some() || closure_fallback.is_some(),
-        "no impl found for vtable: trait={:?}, concrete_ty={:?}, simplified={:?}",
-        trait_id,
-        concrete_ty,
-        simplified
-    );
 
     // Collect vtable methods in declaration order.
     // For closure fallback (`Fn`/`FnMut`/`FnOnce`), include supertrait methods
@@ -1084,15 +1159,18 @@ fn get_or_create_vtable(
     data.define(vtable_bytes.into_boxed_slice());
 
     // Slot 3+: trait method fn ptrs — emit as relocations
-    let closure_func_id = closure_fallback.map(|(closure_id, closure_subst)| {
+    let closure_func_id = closure_fallback.as_ref().map(|(closure_id, closure_subst)| {
         let closure_body = fx
             .db()
-            .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
+            .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), fx.env().clone())
             .expect("failed to get closure MIR for vtable");
         let closure_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
             .expect("closure sig for vtable");
-        let closure_name =
-            symbol_mangling::mangle_closure(fx.db(), closure_id, fx.ext_crate_disambiguators());
+        let closure_name = symbol_mangling::mangle_closure(
+            fx.db(),
+            *closure_id,
+            fx.ext_crate_disambiguators(),
+        );
         fx.module
             .declare_function(&closure_name, Linkage::Import, &closure_sig)
             .expect("declare closure vtable method")
@@ -1100,49 +1178,7 @@ fn get_or_create_vtable(
 
     for (method_idx, trait_method_func_id) in method_func_ids.iter().enumerate() {
         let trait_method_name = fx.db().function_signature(*trait_method_func_id).name.clone();
-        let func_id = if impl_id.is_some() {
-            let trait_method_subst = trait_method_substs_for_receiver(
-                fx.db(),
-                krate,
-                *trait_method_func_id,
-                &concrete_ty,
-            );
-            let (impl_func_id, impl_generic_args) =
-                match fx
-                    .db()
-                    .lookup_impl_method(fx.env().as_ref(), *trait_method_func_id, trait_method_subst)
-                {
-                    (Either::Left(resolved_id), resolved_args) => (resolved_id, resolved_args),
-                    (Either::Right((derive_impl_id, derive_method)), _) => {
-                        panic!(
-                            "unsupported builtin-derive vtable method: {:?}::{:?}",
-                            derive_impl_id, derive_method
-                        );
-                    }
-                };
-
-            // Declare/import the impl function.
-            let impl_body = fx
-                .db()
-                .monomorphized_mir_body(
-                    impl_func_id.into(),
-                    impl_generic_args.clone().store(),
-                    fx.env().clone(),
-                )
-                .expect("failed to get impl method MIR for vtable");
-            let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
-                .expect("impl method sig for vtable");
-            let impl_fn_name = symbol_mangling::mangle_function(
-                fx.db(),
-                impl_func_id,
-                impl_generic_args,
-                fx.ext_crate_disambiguators(),
-            );
-
-            fx.module
-                .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
-                .expect("declare vtable method")
-        } else {
+        let func_id = if closure_fallback.is_some() {
             let closure_func_id = closure_func_id.expect("closure vtable method func id");
             assert!(
                 matches!(trait_method_name.as_str(), "call" | "call_mut" | "call_once"),
@@ -1150,6 +1186,60 @@ fn get_or_create_vtable(
                 trait_method_name.as_str()
             );
             closure_func_id
+        } else {
+            let trait_method_subst = trait_method_substs_for_receiver(
+                fx.db(),
+                krate,
+                *trait_method_func_id,
+                &concrete_ty,
+            );
+            let resolved_method =
+                match fx
+                    .db()
+                    .lookup_impl_method(fx.env().as_ref(), *trait_method_func_id, trait_method_subst)
+                {
+                    (Either::Left(resolved_id), resolved_args) => {
+                        Either::Left((resolved_id, resolved_args.store()))
+                    }
+                    (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
+                        Either::Right((derive_impl_id, derive_method, resolved_args.store()))
+                    }
+                };
+            match resolved_method {
+                Either::Left((impl_func_id, impl_generic_args)) => {
+                    let impl_generic_args = impl_generic_args.as_ref();
+                    // Declare/import the impl function.
+                    let impl_body = fx
+                        .db()
+                        .monomorphized_mir_body(
+                            impl_func_id.into(),
+                            impl_generic_args.clone().store(),
+                            fx.env().clone(),
+                        )
+                        .expect("failed to get impl method MIR for vtable");
+                    let impl_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &impl_body)
+                        .expect("impl method sig for vtable");
+                    let impl_fn_name = symbol_mangling::mangle_function(
+                        fx.db(),
+                        impl_func_id,
+                        impl_generic_args,
+                        fx.ext_crate_disambiguators(),
+                    );
+
+                    fx.module
+                        .declare_function(&impl_fn_name, Linkage::Import, &impl_sig)
+                        .expect("declare vtable method")
+                }
+                Either::Right((derive_impl_id, derive_method, resolved_args)) => {
+                    declare_builtin_derive_vtable_shim(
+                        fx,
+                        *trait_method_func_id,
+                        derive_impl_id,
+                        derive_method,
+                        resolved_args.as_ref(),
+                    )
+                }
+            }
         };
 
         let func_ref = fx.module.declare_func_in_data(func_id, &mut data);
@@ -5056,18 +5146,7 @@ fn collect_vtable_methods(
     // Extract the concrete source type
     let from_ty = operand_ty(db, body, &operand.kind);
     let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
-
-    let interner = DbInterner::new_no_crate(db);
-    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
     let source_pointee_stored = source_pointee.store();
-    let Some(simplified) =
-        simplify_type(interner, source_pointee, TreatParams::InstantiateWithInfer)
-    else {
-        return;
-    };
-    if find_trait_impl_for_simplified_ty(db, trait_id, &simplified, local_crate).is_none() {
-        return;
-    }
 
     // Add all trait method implementations to the queue
     let trait_items = trait_id.trait_items(db);
@@ -5081,30 +5160,6 @@ fn collect_vtable_methods(
             queue.push_back((impl_func_id, impl_generic_args.store()));
         }
     }
-}
-
-fn find_trait_impl_for_simplified_ty<'db>(
-    db: &'db dyn HirDatabase,
-    trait_id: TraitId,
-    simplified: &hir_ty::next_solver::SimplifiedType,
-    local_crate: base_db::Crate,
-) -> Option<hir_def::ImplId> {
-    let mut search_order: Vec<base_db::Crate> = vec![local_crate];
-    for &krate in db.all_crates().iter() {
-        if krate != local_crate {
-            search_order.push(krate);
-        }
-    }
-
-    for krate in search_order {
-        let trait_impls = TraitImpls::for_crate(db, krate);
-        let (impl_ids, _) = trait_impls.for_trait_and_self_ty(trait_id, simplified);
-        if let Some(&impl_id) = impl_ids.first() {
-            return Some(impl_id);
-        }
-    }
-
-    None
 }
 
 /// Generate a `drop_in_place::<T>` glue function for the given type.
