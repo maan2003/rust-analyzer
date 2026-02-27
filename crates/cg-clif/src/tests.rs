@@ -63,6 +63,28 @@ unsafe extern "C" fn jit_rust_alloc_zeroed(size: usize, align: usize) -> *mut u8
 
 unsafe extern "C" fn jit_rust_no_alloc_shim_is_unstable_v2() {}
 
+// Miri-only runtime hook used behind `#[cfg(miri)]` in core.
+// In this native JIT harness it is intentionally a no-op.
+extern "C" fn jit_miri_promise_symbolic_alignment(_ptr: *const (), _align: usize) {}
+
+std::thread_local! {
+    static JIT_STD_INTERNAL_RANDOM_KEYS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321)) };
+}
+
+// This symbol is used as the thread-local key initializer callback
+// (`LocalKey::new`) in std random-state paths: `fn(Option<&mut Option<T>>) -> *const T`.
+fn jit_rust_std_internal_init_fn(
+    arg: Option<&mut Option<std::cell::Cell<(u64, u64)>>>,
+) -> *const std::cell::Cell<(u64, u64)> {
+    JIT_STD_INTERNAL_RANDOM_KEYS.with(|keys| {
+        if let Some(slot) = arg {
+            *slot = Some(std::cell::Cell::new(keys.get()));
+        }
+        keys as *const std::cell::Cell<(u64, u64)>
+    })
+}
+
 use crate::symbol_mangling;
 
 // ---------------------------------------------------------------------------
@@ -371,6 +393,11 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
         );
+        jit_builder.symbol(
+            "miri_promise_symbolic_alignment",
+            jit_miri_promise_symbolic_alignment as *const u8,
+        );
+        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         // Use the first function's crate as local_crate (all test fns are in same crate)
@@ -1701,6 +1728,11 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
         );
+        jit_builder.symbol(
+            "miri_promise_symbolic_alignment",
+            jit_miri_promise_symbolic_alignment as *const u8,
+        );
+        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -2001,6 +2033,11 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
         );
+        jit_builder.symbol(
+            "miri_promise_symbolic_alignment",
+            jit_miri_promise_symbolic_alignment as *const u8,
+        );
+        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -3654,6 +3691,21 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn jit_slice_get_unchecked_intrinsic_probe() {
+    let result: i32 = jit_run(
+        r#"
+fn foo() -> i32 {
+    let arr = [11_i32, 22, 33];
+    unsafe { *arr.get_unchecked(1usize) }
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 22);
+}
+
+#[test]
 fn jit_write_bytes_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"
@@ -3690,6 +3742,21 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 42);
+}
+
+#[test]
+fn std_jit_slice_get_unchecked_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let bytes = [10_u8, 20, 30];
+    let s: &[u8] = &bytes;
+    unsafe { *s.get_unchecked(1usize) as i32 }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 20);
 }
 
 // ---------------------------------------------------------------------------

@@ -2579,6 +2579,21 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                 BackendRepr::Scalar(scalar) => {
                     let raw_bits = const_to_u128(fx.db(), konst.as_ref(), scalar.size(fx.dl));
                     let val = match scalar.primitive() {
+                        Primitive::Pointer(_) => {
+                            let const_memory_map = {
+                                let val = resolve_const_value(fx.db(), konst.as_ref());
+                                val.value.inner().memory_map.clone()
+                            };
+                            let addr_to_gv = create_const_data_sections(fx, &const_memory_map);
+                            codegen_scalar_const(
+                                fx,
+                                &scalar,
+                                raw_bits,
+                                &addr_to_gv,
+                                Some(&const_memory_map),
+                                Some(ty),
+                            )
+                        }
                         Primitive::Float(rustc_abi::Float::F32) => {
                             fx.bcx.ins().f32const(f32::from_bits(raw_bits as u32))
                         }
@@ -2622,8 +2637,22 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                     // building a mapping of old addresses → GlobalValues.
                     let addr_to_gv = create_const_data_sections(fx, &const_memory_map);
 
-                    let a_val = codegen_scalar_const(fx, &a_scalar, a_raw, &addr_to_gv);
-                    let b_val = codegen_scalar_const(fx, &b_scalar, b_raw, &addr_to_gv);
+                    let a_val = codegen_scalar_const(
+                        fx,
+                        &a_scalar,
+                        a_raw,
+                        &addr_to_gv,
+                        Some(&const_memory_map),
+                        Some(ty),
+                    );
+                    let b_val = codegen_scalar_const(
+                        fx,
+                        &b_scalar,
+                        b_raw,
+                        &addr_to_gv,
+                        Some(&const_memory_map),
+                        Some(ty),
+                    );
                     CValue::by_val_pair(a_val, b_val, layout)
                 }
                 _ => {
@@ -2688,6 +2717,156 @@ fn create_const_data_sections(
     map
 }
 
+/// Lower a const-eval vtable-map id to a code pointer when the mapped type
+/// is callable (`FnDef` or closure).
+fn codegen_const_callable_from_vtable_id(
+    fx: &mut FunctionCx<'_, impl Module>,
+    vtable_id: usize,
+    memory_map: &hir_ty::MemoryMap<'_>,
+) -> Option<Value> {
+    let mapped_ty = memory_map.vtable_ty(vtable_id).ok()?;
+    match mapped_ty.kind() {
+        TyKind::FnDef(def, generic_args) => {
+            let CallableDefId::FunctionId(mut callee_func_id) = def.0 else {
+                return None;
+            };
+            let mut callee_args = generic_args;
+
+            if let ItemContainerId::TraitId(_) = callee_func_id.loc(fx.db()).container {
+                let interner = DbInterner::new_no_crate(fx.db());
+                if hir_ty::method_resolution::is_dyn_method(
+                    interner,
+                    fx.env().param_env(),
+                    callee_func_id,
+                    callee_args,
+                )
+                .is_none()
+                {
+                    match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, callee_args)
+                    {
+                        (Either::Left(resolved_id), resolved_args) => {
+                            callee_func_id = resolved_id;
+                            callee_args = resolved_args;
+                        }
+                        (Either::Right(_), _) => return None,
+                    }
+                }
+            }
+
+            let is_extern =
+                matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
+            let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
+            let interner = DbInterner::new_no_crate(fx.db());
+            let empty_args = GenericArgs::empty(interner);
+
+            let (callee_sig, callee_name) = if is_extern {
+                let sig =
+                    build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
+                        .expect("extern fn sig for const fn ptr");
+                let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
+                (sig, name)
+            } else if is_cross_crate {
+                let sig = build_fn_sig_from_ty(
+                    fx.isa,
+                    fx.db(),
+                    fx.dl,
+                    fx.env(),
+                    callee_func_id,
+                    callee_args,
+                )
+                .expect("cross-crate fn sig for const fn ptr");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    callee_func_id,
+                    callee_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            } else {
+                let callee_body = fx
+                    .db()
+                    .monomorphized_mir_body(callee_func_id.into(), callee_args.store(), fx.env().clone())
+                    .expect("failed to get local callee MIR for const fn ptr");
+                let sig =
+                    build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("const fn ptr sig");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    callee_func_id,
+                    callee_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            };
+
+            let callee_id = fx
+                .module
+                .declare_function(&callee_name, Linkage::Import, &callee_sig)
+                .expect("declare callee for const fn ptr");
+            let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+            Some(fx.bcx.ins().func_addr(fx.pointer_type, callee_ref))
+        }
+        TyKind::Closure(closure_id, closure_subst) => {
+            let (closure_sig, closure_name) = match fx
+                .db()
+                .monomorphized_mir_body_for_closure(closure_id.0, closure_subst.store(), fx.env().clone())
+            {
+                Ok(closure_body) => {
+                    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
+                        .expect("closure sig for const fn ptr");
+                    let name = symbol_mangling::mangle_closure(
+                        fx.db(),
+                        closure_id.0,
+                        closure_subst,
+                        fx.ext_crate_disambiguators(),
+                    );
+                    (sig, name)
+                }
+                Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
+                    let fn_ptr_ty = closure_subst.split_closure_args().closure_sig_as_fn_ptr_ty;
+                    let sig = build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)?;
+                    (sig, name)
+                }
+                Err(_) => return None,
+            };
+            let closure_func_id = fx
+                .module
+                .declare_function(&closure_name, Linkage::Import, &closure_sig)
+                .expect("declare closure for const fn ptr");
+            let closure_ref = fx.module.declare_func_in_func(closure_func_id, fx.bcx.func);
+            Some(fx.bcx.ins().func_addr(fx.pointer_type, closure_ref))
+        }
+        _ => None,
+    }
+}
+
+fn build_fn_ptr_sig_from_ty(
+    isa: &dyn TargetIsa,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    fn_ptr_ty: hir_ty::next_solver::Ty<'_>,
+) -> Option<Signature> {
+    let TyKind::FnPtr(sig_tys, _header) = fn_ptr_ty.kind() else {
+        return None;
+    };
+
+    let mut sig = Signature::new(isa.default_call_conv());
+    let sig_tys_inner = sig_tys.clone().skip_binder();
+
+    let output = sig_tys_inner.output();
+    if !output.is_never() {
+        let ret_layout = db.layout_of_ty(output.store(), env.clone()).ok()?;
+        append_ret_to_sig(&mut sig, dl, &ret_layout);
+    }
+
+    for &param_ty in sig_tys_inner.inputs() {
+        let param_layout = db.layout_of_ty(param_ty.store(), env.clone()).ok()?;
+        append_param_to_sig(&mut sig, dl, &param_layout);
+    }
+
+    Some(sig)
+}
+
 /// Emit a Cranelift Value for a single scalar constant.
 /// If the scalar is a pointer and the address matches an entry in `addr_to_gv`,
 /// emits a `symbol_value` (relocation). Otherwise, emits an `iconst` or float const.
@@ -2696,6 +2875,8 @@ fn codegen_scalar_const(
     scalar: &Scalar,
     raw: u128,
     addr_to_gv: &HashMap<usize, cranelift_codegen::ir::GlobalValue>,
+    memory_map: Option<&hir_ty::MemoryMap<'_>>,
+    _const_ty: Option<&StoredTy>,
 ) -> Value {
     match scalar.primitive() {
         Primitive::Pointer(_) => {
@@ -2704,8 +2885,11 @@ fn codegen_scalar_const(
                 fx.bcx.ins().symbol_value(fx.pointer_type, gv)
             } else if addr == 0 {
                 iconst_from_bits(&mut fx.bcx, fx.pointer_type, 0)
+            } else if let Some(ptr) = memory_map
+                .and_then(|mm| codegen_const_callable_from_vtable_id(fx, addr, mm))
+            {
+                ptr
             } else {
-                // Unknown address — treat as raw integer (shouldn't normally happen)
                 iconst_from_bits(&mut fx.bcx, fx.pointer_type, raw)
             }
         }
@@ -3906,7 +4090,6 @@ fn codegen_intrinsic_call(
                 Some(fx.bcx.ins().sdiv_imm(diff_bytes, pointee_size as i64))
             }
         }
-
         // --- size / alignment queries ---
         "size_of" => {
             let layout = generic_ty_layout.clone().expect("size_of: layout error");
