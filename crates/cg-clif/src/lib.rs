@@ -750,8 +750,12 @@ fn codegen_cast(
             .expect("failed to get closure MIR for ClosureFnPointer");
         let closure_sig =
             build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
-        let closure_name =
-            symbol_mangling::mangle_closure(fx.db(), closure_id.0, fx.ext_crate_disambiguators());
+        let closure_name = symbol_mangling::mangle_closure(
+            fx.db(),
+            closure_id.0,
+            closure_subst,
+            fx.ext_crate_disambiguators(),
+        );
         let closure_func_id = fx
             .module
             .declare_function(&closure_name, Linkage::Import, &closure_sig)
@@ -1169,6 +1173,7 @@ fn get_or_create_vtable(
         let closure_name = symbol_mangling::mangle_closure(
             fx.db(),
             *closure_id,
+            closure_subst.as_ref(),
             fx.ext_crate_disambiguators(),
         );
         fx.module
@@ -1722,6 +1727,25 @@ fn remap_variant_index_to_discriminant(
     mapped
 }
 
+/// Pick which scalar lane of a `ScalarPair` holds the enum tag.
+///
+/// For niche-encoded enums like `Option<(usize, &T)>`, `tag_field` can point
+/// at a composite payload field while the actual niche tag lives in one of that
+/// field's scalar ABI lanes.
+fn scalar_pair_tag_lane(a: Scalar, b: Scalar, tag: &Scalar, tag_field: rac_abi::FieldIdx) -> usize {
+    if a == *tag && b != *tag {
+        0
+    } else if b == *tag && a != *tag {
+        1
+    } else {
+        match tag_field.as_usize() {
+            0 => 0,
+            1 => 1,
+            idx => panic!("invalid scalar-pair tag field index: {idx}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
@@ -2042,9 +2066,13 @@ pub(crate) fn codegen_get_discriminant(
             // Read the tag value — handle register and memory places
             let tag_val = match place.layout.backend_repr {
                 BackendRepr::Scalar(_) => place.to_cvalue(fx).load_scalar(fx),
-                BackendRepr::ScalarPair(_, _) => {
+                BackendRepr::ScalarPair(a_scalar, b_scalar) => {
                     let (a, b) = place.to_cvalue(fx).load_scalar_pair(fx);
-                    if tag_field.as_usize() == 0 { a } else { b }
+                    match scalar_pair_tag_lane(a_scalar, b_scalar, tag, *tag_field) {
+                        0 => a,
+                        1 => b,
+                        _ => unreachable!(),
+                    }
                 }
                 _ => {
                     let tag_offset = place.layout.fields.offset(tag_field.as_usize());
@@ -2148,22 +2176,37 @@ pub(crate) fn codegen_set_discriminant(
 
             match tag_encoding {
                 TagEncoding::Direct => {
-                    let ptr = place.place_field(fx, tag_field.as_usize(), tag_layout);
                     let tag_clif_ty = scalar_to_clif_type(fx.dl, tag);
                     let discr_bits =
                         enum_variant_discriminant_bits(fx.db(), enum_ty, variant_index);
                     let discr_bits = tag.size(fx.dl).truncate(discr_bits);
                     let to = iconst_from_bits(&mut fx.bcx, tag_clif_ty, discr_bits);
-                    ptr.write_cvalue(fx, CValue::by_val(to, ptr.layout.clone()));
+
+                    if let BackendRepr::ScalarPair(a_scalar, b_scalar) = place.layout.backend_repr {
+                        let lane = scalar_pair_tag_lane(a_scalar, b_scalar, tag, *tag_field);
+                        let tag_place = place.place_scalar_pair_lane(fx, lane, tag_layout);
+                        tag_place.write_cvalue(fx, CValue::by_val(to, tag_place.layout.clone()));
+                    } else {
+                        let ptr = place.place_field(fx, tag_field.as_usize(), tag_layout);
+                        ptr.write_cvalue(fx, CValue::by_val(to, ptr.layout.clone()));
+                    }
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                     if variant_index != *untagged_variant {
-                        let niche = place.place_field(fx, tag_field.as_usize(), tag_layout);
                         let niche_type = scalar_to_clif_type(fx.dl, tag);
                         let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
                         let niche_value = (niche_value as u128).wrapping_add(*niche_start);
                         let niche_value = iconst_from_bits(&mut fx.bcx, niche_type, niche_value);
-                        niche.write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
+
+                        if let BackendRepr::ScalarPair(a_scalar, b_scalar) = place.layout.backend_repr {
+                            let lane = scalar_pair_tag_lane(a_scalar, b_scalar, tag, *tag_field);
+                            let niche = place.place_scalar_pair_lane(fx, lane, tag_layout);
+                            niche
+                                .write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
+                        } else {
+                            let niche = place.place_field(fx, tag_field.as_usize(), tag_layout);
+                            niche.write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
+                        }
                     }
                 }
             }
@@ -3167,13 +3210,17 @@ fn codegen_closure_call(
     // Get closure MIR body to build the signature
     let closure_body = fx
         .db()
-        .monomorphized_mir_body_for_closure(closure_id, closure_subst, fx.env().clone())
+        .monomorphized_mir_body_for_closure(closure_id, closure_subst.clone(), fx.env().clone())
         .expect("closure MIR");
     let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
 
     // Generate mangled name
-    let closure_name =
-        symbol_mangling::mangle_closure(fx.db(), closure_id, fx.ext_crate_disambiguators());
+    let closure_name = symbol_mangling::mangle_closure(
+        fx.db(),
+        closure_id,
+        closure_subst.as_ref(),
+        fx.ext_crate_disambiguators(),
+    );
 
     // Declare in module (Import linkage — defined elsewhere in same module)
     let callee_id =
@@ -3942,6 +3989,39 @@ fn codegen_intrinsic_call(
             }
             return true;
         }
+        "slice_get_unchecked" | "slice_get_unchecked_mut" => {
+            assert_eq!(args.len(), 2, "{name} expects 2 args");
+
+            let slice = codegen_operand(fx, &args[0].kind);
+            let index = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let data_ptr = match slice.layout.backend_repr {
+                BackendRepr::ScalarPair(_, _) => slice.load_scalar_pair(fx).0,
+                BackendRepr::Scalar(_) => slice.load_scalar(fx),
+                _ => panic!("{name} first argument must be pointer-like"),
+            };
+
+            let arg0_ty = operand_ty(fx.db(), body, &args[0].kind);
+            let pointee = arg0_ty
+                .as_ref()
+                .builtin_deref(true)
+                .expect("slice_get_unchecked first argument must be pointer/reference");
+            let elem_ty = match pointee.kind() {
+                TyKind::Slice(elem) | TyKind::Array(elem, _) => elem.store(),
+                _ => panic!("{name} first argument pointee must be slice/array, got {pointee:?}"),
+            };
+            let elem_layout = fx
+                .db()
+                .layout_of_ty(elem_ty, fx.env().clone())
+                .expect("slice_get_unchecked element layout error");
+
+            let index = codegen_intcast(fx, index, fx.pointer_type, false);
+            let byte_offset = if elem_layout.size.bytes() == 1 {
+                index
+            } else {
+                fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64)
+            };
+            Some(fx.bcx.ins().iadd(data_ptr, byte_offset))
+        }
         "type_id" | "type_name" => {
             // These are complex; fall through to let them be unresolved
             // (they need const eval or string allocation)
@@ -4180,6 +4260,41 @@ fn codegen_intrinsic_call(
                 types::I32,
                 &[lhs_ptr, rhs_ptr, byte_count],
             ))
+        }
+        "three_way_compare" => {
+            assert_eq!(args.len(), 2, "three_way_compare expects 2 args");
+
+            let lhs = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let rhs = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
+            let signed = matches!(arg_ty.as_ref().kind(), TyKind::Int(_));
+
+            let lt_cc = if signed { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
+            let gt_cc =
+                if signed { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan };
+            let is_lt = fx.bcx.ins().icmp(lt_cc, lhs, rhs);
+            let is_gt = fx.bcx.ins().icmp(gt_cc, lhs, rhs);
+
+            let dest = codegen_place(fx, destination);
+            let BackendRepr::Scalar(order_scalar) = dest.layout.backend_repr else {
+                panic!("three_way_compare destination must be scalar")
+            };
+            let order_ty = scalar_to_clif_type(fx.dl, &order_scalar);
+            let less = fx.bcx.ins().iconst(order_ty, -1);
+            let equal = fx.bcx.ins().iconst(order_ty, 0);
+            let greater = fx.bcx.ins().iconst(order_ty, 1);
+            let non_lt = fx.bcx.ins().select(is_gt, greater, equal);
+            let ordering = fx.bcx.ins().select(is_lt, less, non_lt);
+
+            dest.write_cvalue(fx, CValue::by_val(ordering, dest.layout.clone()));
+            if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                fx.set_drop_flag(destination.local);
+            }
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
         }
         "read_via_copy" => {
             assert_eq!(args.len(), 1, "read_via_copy expects 1 arg");
@@ -5807,8 +5922,12 @@ pub fn compile_executable(
         let body = db
             .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
             .map_err(|e| format!("MIR error for closure: {:?}", e))?;
-        let closure_name =
-            symbol_mangling::mangle_closure(db, *closure_id, ext_crate_disambiguators);
+        let closure_name = symbol_mangling::mangle_closure(
+            db,
+            *closure_id,
+            closure_subst.as_ref(),
+            ext_crate_disambiguators,
+        );
         if !compiled_closure_symbols.insert(closure_name.clone()) {
             continue;
         }

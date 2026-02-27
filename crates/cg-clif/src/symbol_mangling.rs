@@ -113,12 +113,12 @@ pub fn mangle_static(
 
 /// Produce a symbol name for a closure.
 ///
-/// Uses a simple scheme: `_Rclosure_{owner_crate}_{closure_id}` since closures
-/// don't have a proper DefPath in r-a. The InternedClosureId is used as a
-/// unique identifier within the crate.
+/// Uses a simple scheme based on `_Rclosure_{owner_crate}_{closure_id}` with
+/// optional type-argument encoding for monomorphized closure instances.
 pub fn mangle_closure(
     db: &dyn HirDatabase,
     closure_id: hir_ty::db::InternedClosureId,
+    generic_args: GenericArgs<'_>,
     ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> String {
     let def = db.lookup_intern_closure(closure_id);
@@ -132,8 +132,36 @@ pub fn mangle_closure(
         .map(|dn| dn.crate_name().to_string())
         .unwrap_or_else(|| format!("crate{}", file_dis));
     let disamb = ext_crate_disambiguators.get(&crate_name).copied().unwrap_or(file_dis);
-    // Use a simple unique name: crate + disambiguator + closure intern id
-    format!("_Rclosure_{}_{:x}_{:?}", crate_name, disamb, closure_id)
+
+    let out = format!("_Rclosure_{}_{:x}_{:?}", crate_name, disamb, closure_id);
+
+    // Mirror function symbol behavior: encode non-lifetime type args so
+    // multiple monomorphized instances of the same closure id don't collide.
+    let ty_args: Vec<_> = generic_args
+        .iter()
+        .filter_map(|arg| match arg.kind() {
+            GenericArgKind::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect();
+
+    if ty_args.is_empty() {
+        return out;
+    }
+
+    let mut m = SymbolMangler {
+        db,
+        start_offset: out.len(),
+        out,
+        ext_crate_disambiguators,
+        module_paths: HashMap::new(),
+    };
+    m.out.push('I');
+    for ty in &ty_args {
+        m.print_type(*ty);
+    }
+    m.out.push('E');
+    m.out
 }
 
 /// Produce a symbol name for a `drop_in_place::<T>` glue function.

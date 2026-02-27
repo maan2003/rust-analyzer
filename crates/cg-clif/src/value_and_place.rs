@@ -424,6 +424,42 @@ impl CPlace {
         }
     }
 
+    /// Project directly to lane `0`/`1` of a ScalarPair place.
+    ///
+    /// This bypasses `FieldsShape` indexing and is used when an enum niche tag
+    /// is stored in one scalar lane of a composite payload field.
+    pub(crate) fn place_scalar_pair_lane(
+        &self,
+        fx: &mut FunctionCx<'_, impl Module>,
+        lane: usize,
+        lane_layout: Arc<Layout>,
+    ) -> CPlace {
+        let BackendRepr::ScalarPair(a_scalar, b_scalar) = self.layout.backend_repr else {
+            panic!("place_scalar_pair_lane on non-ScalarPair layout");
+        };
+
+        match self.inner {
+            CPlaceInner::VarPair(var1, var2) => match lane {
+                0 => CPlace { inner: CPlaceInner::Var(var1), layout: lane_layout },
+                1 => CPlace { inner: CPlaceInner::Var(var2), layout: lane_layout },
+                _ => panic!("scalar pair lane index out of range: {lane}"),
+            },
+            CPlaceInner::Addr(ptr, None) => {
+                let b_off = scalar_pair_b_offset(fx.dl, a_scalar, b_scalar);
+                let lane_ptr = match lane {
+                    0 => ptr,
+                    1 => ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off),
+                    _ => panic!("scalar pair lane index out of range: {lane}"),
+                };
+                CPlace::for_ptr(lane_ptr, lane_layout)
+            }
+            CPlaceInner::Addr(_, Some(_)) => {
+                panic!("place_scalar_pair_lane does not support unsized Addr places")
+            }
+            CPlaceInner::Var(_) => panic!("place_scalar_pair_lane on scalar Var place"),
+        }
+    }
+
     /// Take a reference to this place, producing a CValue.
     /// For unsized places (with metadata), produces a fat pointer (ScalarPair).
     /// For sized places, produces a thin pointer (Scalar).

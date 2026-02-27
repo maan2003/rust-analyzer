@@ -1749,7 +1749,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             let body = db
                 .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
-            let closure_name = crate::symbol_mangling::mangle_closure(&db, *closure_id, &empty_map);
+            let closure_name =
+                crate::symbol_mangling::mangle_closure(&db, *closure_id, closure_subst.as_ref(), &empty_map);
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 continue;
             }
@@ -2114,8 +2115,12 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             let body = db
                 .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
-            let closure_name =
-                crate::symbol_mangling::mangle_closure(&db, *closure_id, &disambiguators);
+            let closure_name = crate::symbol_mangling::mangle_closure(
+                &db,
+                *closure_id,
+                closure_subst.as_ref(),
+                &disambiguators,
+            );
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 if trace_enabled {
                     eprintln!("std-jit: skipping duplicate closure definition for {closure_name}");
@@ -2861,7 +2866,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: monomorphization errors in alloc::collections::btree node descent"]
 fn std_jit_btreemap_range_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2876,6 +2880,44 @@ fn foo() -> i32 {
         sum += *value;
     }
     (sum == 50) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_option_tuple_ref_niche_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let v = 1_i32;
+    let x: Option<(usize, &i32)> = Some((0usize, &v));
+    match x {
+        Some((idx, r)) => (idx as i32) * 10 + *r,
+        None => -1,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_btreemap_get_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::BTreeMap<i32, i32> = std::collections::BTreeMap::new();
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+    match map.get(&2) {
+        Some(v) => (*v == 20) as i32,
+        None => 0,
+    }
 }
 "#,
         "foo",
