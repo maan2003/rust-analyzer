@@ -33,6 +33,7 @@ use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
     Rvalue, StatementKind, TerminatorKind, UnOp,
 };
+use intern::sym;
 use hir_ty::next_solver::{
     Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
     ValueConst,
@@ -990,7 +991,13 @@ fn codegen_unsize_coercion(
         ),
     };
 
-    CValue::by_val_pair(data_ptr, metadata, result_layout.clone())
+    match result_layout.backend_repr {
+        BackendRepr::ScalarPair(_, _) => {
+            CValue::by_val_pair(data_ptr, metadata, result_layout.clone())
+        }
+        BackendRepr::Scalar(_) => CValue::by_val(data_ptr, result_layout.clone()),
+        _ => panic!("unsupported unsize result layout: {:?}", result_layout.backend_repr),
+    }
 }
 
 /// Build or retrieve a vtable for `concrete_ty` implementing `trait_id`.
@@ -2309,12 +2316,15 @@ fn codegen_binop(
             let rhs_val = rhs_cval.load_scalar(fx);
 
             // Overflow binops return (T, bool) as a ScalarPair
-            if matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow)
-            {
+            if matches!(
+                op,
+                BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow
+            ) {
                 let Primitive::Int(_, signed) = scalar.primitive() else {
                     panic!("overflow binop on non-integer type");
                 };
-                let (res, has_overflow) = codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
+                let (res, has_overflow) =
+                    codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
                 let BackendRepr::ScalarPair(_, overflow_scalar) = result_layout.backend_repr else {
                     panic!("overflow binop must return ScalarPair");
                 };
@@ -2806,7 +2816,8 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
 
                     let slot = CPlace::new_stack_slot(fx, layout.clone());
                     let dst = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
-                    let byte_count = fx.bcx.ins().iconst(fx.pointer_type, const_memory.len() as i64);
+                    let byte_count =
+                        fx.bcx.ins().iconst(fx.pointer_type, const_memory.len() as i64);
                     fx.bcx.call_memcpy(fx.module.target_config(), dst, blob_ptr, byte_count);
 
                     let const_allocs = create_const_data_sections(fx, &const_memory_map);
@@ -2836,9 +2847,11 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                             if let Some(patched_ptr) =
                                 const_ptr_from_data_alloc(fx, raw_addr, &const_allocs)
                             {
-                                let field_ptr = slot
-                                    .to_ptr()
-                                    .offset_i64(&mut fx.bcx, fx.pointer_type, offset as i64);
+                                let field_ptr = slot.to_ptr().offset_i64(
+                                    &mut fx.bcx,
+                                    fx.pointer_type,
+                                    offset as i64,
+                                );
                                 field_ptr.store(&mut fx.bcx, patched_ptr, flags);
                             }
                         }
@@ -3141,34 +3154,102 @@ fn codegen_scalar_const(
     }
 }
 
-/// Store a call's return value into `dest` and jump to the continuation block
+fn call_result_unsize_metadata(
+    fx: &mut FunctionCx<'_, impl Module>,
+    source_return_ty: &StoredTy,
+    destination_place: &Place,
+) -> Value {
+    let Some(src_pointee) = source_return_ty.as_ref().builtin_deref(true) else {
+        panic!("cannot unsize non-pointer call return: {:?}", source_return_ty);
+    };
+    let dest_ty = place_ty(fx.db(), fx.ra_body(), destination_place);
+    let Some(dest_pointee) = dest_ty.as_ref().builtin_deref(true) else {
+        panic!("call destination for unsize return is not a pointer: {:?}", dest_ty);
+    };
+
+    match dest_pointee.kind() {
+        TyKind::Dynamic(..) => {
+            let dyn_trait_id =
+                dest_pointee.dyn_trait().expect("dyn destination pointer must have principal trait");
+            get_or_create_vtable(fx, src_pointee.store(), dyn_trait_id)
+        }
+        TyKind::Slice(_) | TyKind::Str => match src_pointee.kind() {
+            TyKind::Array(_, len) => {
+                let len = try_const_usize(fx.db(), len)
+                    .expect("array->slice return requires monomorphic length")
+                    as i64;
+                fx.bcx.ins().iconst(fx.pointer_type, len)
+            }
+            _ => panic!("unsupported call return unsize to slice/str from {:?}", src_pointee.kind()),
+        },
+        _ => panic!("unsupported call return unsize destination kind: {:?}", dest_pointee.kind()),
+    }
+}
+
+/// Prepare a call result `CValue` for the destination place.
+///
+/// This happens at call lowering (producer side), not in `CPlace::write_cvalue`.
+fn prepare_call_result_cvalue(
+    fx: &mut FunctionCx<'_, impl Module>,
+    call: cranelift_codegen::ir::Inst,
+    dest: &CPlace,
+    source_return_ty: Option<&StoredTy>,
+    destination_place: &Place,
+) -> Option<CValue> {
+    if dest.layout.is_zst() {
+        return None;
+    }
+
+    let results = fx.bcx.inst_results(call).to_vec();
+    match dest.layout.backend_repr {
+        BackendRepr::Scalar(_) => {
+            assert_eq!(
+                results.len(),
+                1,
+                "scalar call destination expects 1 return value, got {}",
+                results.len(),
+            );
+            Some(CValue::by_val(results[0], dest.layout.clone()))
+        }
+        BackendRepr::ScalarPair(_, _) => match results.as_slice() {
+            [a, b] => Some(CValue::by_val_pair(*a, *b, dest.layout.clone())),
+            [data] => {
+                let Some(source_return_ty) = source_return_ty else {
+                    panic!("scalar-pair call destination expects 2 return values, got {}", results.len(),);
+                };
+                let metadata = call_result_unsize_metadata(fx, source_return_ty, destination_place);
+                Some(CValue::by_val_pair(*data, metadata, dest.layout.clone()))
+            }
+            _ => {
+                panic!("scalar-pair call destination expects 2 return values, got {}", results.len(),)
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Store a prepared call return value into `dest` and jump to the continuation block
 /// (or trap for diverging calls). Shared by all call codegen paths.
 fn store_call_result_and_jump(
     fx: &mut FunctionCx<'_, impl Module>,
-    call: cranelift_codegen::ir::Inst,
     sret_slot: Option<CPlace>,
     dest: CPlace,
+    call_result: Option<CValue>,
     destination_place: &Place,
     target: &Option<BasicBlockId>,
 ) {
     if let Some(sret_slot) = sret_slot {
         let cval = sret_slot.to_cvalue(fx);
         dest.write_cvalue(fx, cval);
+    } else if let Some(cval) = call_result {
+        dest.write_cvalue(fx, cval);
     } else {
-        let results = fx.bcx.inst_results(call);
-        if !dest.layout.is_zst() {
-            match dest.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
-                    let val = results[0];
-                    dest.write_cvalue(fx, CValue::by_val(val, dest.layout.clone()));
-                }
-                BackendRepr::ScalarPair(_, _) => {
-                    dest.write_cvalue(
-                        fx,
-                        CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-                    );
-                }
-                _ => {}
+        match dest.layout.backend_repr {
+            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _) if !dest.layout.is_zst() => {
+                panic!("missing prepared call result for non-ZST scalar destination")
+            }
+            _ => {
+                // ZST and memory destinations have no direct call SSA result to write here.
             }
         }
     }
@@ -3194,10 +3275,10 @@ fn store_call_result_and_jump(
 /// before passing to avoid aliasing the caller's live place.
 fn lower_indirect_call_arg(
     fx: &mut FunctionCx<'_, impl Module>,
-    operand_kind: &OperandKind,
+    is_owned: bool,
     cval: CValue,
 ) -> Value {
-    let ptr = if matches!(operand_kind, OperandKind::Move(_)) {
+    let ptr = if is_owned {
         cval.force_stack(fx)
     } else {
         let tmp = CPlace::new_stack_slot(fx, cval.layout.clone());
@@ -3205,6 +3286,169 @@ fn lower_indirect_call_arg(
         tmp.to_ptr()
     };
     ptr.get_addr(&mut fx.bcx, fx.pointer_type)
+}
+
+#[derive(Clone)]
+struct CallArgument {
+    cval: CValue,
+    is_owned: bool,
+}
+
+fn codegen_call_argument_operand(
+    fx: &mut FunctionCx<'_, impl Module>,
+    operand: &Operand,
+) -> CallArgument {
+    CallArgument {
+        cval: codegen_operand(fx, &operand.kind),
+        is_owned: matches!(operand.kind, OperandKind::Move(_)),
+    }
+}
+
+fn lower_call_operands_for_abi(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+    flatten_rust_call_tuple: bool,
+) -> Vec<CallArgument> {
+    if !flatten_rust_call_tuple {
+        return args.iter().map(|arg| codegen_call_argument_operand(fx, arg)).collect();
+    }
+
+    let (tuple_operand, prefix_operands) =
+        args.split_last().expect("rust-call tuple flattening requires at least one argument");
+
+    let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_operand.kind);
+    let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
+        panic!("rust-call tuple flattening expected final tuple argument, got {tuple_ty:?}");
+    };
+
+    let mut lowered =
+        prefix_operands.iter().map(|operand| codegen_call_argument_operand(fx, operand)).collect::<Vec<_>>();
+
+    let tuple_arg = codegen_call_argument_operand(fx, tuple_operand);
+
+    let tuple_layout = tuple_arg.cval.layout.clone();
+    let tuple_ptr = tuple_arg.cval.clone().force_stack(fx);
+    let tuple_place = CPlace::for_ptr(tuple_ptr, tuple_layout);
+
+    lowered.reserve(tuple_fields.as_slice().len());
+    for (idx, field_ty) in tuple_fields.iter().enumerate() {
+        let field_layout = fx
+            .db()
+            .layout_of_ty(field_ty.store(), fx.env().clone())
+            .expect("rust-call tuple field layout");
+        let cval = if field_layout.is_zst() {
+            CValue::zst(field_layout)
+        } else {
+            tuple_place.place_field(fx, idx, field_layout).to_cvalue(fx)
+        };
+        lowered.push(CallArgument { cval, is_owned: tuple_arg.is_owned });
+    }
+
+    lowered
+}
+
+fn call_operand_abi_types(
+    fx: &mut FunctionCx<'_, impl Module>,
+    operand: &Operand,
+) -> Vec<Type> {
+    let layout = fx
+        .db()
+        .layout_of_ty(operand_ty(fx.db(), fx.ra_body(), &operand.kind), fx.env().clone())
+        .expect("call operand layout");
+
+    if layout.is_zst() {
+        Vec::new()
+    } else {
+        match layout.backend_repr {
+            BackendRepr::Scalar(scalar) => vec![scalar_to_clif_type(fx.dl, &scalar)],
+            BackendRepr::ScalarPair(a, b) => {
+                vec![scalar_to_clif_type(fx.dl, &a), scalar_to_clif_type(fx.dl, &b)]
+            }
+            _ => vec![fx.pointer_type],
+        }
+    }
+}
+
+fn flattened_rust_call_operand_abi_types(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+) -> Option<Vec<Type>> {
+    let (tuple_operand, prefix_operands) = args.split_last()?;
+    let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_operand.kind);
+    let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
+        return None;
+    };
+
+    let mut result = prefix_operands
+        .iter()
+        .flat_map(|operand| call_operand_abi_types(fx, operand).into_iter())
+        .collect::<Vec<_>>();
+    for field_ty in tuple_fields.iter() {
+        let field_layout = fx
+            .db()
+            .layout_of_ty(field_ty.store(), fx.env().clone())
+            .expect("rust-call tuple field layout");
+        if field_layout.is_zst() {
+            continue;
+        }
+        match field_layout.backend_repr {
+            BackendRepr::Scalar(scalar) => result.push(scalar_to_clif_type(fx.dl, &scalar)),
+            BackendRepr::ScalarPair(a, b) => {
+                result.push(scalar_to_clif_type(fx.dl, &a));
+                result.push(scalar_to_clif_type(fx.dl, &b));
+            }
+            _ => result.push(fx.pointer_type),
+        }
+    }
+    Some(result)
+}
+
+fn should_flatten_rust_call_args_for_signature(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+    callee_sig: &Signature,
+) -> bool {
+    let expected = callee_sig
+        .params
+        .iter()
+        .filter(|param| param.purpose != ArgumentPurpose::StructReturn)
+        .map(|param| param.value_type)
+        .collect::<Vec<_>>();
+    let plain = args
+        .iter()
+        .flat_map(|operand| call_operand_abi_types(fx, operand).into_iter())
+        .collect::<Vec<_>>();
+    if plain == expected {
+        return false;
+    }
+
+    flattened_rust_call_operand_abi_types(fx, args).is_some_and(|flattened| flattened == expected)
+}
+
+fn append_lowered_call_args(
+    fx: &mut FunctionCx<'_, impl Module>,
+    call_args: &mut Vec<Value>,
+    lowered_args: &[CallArgument],
+) {
+    for arg in lowered_args {
+        let cval = arg.cval.clone();
+        if cval.layout.is_zst() {
+            continue;
+        }
+        match cval.layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                let (a, b) = cval.load_scalar_pair(fx);
+                call_args.push(a);
+                call_args.push(b);
+            }
+            BackendRepr::Scalar(_) => {
+                call_args.push(cval.load_scalar(fx));
+            }
+            _ => {
+                call_args.push(lower_indirect_call_arg(fx, arg.is_owned, cval));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3494,8 +3738,16 @@ fn codegen_call(
                 }
             }
         }
-        TyKind::FnPtr(sig_tys, _header) => {
-            codegen_fn_ptr_call(fx, func, &sig_tys, args, destination, target);
+        TyKind::FnPtr(sig_tys, header) => {
+            codegen_fn_ptr_call(
+                fx,
+                func,
+                &sig_tys,
+                matches!(header.abi, hir_ty::FnAbi::RustCall),
+                args,
+                destination,
+                target,
+            );
         }
         _ => todo!("non-FnDef/FnPtr call: {:?}", fn_ty_stored),
     }
@@ -3539,6 +3791,7 @@ fn codegen_fn_ptr_call(
     fx: &mut FunctionCx<'_, impl Module>,
     func_operand: &Operand,
     sig_tys: &rustc_type_ir::Binder<DbInterner, rustc_type_ir::FnSigTys<DbInterner>>,
+    is_rust_call_abi: bool,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -3553,6 +3806,7 @@ fn codegen_fn_ptr_call(
 
     // Return type
     let output = sig_tys_inner.output();
+    let source_return_ty = (!output.is_never()).then(|| output.store());
     let dest = codegen_place(fx, destination);
     let is_sret_return = if output.is_never() || dest.layout.is_zst() {
         false
@@ -3574,10 +3828,27 @@ fn codegen_fn_ptr_call(
         }
     };
 
+    let input_tys: Vec<StoredTy> = sig_tys_inner.inputs().iter().map(|ty| ty.store()).collect();
+    let abi_input_tys = if is_rust_call_abi {
+        if let Some((packed_tuple_ty, prefix_tys)) = input_tys.split_last() {
+            if let TyKind::Tuple(tuple_fields) = packed_tuple_ty.as_ref().kind() {
+                let mut flattened = prefix_tys.to_vec();
+                flattened.extend(tuple_fields.iter().map(|field_ty| field_ty.store()));
+                flattened
+            } else {
+                input_tys
+            }
+        } else {
+            input_tys
+        }
+    } else {
+        input_tys
+    };
+
     // Parameter types in signature
-    for &param_ty in sig_tys_inner.inputs() {
+    for param_ty in abi_input_tys {
         let param_layout =
-            fx.db().layout_of_ty(param_ty.store(), fx.env().clone()).expect("fn ptr param layout");
+            fx.db().layout_of_ty(param_ty, fx.env().clone()).expect("fn ptr param layout");
         match param_layout.backend_repr {
             BackendRepr::Scalar(scalar) => {
                 sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
@@ -3593,6 +3864,8 @@ fn codegen_fn_ptr_call(
         }
     }
 
+    let flatten_rust_call_args =
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &sig);
     let sig_ref = fx.bcx.import_signature(sig);
 
     // Build argument values
@@ -3607,29 +3880,26 @@ fn codegen_fn_ptr_call(
         None
     };
 
-    for arg in args {
-        let cval = codegen_operand(fx, &arg.kind);
-        if cval.layout.is_zst() {
-            continue;
-        }
-        match cval.layout.backend_repr {
-            BackendRepr::ScalarPair(_, _) => {
-                let (a, b) = cval.load_scalar_pair(fx);
-                call_args.push(a);
-                call_args.push(b);
-            }
-            BackendRepr::Scalar(_) => {
-                call_args.push(cval.load_scalar(fx));
-            }
-            _ => {
-                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
-            }
-        }
-    }
+    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    append_lowered_call_args(fx, &mut call_args, &lowered_args);
 
     // Emit indirect call
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
+    let call_result = prepare_call_result_cvalue(
+        fx,
+        call,
+        &dest,
+        source_return_ty.as_ref(),
+        destination,
+    );
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        destination,
+        target,
+    );
 }
 
 /// Call a closure body directly.
@@ -3641,6 +3911,7 @@ fn codegen_closure_call(
     fx: &mut FunctionCx<'_, impl Module>,
     closure_id: hir_ty::db::InternedClosureId,
     closure_subst: StoredGenericArgs,
+    is_rust_call_abi: bool,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -3650,6 +3921,7 @@ fn codegen_closure_call(
         .db()
         .monomorphized_mir_body_for_closure(closure_id, closure_subst.clone(), fx.env().clone())
         .expect("closure MIR");
+    let closure_ret_ty = closure_body.locals[hir_ty::mir::return_slot()].ty.clone();
     let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
 
     // Generate mangled name
@@ -3664,6 +3936,12 @@ fn codegen_closure_call(
     let callee_id =
         fx.module.declare_function(&closure_name, Linkage::Import, &sig).expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+
+    let flatten_rust_call_args =
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &sig);
+    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+
+    assert!(!lowered_args.is_empty(), "closure call is missing receiver argument");
 
     // Destination
     let dest = codegen_place(fx, destination);
@@ -3685,29 +3963,25 @@ fn codegen_closure_call(
         None
     };
 
-    for arg in args {
-        let cval = codegen_operand(fx, &arg.kind);
-        if cval.layout.is_zst() {
-            continue;
-        }
-        match cval.layout.backend_repr {
-            BackendRepr::ScalarPair(_, _) => {
-                let (a, b) = cval.load_scalar_pair(fx);
-                call_args.push(a);
-                call_args.push(b);
-            }
-            BackendRepr::Scalar(_) => {
-                call_args.push(cval.load_scalar(fx));
-            }
-            _ => {
-                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
-            }
-        }
-    }
+    append_lowered_call_args(fx, &mut call_args, &lowered_args);
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
+    let call_result = prepare_call_result_cvalue(
+        fx,
+        call,
+        &dest,
+        Some(&closure_ret_ty),
+        destination,
+    );
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        destination,
+        target,
+    );
 }
 
 fn method_output_ty(
@@ -3715,6 +3989,15 @@ fn method_output_ty(
     func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
 ) -> StoredTy {
+    callable_output_ty(db, func_id, generic_args)
+        .expect("derive pseudo-method unexpectedly returned never")
+}
+
+fn callable_output_ty(
+    db: &dyn HirDatabase,
+    func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
+) -> Option<StoredTy> {
     let interner = DbInterner::new_no_crate(db);
     let fn_sig = if generic_args.is_empty() {
         db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
@@ -3722,8 +4005,7 @@ fn method_output_ty(
         db.callable_item_signature(func_id.into()).instantiate(interner, generic_args).skip_binder()
     };
     let output = *fn_sig.inputs_and_output.as_slice().split_last().unwrap().0;
-    assert!(!output.is_never(), "derive pseudo-method unexpectedly returned never: {func_id:?}");
-    output.store()
+    (!output.is_never()).then(|| output.store())
 }
 
 fn trait_method_substs_for_derive_call<'db>(
@@ -3783,7 +4065,10 @@ fn bool_cvalue_to_bool_scalar(
     }
 }
 
-fn enum_discriminant_layout(fx: &mut FunctionCx<'_, impl Module>, enum_layout: &LayoutArc) -> LayoutArc {
+fn enum_discriminant_layout(
+    fx: &mut FunctionCx<'_, impl Module>,
+    enum_layout: &LayoutArc,
+) -> LayoutArc {
     use rustc_abi::Variants;
     match &enum_layout.variants {
         Variants::Multiple { tag, .. } => tag_scalar_layout(fx.dl, tag),
@@ -3794,7 +4079,11 @@ fn enum_discriminant_layout(fx: &mut FunctionCx<'_, impl Module>, enum_layout: &
     }
 }
 
-fn enum_variant_idx_by_name(db: &dyn HirDatabase, enum_id: hir_def::EnumId, wanted: &str) -> VariantIdx {
+fn enum_variant_idx_by_name(
+    db: &dyn HirDatabase,
+    enum_id: hir_def::EnumId,
+    wanted: &str,
+) -> VariantIdx {
     for (idx, (_, name, _)) in enum_id.enum_variants(db).variants.iter().enumerate() {
         if name.as_str() == wanted {
             return VariantIdx::from_u32(idx as u32);
@@ -3951,7 +4240,8 @@ fn decode_option_ordering_state(
     // 0 = None, 1 = Equal, 2 = Less, 3 = Greater
     let option_place = CPlace::for_ptr(value.force_stack(fx), info.option_layout.clone());
     let option_discr_layout = enum_discriminant_layout(fx, &info.option_layout);
-    let option_discr = codegen_get_discriminant(fx, &option_place, &info.option_ty, &option_discr_layout);
+    let option_discr =
+        codegen_get_discriminant(fx, &option_place, &info.option_ty, &option_discr_layout);
     let is_none = codegen_icmp_imm(fx, IntCC::Equal, option_discr, info.option_none_discr as i128);
 
     let some_layout = variant_layout(&info.option_layout, info.option_some_idx);
@@ -3961,7 +4251,8 @@ fn decode_option_ordering_state(
     let ordering_discr =
         codegen_get_discriminant(fx, &ordering_field, &info.ordering_ty, &ordering_discr_layout);
 
-    let is_less = codegen_icmp_imm(fx, IntCC::Equal, ordering_discr, info.ordering_less_discr as i128);
+    let is_less =
+        codegen_icmp_imm(fx, IntCC::Equal, ordering_discr, info.ordering_less_discr as i128);
     let is_equal =
         codegen_icmp_imm(fx, IntCC::Equal, ordering_discr, info.ordering_equal_discr as i128);
 
@@ -4008,15 +4299,9 @@ fn codegen_direct_call_from_cvalues_into_dest(
         );
         (sig, name)
     } else if is_cross_crate {
-        let sig = build_fn_sig_from_ty(
-            fx.isa,
-            fx.db(),
-            fx.dl,
-            fx.env(),
-            callee_func_id,
-            generic_args,
-        )
-        .expect("cross-crate fn sig");
+        let sig =
+            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
+                .expect("cross-crate fn sig");
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
@@ -4096,10 +4381,7 @@ fn codegen_direct_call_from_cvalues_into_dest(
             dest.write_cvalue(fx, CValue::by_val(results[0], dest.layout.clone()));
         }
         BackendRepr::ScalarPair(_, _) => {
-            dest.write_cvalue(
-                fx,
-                CValue::by_val_pair(results[0], results[1], dest.layout.clone()),
-            );
+            dest.write_cvalue(fx, CValue::by_val_pair(results[0], results[1], dest.layout.clone()));
         }
         _ => {}
     }
@@ -4184,7 +4466,8 @@ fn codegen_builtin_derive_method_impl(
 
             match adt_id.inner().id {
                 hir_def::AdtId::StructId(struct_id) => {
-                    for (field_idx, (_, field_ty)) in fx.db().field_types(struct_id.into()).iter().enumerate()
+                    for (field_idx, (_, field_ty)) in
+                        fx.db().field_types(struct_id.into()).iter().enumerate()
                     {
                         let field_ty = field_ty.get().instantiate(interner, adt_args).store();
                         let field_layout = fx
@@ -4219,13 +4502,13 @@ fn codegen_builtin_derive_method_impl(
                             let variant_layout = variant_layout(&dest.layout, variant_idx);
                             let src_variant = src_place.downcast_variant(variant_layout.clone());
                             let dest_variant = dest.downcast_variant(variant_layout);
-                            let variant_id = enum_id.enum_variants(fx.db()).variants
-                                [variant_idx.as_usize()]
-                                .0;
+                            let variant_id =
+                                enum_id.enum_variants(fx.db()).variants[variant_idx.as_usize()].0;
                             for (field_idx, (_, field_ty)) in
                                 fx.db().field_types(variant_id.into()).iter().enumerate()
                             {
-                                let field_ty = field_ty.get().instantiate(interner, adt_args).store();
+                                let field_ty =
+                                    field_ty.get().instantiate(interner, adt_args).store();
                                 let field_layout = fx
                                     .db()
                                     .layout_of_ty(field_ty.clone(), fx.env().clone())
@@ -4250,7 +4533,8 @@ fn codegen_builtin_derive_method_impl(
                         }
                         Variants::Multiple { .. } => {
                             let discr_layout = enum_discriminant_layout(fx, &dest.layout);
-                            let discr = codegen_get_discriminant(fx, &src_place, &self_ty, &discr_layout);
+                            let discr =
+                                codegen_get_discriminant(fx, &src_place, &self_ty, &discr_layout);
                             let discr_ty = fx.bcx.func.dfg.value_type(discr);
 
                             let done_block = fx.bcx.create_block();
@@ -4258,7 +4542,9 @@ fn codegen_builtin_derive_method_impl(
                             let mut switch = Switch::new();
                             let mut variant_blocks = Vec::new();
 
-                            for (variant_i, _) in enum_id.enum_variants(fx.db()).variants.iter().enumerate() {
+                            for (variant_i, _) in
+                                enum_id.enum_variants(fx.db()).variants.iter().enumerate()
+                            {
                                 let variant_idx = VariantIdx::from_u32(variant_i as u32);
                                 let discr_bits =
                                     enum_variant_discriminant_bits(fx.db(), &self_ty, variant_idx);
@@ -4273,11 +4559,12 @@ fn codegen_builtin_derive_method_impl(
                             for (variant_idx, block) in variant_blocks {
                                 fx.bcx.switch_to_block(block);
                                 let variant_layout = variant_layout(&dest.layout, variant_idx);
-                                let src_variant = src_place.downcast_variant(variant_layout.clone());
+                                let src_variant =
+                                    src_place.downcast_variant(variant_layout.clone());
                                 let dest_variant = dest.downcast_variant(variant_layout);
                                 let variant_id = enum_id.enum_variants(fx.db()).variants
                                     [variant_idx.as_usize()]
-                                    .0;
+                                .0;
 
                                 for (field_idx, (_, field_ty)) in
                                     fx.db().field_types(variant_id.into()).iter().enumerate()
@@ -4289,8 +4576,11 @@ fn codegen_builtin_derive_method_impl(
                                         .layout_of_ty(field_ty.clone(), fx.env().clone())
                                         .expect("builtin Clone::clone enum field layout");
 
-                                    let src_field =
-                                        src_variant.place_field(fx, field_idx, field_layout.clone());
+                                    let src_field = src_variant.place_field(
+                                        fx,
+                                        field_idx,
+                                        field_layout.clone(),
+                                    );
                                     let dest_field =
                                         dest_variant.place_field(fx, field_idx, field_layout);
 
@@ -4337,8 +4627,10 @@ fn codegen_builtin_derive_method_impl(
         BuiltinDeriveImplMethod::eq => {
             assert_eq!(args.len(), 2, "builtin PartialEq::eq expects two receiver arguments");
 
-            let self_layout =
-                fx.db().layout_of_ty(self_ty.clone(), fx.env().clone()).expect("PartialEq self layout");
+            let self_layout = fx
+                .db()
+                .layout_of_ty(self_ty.clone(), fx.env().clone())
+                .expect("PartialEq self layout");
             let lhs_ref = args[0].clone();
             let rhs_ref = args[1].clone();
             let BackendRepr::Scalar(_) = lhs_ref.layout.backend_repr else {
@@ -4371,7 +4663,8 @@ fn codegen_builtin_derive_method_impl(
                                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                                     .expect("PartialEq struct field layout");
 
-                                let lhs_field = lhs_val.place_field(fx, field_idx, field_layout.clone());
+                                let lhs_field =
+                                    lhs_val.place_field(fx, field_idx, field_layout.clone());
                                 let rhs_field = rhs_val.place_field(fx, field_idx, field_layout);
                                 let ref_layout = shared_ref_layout_for_pointee(fx, &field_ty);
                                 let lhs_ref = lhs_field.place_ref(fx, ref_layout.clone());
@@ -4396,11 +4689,12 @@ fn codegen_builtin_derive_method_impl(
                                 Variants::Single { index } => {
                                     let variant_idx = *index;
                                     let variant_layout = variant_layout(&self_layout, variant_idx);
-                                    let lhs_variant = lhs_val.downcast_variant(variant_layout.clone());
+                                    let lhs_variant =
+                                        lhs_val.downcast_variant(variant_layout.clone());
                                     let rhs_variant = rhs_val.downcast_variant(variant_layout);
                                     let variant_id = enum_id.enum_variants(fx.db()).variants
                                         [variant_idx.as_usize()]
-                                        .0;
+                                    .0;
                                     for (field_idx, (_, field_ty)) in
                                         fx.db().field_types(variant_id.into()).iter().enumerate()
                                     {
@@ -4411,11 +4705,15 @@ fn codegen_builtin_derive_method_impl(
                                             .layout_of_ty(field_ty.clone(), fx.env().clone())
                                             .expect("PartialEq enum field layout");
 
-                                        let lhs_field =
-                                            lhs_variant.place_field(fx, field_idx, field_layout.clone());
+                                        let lhs_field = lhs_variant.place_field(
+                                            fx,
+                                            field_idx,
+                                            field_layout.clone(),
+                                        );
                                         let rhs_field =
                                             rhs_variant.place_field(fx, field_idx, field_layout);
-                                        let ref_layout = shared_ref_layout_for_pointee(fx, &field_ty);
+                                        let ref_layout =
+                                            shared_ref_layout_for_pointee(fx, &field_ty);
                                         let lhs_ref = lhs_field.place_ref(fx, ref_layout.clone());
                                         let rhs_ref = rhs_field.place_ref(fx, ref_layout);
                                         let eq_res = codegen_trait_method_call_returning_cvalue(
@@ -4425,23 +4723,36 @@ fn codegen_builtin_derive_method_impl(
                                             true,
                                             &[lhs_ref, rhs_ref],
                                         );
-                                        let eq_scalar = bool_cvalue_to_bool_scalar(fx, eq_res, bool_ty);
+                                        let eq_scalar =
+                                            bool_cvalue_to_bool_scalar(fx, eq_res, bool_ty);
                                         all_eq = fx.bcx.ins().band(all_eq, eq_scalar);
                                     }
                                 }
                                 Variants::Multiple { .. } => {
                                     let discr_layout = enum_discriminant_layout(fx, &self_layout);
-                                    let lhs_discr =
-                                        codegen_get_discriminant(fx, &lhs_val, &self_ty, &discr_layout);
-                                    let rhs_discr =
-                                        codegen_get_discriminant(fx, &rhs_val, &self_ty, &discr_layout);
+                                    let lhs_discr = codegen_get_discriminant(
+                                        fx,
+                                        &lhs_val,
+                                        &self_ty,
+                                        &discr_layout,
+                                    );
+                                    let rhs_discr = codegen_get_discriminant(
+                                        fx,
+                                        &rhs_val,
+                                        &self_ty,
+                                        &discr_layout,
+                                    );
                                     let discr_ty = fx.bcx.func.dfg.value_type(lhs_discr);
 
-                                    let discr_eq = fx.bcx.ins().icmp(IntCC::Equal, lhs_discr, rhs_discr);
-                                    let fields_eq_place = CPlace::new_stack_slot(fx, dest.layout.clone());
+                                    let discr_eq =
+                                        fx.bcx.ins().icmp(IntCC::Equal, lhs_discr, rhs_discr);
+                                    let fields_eq_place =
+                                        CPlace::new_stack_slot(fx, dest.layout.clone());
                                     let zero = fx.bcx.ins().iconst(bool_ty, 0);
-                                    fields_eq_place
-                                        .write_cvalue(fx, CValue::by_val(zero, dest.layout.clone()));
+                                    fields_eq_place.write_cvalue(
+                                        fx,
+                                        CValue::by_val(zero, dest.layout.clone()),
+                                    );
 
                                     let done_block = fx.bcx.create_block();
                                     let trap_block = fx.bcx.create_block();
@@ -4468,31 +4779,45 @@ fn codegen_builtin_derive_method_impl(
 
                                     for (variant_idx, block) in variant_blocks {
                                         fx.bcx.switch_to_block(block);
-                                        let variant_layout = variant_layout(&self_layout, variant_idx);
-                                        let lhs_variant = lhs_val.downcast_variant(variant_layout.clone());
+                                        let variant_layout =
+                                            variant_layout(&self_layout, variant_idx);
+                                        let lhs_variant =
+                                            lhs_val.downcast_variant(variant_layout.clone());
                                         let rhs_variant = rhs_val.downcast_variant(variant_layout);
                                         let variant_id = enum_id.enum_variants(fx.db()).variants
                                             [variant_idx.as_usize()]
-                                            .0;
+                                        .0;
                                         let mut variant_eq = fx.bcx.ins().iconst(bool_ty, 1);
 
-                                        for (field_idx, (_, field_ty)) in
-                                            fx.db().field_types(variant_id.into()).iter().enumerate()
+                                        for (field_idx, (_, field_ty)) in fx
+                                            .db()
+                                            .field_types(variant_id.into())
+                                            .iter()
+                                            .enumerate()
                                         {
-                                            let field_ty =
-                                                field_ty.get().instantiate(interner, adt_args).store();
+                                            let field_ty = field_ty
+                                                .get()
+                                                .instantiate(interner, adt_args)
+                                                .store();
                                             let field_layout = fx
                                                 .db()
                                                 .layout_of_ty(field_ty.clone(), fx.env().clone())
                                                 .expect("PartialEq enum field layout");
 
-                                            let lhs_field = lhs_variant
-                                                .place_field(fx, field_idx, field_layout.clone());
-                                            let rhs_field =
-                                                rhs_variant.place_field(fx, field_idx, field_layout);
+                                            let lhs_field = lhs_variant.place_field(
+                                                fx,
+                                                field_idx,
+                                                field_layout.clone(),
+                                            );
+                                            let rhs_field = rhs_variant.place_field(
+                                                fx,
+                                                field_idx,
+                                                field_layout,
+                                            );
                                             let ref_layout =
                                                 shared_ref_layout_for_pointee(fx, &field_ty);
-                                            let lhs_ref = lhs_field.place_ref(fx, ref_layout.clone());
+                                            let lhs_ref =
+                                                lhs_field.place_ref(fx, ref_layout.clone());
                                             let rhs_ref = rhs_field.place_ref(fx, ref_layout);
                                             let eq_res = codegen_trait_method_call_returning_cvalue(
                                                 fx,
@@ -4514,7 +4839,9 @@ fn codegen_builtin_derive_method_impl(
                                     }
 
                                     fx.bcx.switch_to_block(trap_block);
-                                    fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                                    fx.bcx
+                                        .ins()
+                                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
 
                                     fx.bcx.switch_to_block(done_block);
 
@@ -4578,7 +4905,8 @@ fn codegen_builtin_derive_method_impl(
                                     .db()
                                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                                     .expect("PartialOrd struct field layout");
-                                let lhs_field = lhs_val.place_field(fx, field_idx, field_layout.clone());
+                                let lhs_field =
+                                    lhs_val.place_field(fx, field_idx, field_layout.clone());
                                 let rhs_field = rhs_val.place_field(fx, field_idx, field_layout);
 
                                 let ref_layout = shared_ref_layout_for_pointee(fx, &field_ty);
@@ -4592,13 +4920,19 @@ fn codegen_builtin_derive_method_impl(
                                     &[lhs_ref, rhs_ref],
                                 );
                                 let cmp_state = decode_option_ordering_state(fx, &info, cmp_res);
-                                let is_running_equal = fx.bcx.ins().icmp_imm(IntCC::Equal, state, 1);
+                                let is_running_equal =
+                                    fx.bcx.ins().icmp_imm(IntCC::Equal, state, 1);
                                 state = fx.bcx.ins().select(is_running_equal, cmp_state, state);
                             }
                             write_option_ordering_state(fx, &info, dest, state);
                         }
                         hir_def::AdtId::UnionId(_) => {
-                            write_option_ordering_variant(fx, &info, dest, Some(info.ordering_equal_idx));
+                            write_option_ordering_variant(
+                                fx,
+                                &info,
+                                dest,
+                                Some(info.ordering_equal_idx),
+                            );
                         }
                         hir_def::AdtId::EnumId(enum_id) => {
                             use rustc_abi::Variants;
@@ -4606,11 +4940,12 @@ fn codegen_builtin_derive_method_impl(
                                 Variants::Single { index } => {
                                     let variant_idx = *index;
                                     let variant_layout = variant_layout(&self_layout, variant_idx);
-                                    let lhs_variant = lhs_val.downcast_variant(variant_layout.clone());
+                                    let lhs_variant =
+                                        lhs_val.downcast_variant(variant_layout.clone());
                                     let rhs_variant = rhs_val.downcast_variant(variant_layout);
                                     let variant_id = enum_id.enum_variants(fx.db()).variants
                                         [variant_idx.as_usize()]
-                                        .0;
+                                    .0;
 
                                     let mut state = fx.bcx.ins().iconst(types::I8, 1);
                                     for (field_idx, (_, field_ty)) in
@@ -4622,12 +4957,16 @@ fn codegen_builtin_derive_method_impl(
                                             .db()
                                             .layout_of_ty(field_ty.clone(), fx.env().clone())
                                             .expect("PartialOrd enum field layout");
-                                        let lhs_field =
-                                            lhs_variant.place_field(fx, field_idx, field_layout.clone());
+                                        let lhs_field = lhs_variant.place_field(
+                                            fx,
+                                            field_idx,
+                                            field_layout.clone(),
+                                        );
                                         let rhs_field =
                                             rhs_variant.place_field(fx, field_idx, field_layout);
 
-                                        let ref_layout = shared_ref_layout_for_pointee(fx, &field_ty);
+                                        let ref_layout =
+                                            shared_ref_layout_for_pointee(fx, &field_ty);
                                         let lhs_ref = lhs_field.place_ref(fx, ref_layout.clone());
                                         let rhs_ref = rhs_field.place_ref(fx, ref_layout);
                                         let cmp_res = codegen_trait_method_call_returning_cvalue(
@@ -4637,23 +4976,34 @@ fn codegen_builtin_derive_method_impl(
                                             true,
                                             &[lhs_ref, rhs_ref],
                                         );
-                                        let cmp_state = decode_option_ordering_state(fx, &info, cmp_res);
+                                        let cmp_state =
+                                            decode_option_ordering_state(fx, &info, cmp_res);
                                         let is_running_equal =
                                             fx.bcx.ins().icmp_imm(IntCC::Equal, state, 1);
-                                        state = fx.bcx.ins().select(is_running_equal, cmp_state, state);
+                                        state =
+                                            fx.bcx.ins().select(is_running_equal, cmp_state, state);
                                     }
 
                                     write_option_ordering_state(fx, &info, dest, state);
                                 }
                                 Variants::Multiple { .. } => {
                                     let discr_layout = enum_discriminant_layout(fx, &self_layout);
-                                    let lhs_discr =
-                                        codegen_get_discriminant(fx, &lhs_val, &self_ty, &discr_layout);
-                                    let rhs_discr =
-                                        codegen_get_discriminant(fx, &rhs_val, &self_ty, &discr_layout);
+                                    let lhs_discr = codegen_get_discriminant(
+                                        fx,
+                                        &lhs_val,
+                                        &self_ty,
+                                        &discr_layout,
+                                    );
+                                    let rhs_discr = codegen_get_discriminant(
+                                        fx,
+                                        &rhs_val,
+                                        &self_ty,
+                                        &discr_layout,
+                                    );
                                     let switch_discr_ty = fx.bcx.func.dfg.value_type(lhs_discr);
 
-                                    let is_eq = fx.bcx.ins().icmp(IntCC::Equal, lhs_discr, rhs_discr);
+                                    let is_eq =
+                                        fx.bcx.ins().icmp(IntCC::Equal, lhs_discr, rhs_discr);
                                     let discr_scalar_ty = fx.bcx.func.dfg.value_type(lhs_discr);
                                     let discr_signed = match discr_layout.backend_repr {
                                         BackendRepr::Scalar(s) => {
@@ -4662,28 +5012,52 @@ fn codegen_builtin_derive_method_impl(
                                         _ => false,
                                     };
                                     let is_lt = if discr_signed {
-                                        fx.bcx.ins().icmp(IntCC::SignedLessThan, lhs_discr, rhs_discr)
+                                        fx.bcx.ins().icmp(
+                                            IntCC::SignedLessThan,
+                                            lhs_discr,
+                                            rhs_discr,
+                                        )
                                     } else {
-                                        fx.bcx.ins().icmp(IntCC::UnsignedLessThan, lhs_discr, rhs_discr)
+                                        fx.bcx.ins().icmp(
+                                            IntCC::UnsignedLessThan,
+                                            lhs_discr,
+                                            rhs_discr,
+                                        )
                                     };
                                     let is_gt = if discr_signed {
-                                        fx.bcx.ins().icmp(IntCC::SignedGreaterThan, lhs_discr, rhs_discr)
+                                        fx.bcx.ins().icmp(
+                                            IntCC::SignedGreaterThan,
+                                            lhs_discr,
+                                            rhs_discr,
+                                        )
                                     } else {
-                                        fx.bcx.ins().icmp(IntCC::UnsignedGreaterThan, lhs_discr, rhs_discr)
+                                        fx.bcx.ins().icmp(
+                                            IntCC::UnsignedGreaterThan,
+                                            lhs_discr,
+                                            rhs_discr,
+                                        )
                                     };
 
                                     let done_block = fx.bcx.create_block();
                                     let same_variant_block = fx.bcx.create_block();
                                     let trap_block = fx.bcx.create_block();
 
-                                    fx.bcx.ins().brif(is_eq, same_variant_block, &[], done_block, &[]);
+                                    fx.bcx.ins().brif(
+                                        is_eq,
+                                        same_variant_block,
+                                        &[],
+                                        done_block,
+                                        &[],
+                                    );
 
                                     fx.bcx.switch_to_block(done_block);
                                     let less_state = fx.bcx.ins().iconst(types::I8, 2);
                                     let greater_state = fx.bcx.ins().iconst(types::I8, 3);
                                     let equal_state = fx.bcx.ins().iconst(types::I8, 1);
-                                    let non_lt_state = fx.bcx.ins().select(is_gt, greater_state, equal_state);
-                                    let discr_state = fx.bcx.ins().select(is_lt, less_state, non_lt_state);
+                                    let non_lt_state =
+                                        fx.bcx.ins().select(is_gt, greater_state, equal_state);
+                                    let discr_state =
+                                        fx.bcx.ins().select(is_lt, less_state, non_lt_state);
                                     write_option_ordering_state(fx, &info, dest, discr_state);
                                     let finished_block = fx.bcx.create_block();
                                     fx.bcx.ins().jump(finished_block, &[]);
@@ -4700,8 +5074,10 @@ fn codegen_builtin_derive_method_impl(
                                             &self_ty,
                                             variant_idx,
                                         );
-                                        let discr_bits =
-                                            truncate_bits_to_clif_int_ty(discr_bits, switch_discr_ty);
+                                        let discr_bits = truncate_bits_to_clif_int_ty(
+                                            discr_bits,
+                                            switch_discr_ty,
+                                        );
                                         let block = fx.bcx.create_block();
                                         switch.set_entry(discr_bits, block);
                                         variant_blocks.push((variant_idx, block));
@@ -4710,44 +5086,63 @@ fn codegen_builtin_derive_method_impl(
 
                                     for (variant_idx, block) in variant_blocks {
                                         fx.bcx.switch_to_block(block);
-                                        let variant_layout = variant_layout(&self_layout, variant_idx);
-                                        let lhs_variant = lhs_val.downcast_variant(variant_layout.clone());
+                                        let variant_layout =
+                                            variant_layout(&self_layout, variant_idx);
+                                        let lhs_variant =
+                                            lhs_val.downcast_variant(variant_layout.clone());
                                         let rhs_variant = rhs_val.downcast_variant(variant_layout);
                                         let variant_id = enum_id.enum_variants(fx.db()).variants
                                             [variant_idx.as_usize()]
-                                            .0;
+                                        .0;
 
                                         let mut state = fx.bcx.ins().iconst(types::I8, 1);
-                                        for (field_idx, (_, field_ty)) in
-                                            fx.db().field_types(variant_id.into()).iter().enumerate()
+                                        for (field_idx, (_, field_ty)) in fx
+                                            .db()
+                                            .field_types(variant_id.into())
+                                            .iter()
+                                            .enumerate()
                                         {
-                                            let field_ty =
-                                                field_ty.get().instantiate(interner, adt_args).store();
+                                            let field_ty = field_ty
+                                                .get()
+                                                .instantiate(interner, adt_args)
+                                                .store();
                                             let field_layout = fx
                                                 .db()
                                                 .layout_of_ty(field_ty.clone(), fx.env().clone())
                                                 .expect("PartialOrd enum field layout");
-                                            let lhs_field = lhs_variant
-                                                .place_field(fx, field_idx, field_layout.clone());
-                                            let rhs_field =
-                                                rhs_variant.place_field(fx, field_idx, field_layout);
+                                            let lhs_field = lhs_variant.place_field(
+                                                fx,
+                                                field_idx,
+                                                field_layout.clone(),
+                                            );
+                                            let rhs_field = rhs_variant.place_field(
+                                                fx,
+                                                field_idx,
+                                                field_layout,
+                                            );
 
                                             let ref_layout =
                                                 shared_ref_layout_for_pointee(fx, &field_ty);
-                                            let lhs_ref = lhs_field.place_ref(fx, ref_layout.clone());
+                                            let lhs_ref =
+                                                lhs_field.place_ref(fx, ref_layout.clone());
                                             let rhs_ref = rhs_field.place_ref(fx, ref_layout);
-                                            let cmp_res = codegen_trait_method_call_returning_cvalue(
-                                                fx,
-                                                trait_method_func_id,
-                                                field_ty,
-                                                true,
-                                                &[lhs_ref, rhs_ref],
-                                            );
+                                            let cmp_res =
+                                                codegen_trait_method_call_returning_cvalue(
+                                                    fx,
+                                                    trait_method_func_id,
+                                                    field_ty,
+                                                    true,
+                                                    &[lhs_ref, rhs_ref],
+                                                );
                                             let cmp_state =
                                                 decode_option_ordering_state(fx, &info, cmp_res);
                                             let is_running_equal =
                                                 fx.bcx.ins().icmp_imm(IntCC::Equal, state, 1);
-                                            state = fx.bcx.ins().select(is_running_equal, cmp_state, state);
+                                            state = fx.bcx.ins().select(
+                                                is_running_equal,
+                                                cmp_state,
+                                                state,
+                                            );
                                         }
 
                                         write_option_ordering_state(fx, &info, dest, state);
@@ -4755,7 +5150,9 @@ fn codegen_builtin_derive_method_impl(
                                     }
 
                                     fx.bcx.switch_to_block(trap_block);
-                                    fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                                    fx.bcx
+                                        .ins()
+                                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
 
                                     fx.bcx.switch_to_block(finished_block);
 
@@ -4768,7 +5165,9 @@ fn codegen_builtin_derive_method_impl(
                         }
                     }
                 }
-                _ => panic!("builtin PartialOrd::partial_cmp expects ADT self type, got {self_ty:?}"),
+                _ => {
+                    panic!("builtin PartialOrd::partial_cmp expects ADT self type, got {self_ty:?}")
+                }
             }
         }
         _ => panic!(
@@ -4818,7 +5217,8 @@ fn codegen_builtin_derive_method_call(
         &dest,
     );
 
-    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+    if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+    {
         fx.set_drop_flag(destination.local);
     }
 
@@ -4984,7 +5384,15 @@ fn codegen_direct_call(
             )
             .is_some()
             {
-                codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
+                codegen_virtual_call(
+                    fx,
+                    callee_func_id,
+                    trait_id,
+                    generic_args,
+                    args,
+                    destination,
+                    target,
+                );
                 return;
             }
 
@@ -4993,7 +5401,9 @@ fn codegen_direct_call(
                 .map(|self_arg| operand_ty(fx.db(), fx.ra_body(), &self_arg.kind).as_ref())
                 .or_else(|| (!generic_args.is_empty()).then(|| generic_args.type_at(0)));
 
-            let trait_method_name = fx.db().function_signature(callee_func_id).name.clone();
+            let trait_method_sig = fx.db().function_signature(callee_func_id);
+            let trait_method_name = trait_method_sig.name.clone();
+            let trait_method_is_rust_call = trait_method_sig.abi == Some(sym::rust_dash_call);
 
             // Fn/FnMut/FnOnce calls are often encoded with receiver information only in the
             // first MIR argument operand. Deriving callable dispatch from that operand keeps us
@@ -5006,6 +5416,7 @@ fn codegen_direct_call(
                                 fx,
                                 closure_id.0,
                                 closure_subst.store(),
+                                trait_method_is_rust_call,
                                 args,
                                 destination,
                                 target,
@@ -5047,11 +5458,12 @@ fn codegen_direct_call(
                                 return;
                             }
                         },
-                        TyKind::FnPtr(sig_tys, _) if !args.is_empty() => {
+                        TyKind::FnPtr(sig_tys, header) if !args.is_empty() => {
                             codegen_fn_ptr_call(
                                 fx,
                                 &args[0],
                                 &sig_tys,
+                                matches!(header.abi, hir_ty::FnAbi::RustCall),
                                 args.get(1..).unwrap_or(&[]),
                                 destination,
                                 target,
@@ -5077,7 +5489,15 @@ fn codegen_direct_call(
                     BackendRepr::ScalarPair(_, _)
                 )
             {
-                codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
+                codegen_virtual_call(
+                    fx,
+                    callee_func_id,
+                    trait_id,
+                    generic_args,
+                    args,
+                    destination,
+                    target,
+                );
                 return;
             }
 
@@ -5110,6 +5530,8 @@ fn codegen_direct_call(
             (callee_func_id, generic_args.store())
         };
 
+    let is_rust_call_abi = fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args.as_ref());
     // Check if this is an extern function (no MIR available)
     let is_extern =
         matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
@@ -5192,25 +5614,10 @@ fn codegen_direct_call(
         None
     };
 
-    for arg in args {
-        let cval = codegen_operand(fx, &arg.kind);
-        if cval.layout.is_zst() {
-            continue;
-        }
-        match cval.layout.backend_repr {
-            BackendRepr::ScalarPair(_, _) => {
-                let (a, b) = cval.load_scalar_pair(fx);
-                call_args.push(a);
-                call_args.push(b);
-            }
-            BackendRepr::Scalar(_) => {
-                call_args.push(cval.load_scalar(fx));
-            }
-            _ => {
-                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
-            }
-        }
-    }
+    let flatten_rust_call_args =
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_sig);
+    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    append_lowered_call_args(fx, &mut call_args, &lowered_args);
 
     if is_c_variadic {
         assert!(
@@ -5265,7 +5672,16 @@ fn codegen_direct_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
+    let call_result =
+        prepare_call_result_cvalue(fx, call, &dest, source_return_ty.as_ref(), destination);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        destination,
+        target,
+    );
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -5274,6 +5690,7 @@ fn codegen_virtual_call(
     fx: &mut FunctionCx<'_, impl Module>,
     callee_func_id: hir_def::FunctionId,
     trait_id: TraitId,
+    generic_args: GenericArgs<'_>,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -5302,8 +5719,32 @@ fn codegen_virtual_call(
 
     let vtable_offset = (3 + method_idx) * ptr_size as usize;
 
+    let is_rust_call_abi = fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args);
+    let mut expected_abi_sig = build_fn_sig_from_ty(
+        fx.isa,
+        fx.db(),
+        fx.dl,
+        fx.env(),
+        callee_func_id,
+        generic_args,
+    )
+    .expect("virtual method ABI signature");
+    if let Some(receiver_param) = expected_abi_sig
+        .params
+        .iter_mut()
+        .find(|param| param.purpose != ArgumentPurpose::StructReturn)
+    {
+        // Vtable methods take `self` as a thin data pointer.
+        receiver_param.value_type = fx.pointer_type;
+    }
+    let flatten_rust_call_args =
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &expected_abi_sig);
+    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    let self_arg = lowered_args.first().expect("virtual call requires receiver argument");
+
     // Get self arg (&dyn Trait = ScalarPair(data_ptr, vtable_ptr))
-    let self_cval = codegen_operand(fx, &args[0].kind);
+    let self_cval = self_arg.cval.clone();
     let (data_ptr, vtable_ptr) = self_cval.load_scalar_pair(fx);
 
     // Load fn ptr from vtable
@@ -5358,8 +5799,8 @@ fn codegen_virtual_call(
     call_args.push(data_ptr);
 
     // Remaining args (after self)
-    for arg in &args[1..] {
-        let cval = codegen_operand(fx, &arg.kind);
+    for arg in lowered_args.iter().skip(1) {
+        let cval = arg.cval.clone();
         if cval.layout.is_zst() {
             continue;
         }
@@ -5377,7 +5818,7 @@ fn codegen_virtual_call(
             }
             _ => {
                 sig.params.push(AbiParam::new(fx.pointer_type));
-                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
+                call_args.push(lower_indirect_call_arg(fx, arg.is_owned, cval));
             }
         }
     }
@@ -5385,7 +5826,16 @@ fn codegen_virtual_call(
     // Emit indirect call
     let sig_ref = fx.bcx.import_signature(sig);
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
+    let call_result =
+        prepare_call_result_cvalue(fx, call, &dest, source_return_ty.as_ref(), destination);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        destination,
+        target,
+    );
 }
 
 fn codegen_intrinsic_call(
@@ -5549,7 +5999,8 @@ fn codegen_intrinsic_call(
             };
             let dest_ty = scalar_to_clif_type(fx.dl, &dest_scalar);
 
-            if !matches!(enum_ty.as_ref().kind(), TyKind::Adt(adt, _) if matches!(adt.inner().id, hir_def::AdtId::EnumId(_))) {
+            if !matches!(enum_ty.as_ref().kind(), TyKind::Adt(adt, _) if matches!(adt.inner().id, hir_def::AdtId::EnumId(_)))
+            {
                 Some(iconst_from_bits(&mut fx.bcx, dest_ty, 0))
             } else {
                 let enum_ref = codegen_operand(fx, &args[0].kind);
@@ -5778,7 +6229,8 @@ fn codegen_intrinsic_call(
             }
 
             let call = fx.bcx.ins().call(callee_ref, &call_args);
-            store_call_result_and_jump(fx, call, sret_slot, dest, destination, target);
+            let call_result = prepare_call_result_cvalue(fx, call, &dest, None, destination);
+            store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
             return true;
         }
 
@@ -6690,7 +7142,8 @@ pub fn compile_fn(
                     let ptr_val = block_params[param_idx];
                     param_idx += 1;
                     let dst = place.to_ptr().get_addr(&mut bcx, pointer_type);
-                    let byte_count = bcx.ins().iconst(pointer_type, place.layout.size.bytes() as i64);
+                    let byte_count =
+                        bcx.ins().iconst(pointer_type, place.layout.size.bytes() as i64);
                     bcx.call_memcpy(module.target_config(), dst, ptr_val, byte_count);
                 }
             }
@@ -7325,8 +7778,13 @@ fn collect_builtin_derive_trait_call_dependency(
     include_rhs_self: bool,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
 ) {
-    let method_substs =
-        trait_method_substs_for_derive_call(db, local_crate, trait_method_func_id, &self_ty, include_rhs_self);
+    let method_substs = trait_method_substs_for_derive_call(
+        db,
+        local_crate,
+        trait_method_func_id,
+        &self_ty,
+        include_rhs_self,
+    );
     let (resolved_callable, resolved_args) =
         db.lookup_impl_method(env.as_ref(), trait_method_func_id, method_substs);
     match resolved_callable {
@@ -7610,9 +8068,12 @@ fn scan_body_for_callees(
                                 let self_ty = args
                                     .first()
                                     .map(|self_arg| operand_ty(db, body, &self_arg.kind))
-                                    .and_then(|ty| ty.as_ref().builtin_deref(true).map(|it| it.store()))
+                                    .and_then(|ty| {
+                                        ty.as_ref().builtin_deref(true).map(|it| it.store())
+                                    })
                                     .or_else(|| {
-                                        (!callee_args.is_empty()).then(|| callee_args.type_at(0).store())
+                                        (!callee_args.is_empty())
+                                            .then(|| callee_args.type_at(0).store())
                                     })
                                     .expect("builtin derive call receiver must be present");
                                 collect_builtin_derive_method_dependencies(

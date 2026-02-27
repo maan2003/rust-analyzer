@@ -51,6 +51,11 @@ impl CValue {
     }
 
     pub(crate) fn by_val_pair(a: Value, b: Value, layout: Arc<Layout>) -> Self {
+        assert!(
+            matches!(layout.backend_repr, BackendRepr::ScalarPair(_, _)),
+            "by_val_pair requires ScalarPair layout, got {:?}",
+            layout.backend_repr,
+        );
         CValue { inner: CValueInner::ByValPair(a, b), layout }
     }
 
@@ -275,17 +280,28 @@ impl CPlace {
 
         match self.inner {
             CPlaceInner::Var(var) => {
-                let val = from.load_scalar(fx);
                 let dst_ty = match self.layout.backend_repr {
                     BackendRepr::Scalar(s) => scalar_to_clif_type(fx.dl, &s),
                     _ => panic!("Var place with non-Scalar layout"),
                 };
-                let src_ty = fx.bcx.func.dfg.value_type(val);
-                let val = if src_ty == dst_ty {
-                    val
-                } else {
-                    assert_eq!(src_ty.bytes(), dst_ty.bytes(), "bitcast size mismatch");
-                    fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val)
+                let val = match from.inner {
+                    CValueInner::ByVal(val) => {
+                        let src_ty = fx.bcx.func.dfg.value_type(val);
+                        if src_ty == dst_ty {
+                            val
+                        } else {
+                            assert_eq!(src_ty.bytes(), dst_ty.bytes(), "bitcast size mismatch");
+                            fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val)
+                        }
+                    }
+                    CValueInner::ByValPair(_, _) => {
+                        panic!("cannot write ScalarPair register value into scalar Var place")
+                    }
+                    CValueInner::ByRef(ptr) => {
+                        let mut flags = MemFlags::new();
+                        flags.set_notrap();
+                        ptr.load(&mut fx.bcx, dst_ty, flags)
+                    }
                 };
                 fx.bcx.def_var(var, val);
             }
@@ -304,19 +320,21 @@ impl CPlace {
                     CValueInner::ByVal(val) => {
                         ptr.store(&mut fx.bcx, val, flags);
                     }
-                    CValueInner::ByValPair(val1, val2) => {
-                        let BackendRepr::ScalarPair(a_scalar, b_scalar) = self.layout.backend_repr
-                        else {
-                            panic!("writing ByValPair to non-ScalarPair memory");
-                        };
-                        let b_off = scalar_pair_b_offset(fx.dl, a_scalar, b_scalar);
-                        ptr.store(&mut fx.bcx, val1, flags);
-                        ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).store(
-                            &mut fx.bcx,
-                            val2,
-                            flags,
-                        );
-                    }
+                    CValueInner::ByValPair(val1, val2) => match self.layout.backend_repr {
+                        BackendRepr::ScalarPair(a_scalar, b_scalar) => {
+                            let b_off = scalar_pair_b_offset(fx.dl, a_scalar, b_scalar);
+                            ptr.store(&mut fx.bcx, val1, flags);
+                            ptr.offset_i64(&mut fx.bcx, fx.pointer_type, b_off).store(
+                                &mut fx.bcx,
+                                val2,
+                                flags,
+                            );
+                        }
+                        BackendRepr::Scalar(_) => {
+                            panic!("cannot write ScalarPair register value into scalar memory place")
+                        }
+                        _ => panic!("writing ByValPair to non-scalar memory is unsupported"),
+                    },
                     CValueInner::ByRef(from_ptr) => {
                         // Delegate to scalar/pair load if possible, else memcpy
                         match self.layout.backend_repr {
