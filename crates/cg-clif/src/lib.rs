@@ -538,6 +538,30 @@ pub(crate) fn codegen_libcall1(
     fx.bcx.inst_results(call)[0]
 }
 
+/// Allocate heap storage for a boxed pointee.
+///
+/// Uses `__rust_alloc(size, align)` for non-ZST pointees and traps on null.
+/// For ZST pointees returns an aligned dangling pointer, matching Box semantics.
+fn codegen_box_alloc(fx: &mut FunctionCx<'_, impl Module>, pointee_layout: &Layout) -> Value {
+    if pointee_layout.is_zst() {
+        return fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
+    }
+
+    let size = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.size.bytes() as i64);
+    let align = fx.bcx.ins().iconst(fx.pointer_type, pointee_layout.align.abi.bytes() as i64);
+    let ptr = codegen_libcall1(
+        fx,
+        "__rust_alloc",
+        &[fx.pointer_type, fx.pointer_type],
+        fx.pointer_type,
+        &[size, align],
+    );
+
+    // `Box` must not contain a null pointer; trap hard on allocation failure.
+    fx.bcx.ins().trapz(ptr, cranelift_codegen::ir::TrapCode::user(3).unwrap());
+    ptr
+}
+
 /// Type-system-agnostic scalar cast kinds.
 pub(crate) enum ScalarCastKind {
     IntToInt,
@@ -1689,6 +1713,14 @@ fn codegen_rvalue(
         }
         Rvalue::Repeat(..) => {
             unreachable!("Repeat should be handled in codegen_assign")
+        }
+        Rvalue::ShallowInitBoxWithAlloc(ty) => {
+            let pointee_layout = fx
+                .db()
+                .layout_of_ty(ty.clone(), fx.env().clone())
+                .expect("ShallowInitBoxWithAlloc: pointee layout error");
+            let ptr = codegen_box_alloc(fx, &pointee_layout);
+            CValue::by_val(ptr, result_layout.clone())
         }
         Rvalue::ShallowInitBox(operand, _ty) => {
             // Transmute *mut u8 → Box<T>. At codegen level, just reinterpret.
@@ -3948,6 +3980,18 @@ fn codegen_intrinsic_call(
                 fx.bcx.ins().jump(block, &[]);
             }
             return true;
+        }
+        "box_new" => {
+            assert_eq!(args.len(), 1, "box_new expects 1 arg");
+
+            let pointee_layout = generic_ty_layout.clone().expect("box_new: layout error");
+            let value = codegen_operand(fx, &args[0].kind);
+
+            let ptr = codegen_box_alloc(fx, &pointee_layout);
+            let heap_place = CPlace::for_ptr(pointer::Pointer::new(ptr), pointee_layout);
+            heap_place.write_cvalue(fx, value);
+
+            Some(ptr)
         }
         "volatile_load" | "unaligned_volatile_load" => {
             // Cranelift treats loads as volatile by default
