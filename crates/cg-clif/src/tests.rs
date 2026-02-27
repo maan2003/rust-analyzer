@@ -2848,7 +2848,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: unresolved std fs closure symbol in metadata path"]
 fn std_jit_fs_metadata_current_dir_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3025,7 +3024,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: fs unix debug fd assert path (IncompleteExpr)"]
 fn std_jit_net_tcp_listener_bind_local_addr_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3047,7 +3045,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: fs unix debug fd assert path (IncompleteExpr)"]
 fn std_jit_net_udp_loopback_send_recv_probe() {
     let result: i32 = jit_run_with_std(
         r#"

@@ -337,6 +337,14 @@ fn is_fn_trait_method(db: &dyn HirDatabase, trait_id: TraitId, method_name: &str
     is_fn_trait && matches!(method_name, "call" | "call_mut" | "call_once")
 }
 
+fn extern_fn_symbol_name(db: &dyn HirDatabase, func_id: hir_def::FunctionId) -> String {
+    if let Some(link_name) = hir_def::attrs::AttrFlags::link_name(db, func_id) {
+        link_name.as_str().to_owned()
+    } else {
+        db.function_signature(func_id).name.as_str().to_owned()
+    }
+}
+
 fn static_pointee_ty(db: &dyn HirDatabase, static_id: StaticId) -> hir_ty::next_solver::Ty<'_> {
     hir_ty::InferenceResult::for_body(db, static_id.into())
         .expr_ty(db.body(static_id.into()).body_expr)
@@ -695,7 +703,7 @@ fn codegen_cast(
             let sig =
                 build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
                     .expect("extern fn sig");
-            let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
+            let name = extern_fn_symbol_name(fx.db(), callee_func_id);
             (sig, name)
         } else if is_cross_crate {
             let sig = build_fn_sig_from_ty(
@@ -2780,7 +2788,7 @@ fn codegen_const_callable_from_vtable_id(
                 let sig =
                     build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
                         .expect("extern fn sig for const fn ptr");
-                let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
+                let name = extern_fn_symbol_name(fx.db(), callee_func_id);
                 (sig, name)
             } else if is_cross_crate {
                 let sig = build_fn_sig_from_ty(
@@ -3860,7 +3868,7 @@ fn codegen_direct_call(
         let sig =
             build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
                 .expect("extern fn sig");
-        let name = fx.db().function_signature(callee_func_id).name.as_str().to_owned();
+        let name = extern_fn_symbol_name(fx.db(), callee_func_id);
         (sig, name)
     } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
         callee_func_id.into(),
@@ -4353,7 +4361,7 @@ fn codegen_intrinsic_call(
                     empty_args,
                 )
                 .expect("const_eval_select extern fn sig");
-                let name = fx.db().function_signature(runtime_func_id).name.as_str().to_owned();
+                let name = extern_fn_symbol_name(fx.db(), runtime_func_id);
                 (sig, name)
             } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
                 runtime_func_id.into(),
@@ -6100,19 +6108,31 @@ fn scan_body_for_callees(
                             .or_else(|| (!callee_args.is_empty()).then(|| callee_args.type_at(0)));
                         let trait_method_name = db.function_signature(callee_id).name.clone();
 
-                        // Closure calls: Fn::call / FnMut::call_mut / FnOnce::call_once where
-                        // self type is a concrete closure — record the closure body, not the
-                        // trait method.
+                        // Mirror `codegen_direct_call` Fn-trait dispatch to avoid
+                        // leaving real callees (e.g. fn-item shims) out of the queue.
                         if is_fn_trait_method(db, trait_id, trait_method_name.as_str())
                             && let Some(self_ty) = receiver_ty
-                            && let TyKind::Closure(closure_id, closure_subst) =
-                                peel_ref_layers(self_ty).kind()
                         {
-                            let key = (closure_id.0, closure_subst.store());
-                            if closure_visited.insert(key.clone()) {
-                                closure_result.push(key);
+                            match peel_ref_layers(self_ty).kind() {
+                                TyKind::Closure(closure_id, closure_subst) => {
+                                    let key = (closure_id.0, closure_subst.store());
+                                    if closure_visited.insert(key.clone()) {
+                                        closure_result.push(key);
+                                    }
+                                    continue;
+                                }
+                                TyKind::FnDef(def, fn_args) => {
+                                    if let CallableDefId::FunctionId(fn_id) = def.0 {
+                                        queue.push_back((fn_id, fn_args.store()));
+                                    }
+                                    continue;
+                                }
+                                TyKind::FnPtr(_, _) => {
+                                    // Indirect fn-pointer dispatch has no direct body to queue.
+                                    continue;
+                                }
+                                _ => {}
                             }
-                            continue;
                         }
 
                         match db.lookup_impl_method(env.as_ref(), callee_id, callee_args) {
