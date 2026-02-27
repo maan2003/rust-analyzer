@@ -1,4 +1,9 @@
-use std::{alloc::Layout, collections::{HashMap, HashSet}, fmt, panic, sync::Mutex};
+use std::{
+    alloc::Layout,
+    collections::{HashMap, HashSet},
+    fmt, panic,
+    sync::Mutex,
+};
 
 use cranelift_module::Module;
 
@@ -397,7 +402,8 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         // Use the first function's crate as local_crate (all test fns are in same crate)
@@ -1732,7 +1738,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -1781,8 +1788,12 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             let body = db
                 .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
-            let closure_name =
-                crate::symbol_mangling::mangle_closure(&db, *closure_id, closure_subst.as_ref(), &empty_map);
+            let closure_name = crate::symbol_mangling::mangle_closure(
+                &db,
+                *closure_id,
+                closure_subst.as_ref(),
+                &empty_map,
+            );
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 continue;
             }
@@ -1803,7 +1814,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile drop_in_place glue functions
         for ty in &drop_types {
-            let drop_name = crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
+            let drop_name =
+                crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
             if !compiled_drop_symbols.insert(drop_name) {
                 continue;
             }
@@ -1908,12 +1920,11 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
     let mut cargo_config = CargoConfig::default();
     cargo_config.sysroot = Some(RustLibSource::Discover);
 
-    let mut workspace = ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
-        .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
-    workspace.kind = ProjectWorkspaceKind::DetachedFile {
-        file: detached_file_manifest.clone(),
-        cargo: None,
-    };
+    let mut workspace =
+        ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
+            .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
+    workspace.kind =
+        ProjectWorkspaceKind::DetachedFile { file: detached_file_manifest.clone(), cargo: None };
 
     let mut source_change = FileChange::default();
     let mut local_file_set = FileSet::default();
@@ -2037,7 +2048,8 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
