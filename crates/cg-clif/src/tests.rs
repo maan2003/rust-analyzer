@@ -3694,9 +3694,15 @@ fn foo() -> i32 {
 fn jit_slice_get_unchecked_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"
+//- minicore: slice, unsize, coerce_unsized
+//- /main.rs
+extern "rust-intrinsic" {
+    pub fn slice_get_unchecked<T>(slice: *const [T], index: usize) -> *const T;
+}
 fn foo() -> i32 {
     let arr = [11_i32, 22, 33];
-    unsafe { *arr.get_unchecked(1usize) }
+    let s: &[i32] = &arr;
+    unsafe { *slice_get_unchecked(s as *const [i32], 1usize) }
 }
 "#,
         &["foo"],
