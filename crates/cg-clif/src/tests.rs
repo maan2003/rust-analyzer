@@ -2734,7 +2734,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: core::fmt::num::impl::fmt local layout HasErrorConst"]
 fn std_jit_env_set_var_smoke() {
     let result: i32 = jit_run_with_std(
         r#"

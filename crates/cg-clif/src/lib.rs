@@ -4158,8 +4158,8 @@ fn codegen_intrinsic_call(
             }
         }
 
-        // --- abort ---
-        "abort" => {
+        // --- abort / unreachable ---
+        "abort" | "unreachable" => {
             fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
             if let Some(target) = target {
                 let block = fx.clif_block(*target);
