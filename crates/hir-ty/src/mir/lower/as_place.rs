@@ -139,11 +139,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         };
         match &self.body[expr_id] {
             Expr::Path(p) => {
-                let resolver_guard =
-                    self.resolver.update_to_inner_scope(self.db, self.owner, expr_id);
-                let hygiene = self.body.expr_path_hygiene(expr_id);
-                let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, p, hygiene);
-                self.resolver.reset_to_guard(resolver_guard);
+                let resolved = self.resolve_value_path_in_expr(expr_id, p);
                 let Some(pr) = resolved else {
                     return try_rvalue(self);
                 };
