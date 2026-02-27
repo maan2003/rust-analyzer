@@ -2977,6 +2977,112 @@ fn foo() -> i32 {
     assert_eq!(result, 1);
 }
 
+#[test]
+fn std_jit_net_ipv6_segments_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+    let segments = ip.segments();
+    ((segments[0] == 0) && (segments[7] == 1)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_socketaddr_v4_parts_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 42), 8080);
+    let ip = addr.ip().octets();
+    ((addr.port() == 8080) && (ip[0] == 10) && (ip[3] == 42)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_ipaddr_match_private_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 2));
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() as i32,
+        std::net::IpAddr::V6(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: fs unix debug fd assert path (IncompleteExpr)"]
+fn std_jit_net_tcp_listener_bind_local_addr_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let listener = match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(listener) => listener,
+        Err(_) => return 0,
+    };
+
+    match listener.local_addr() {
+        Ok(addr) => (addr.is_ipv4() && addr.port() != 0) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: fs unix debug fd assert path (IncompleteExpr)"]
+fn std_jit_net_udp_loopback_send_recv_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let receiver = match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(socket) => socket,
+        Err(_) => return 0,
+    };
+    let receiver_addr = match receiver.local_addr() {
+        Ok(addr) => addr,
+        Err(_) => return 0,
+    };
+
+    let sender = match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(socket) => socket,
+        Err(_) => return 0,
+    };
+    if sender.send_to(&[99_u8], receiver_addr).is_err() {
+        return 0;
+    }
+
+    let mut buf = [0_u8; 1];
+    match receiver.recv_from(&mut buf) {
+        Ok((received, source)) => {
+            (received == 1 && buf[0] == 99_u8 && source.is_ipv4()) as i32
+        }
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Ambitious std-JIT frontier probes
 // ---------------------------------------------------------------------------
