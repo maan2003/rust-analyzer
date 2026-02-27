@@ -320,6 +320,23 @@ fn operand_ty(db: &dyn HirDatabase, body: &MirBody, kind: &OperandKind) -> Store
     }
 }
 
+fn peel_ref_layers<'db>(mut ty: hir_ty::next_solver::Ty<'db>) -> hir_ty::next_solver::Ty<'db> {
+    while let TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = inner;
+    }
+    ty
+}
+
+fn is_fn_trait_method(db: &dyn HirDatabase, trait_id: TraitId, method_name: &str) -> bool {
+    let trait_krate = trait_id.module(db).krate(db);
+    let lang_items = hir_def::lang_item::lang_items(db, trait_krate);
+    let is_fn_trait =
+        Some(trait_id) == lang_items.Fn
+            || Some(trait_id) == lang_items.FnMut
+            || Some(trait_id) == lang_items.FnOnce;
+    is_fn_trait && matches!(method_name, "call" | "call_mut" | "call_once")
+}
+
 fn static_pointee_ty(db: &dyn HirDatabase, static_id: StaticId) -> hir_ty::next_solver::Ty<'_> {
     hir_ty::InferenceResult::for_body(db, static_id.into())
         .expr_ty(db.body(static_id.into()).body_expr)
@@ -3707,39 +3724,99 @@ fn codegen_direct_call(
                 return;
             }
 
-            // Check for closure call: Fn::call / FnMut::call_mut / FnOnce::call_once
-            // where self type is a closure — redirect to the closure's MIR body.
-            if generic_args.len() > 0 {
-                let self_ty = generic_args.type_at(0);
-                if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
-                    codegen_closure_call(
-                        fx,
-                        closure_id.0,
-                        closure_subst.store(),
-                        args,
-                        destination,
-                        target,
-                    );
-                    return;
-                }
+            let receiver_ty = args
+                .first()
+                .map(|self_arg| operand_ty(fx.db(), fx.ra_body(), &self_arg.kind).as_ref())
+                .or_else(|| (!generic_args.is_empty()).then(|| generic_args.type_at(0)));
 
-                // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often
-                // resolve to the blanket reference impl in `core::ops::function::impls`,
-                // but the actual runtime dispatch must still happen through the inner
-                // dyn vtable. Route those straight to virtual dispatch.
-                if let Some(self_pointee) = self_ty.builtin_deref(true)
-                    && self_pointee.dyn_trait() == Some(trait_id)
-                    && matches!(
-                        fx.db()
-                            .layout_of_ty(self_ty.store(), fx.env().clone())
-                            .expect("self layout for dyn ref dispatch")
-                            .backend_repr,
-                        BackendRepr::ScalarPair(_, _)
-                    )
-                {
-                    codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
-                    return;
+            let trait_method_name = fx.db().function_signature(callee_func_id).name.clone();
+
+            // Fn/FnMut/FnOnce calls are often encoded with receiver information only in the
+            // first MIR argument operand. Deriving callable dispatch from that operand keeps us
+            // off unresolved trait-item imports like `FnOnce::call_once`.
+            if is_fn_trait_method(fx.db(), trait_id, trait_method_name.as_str()) {
+                if let Some(self_ty) = receiver_ty {
+                    match peel_ref_layers(self_ty).kind() {
+                        TyKind::Closure(closure_id, closure_subst) => {
+                            codegen_closure_call(
+                                fx,
+                                closure_id.0,
+                                closure_subst.store(),
+                                args,
+                                destination,
+                                target,
+                            );
+                            return;
+                        }
+                        TyKind::FnDef(def, fn_args) => {
+                            match def.0 {
+                                CallableDefId::FunctionId(fn_id) => {
+                                    codegen_direct_call(
+                                        fx,
+                                        fn_id,
+                                        fn_args,
+                                        args.get(1..).unwrap_or(&[]),
+                                        destination,
+                                        target,
+                                    );
+                                    return;
+                                }
+                                CallableDefId::StructId(struct_id) => {
+                                    codegen_adt_constructor_call(
+                                        fx,
+                                        VariantId::StructId(struct_id),
+                                        fn_args,
+                                        args.get(1..).unwrap_or(&[]),
+                                        destination,
+                                        target,
+                                    );
+                                    return;
+                                }
+                                CallableDefId::EnumVariantId(variant_id) => {
+                                    codegen_adt_constructor_call(
+                                        fx,
+                                        VariantId::EnumVariantId(variant_id),
+                                        fn_args,
+                                        args.get(1..).unwrap_or(&[]),
+                                        destination,
+                                        target,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        TyKind::FnPtr(sig_tys, _) if !args.is_empty() => {
+                            codegen_fn_ptr_call(
+                                fx,
+                                &args[0],
+                                &sig_tys,
+                                args.get(1..).unwrap_or(&[]),
+                                destination,
+                                target,
+                            );
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
+            }
+
+            // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often resolve to the
+            // blanket reference impl in `core::ops::function::impls`, but the actual runtime
+            // dispatch must still happen through the inner dyn vtable.
+            if let Some(self_ty) = receiver_ty
+                && let Some(self_pointee) = self_ty.builtin_deref(true)
+                && self_pointee.dyn_trait() == Some(trait_id)
+                && matches!(
+                    fx.db()
+                        .layout_of_ty(self_ty.store(), fx.env().clone())
+                        .expect("self layout for dyn ref dispatch")
+                        .backend_repr,
+                    BackendRepr::ScalarPair(_, _)
+                )
+            {
+                codegen_virtual_call(fx, callee_func_id, trait_id, args, destination, target);
+                return;
             }
 
             // Static trait dispatch: resolve to concrete impl method when possible.
@@ -6005,7 +6082,7 @@ fn scan_body_for_callees(
 
                     // Skip virtual calls — trait methods on dyn types are dispatched
                     // through vtables, not compiled as standalone functions.
-                    if let ItemContainerId::TraitId(_) = callee_id.loc(db).container {
+                    if let ItemContainerId::TraitId(trait_id) = callee_id.loc(db).container {
                         if hir_ty::method_resolution::is_dyn_method(
                             interner,
                             env.param_env(),
@@ -6016,18 +6093,26 @@ fn scan_body_for_callees(
                         {
                             continue;
                         }
-                        // Closure calls: Fn::call / FnMut::call_mut / FnOnce::call_once
-                        // where self type is a concrete closure — record the closure body,
-                        // not the trait method.
-                        if callee_args.len() > 0 {
-                            let self_ty = callee_args.type_at(0);
-                            if let TyKind::Closure(closure_id, closure_subst) = self_ty.kind() {
-                                let key = (closure_id.0, closure_subst.store());
-                                if closure_visited.insert(key.clone()) {
-                                    closure_result.push(key);
-                                }
-                                continue;
+
+                        let receiver_ty = args
+                            .first()
+                            .map(|self_arg| operand_ty(db, body, &self_arg.kind).as_ref())
+                            .or_else(|| (!callee_args.is_empty()).then(|| callee_args.type_at(0)));
+                        let trait_method_name = db.function_signature(callee_id).name.clone();
+
+                        // Closure calls: Fn::call / FnMut::call_mut / FnOnce::call_once where
+                        // self type is a concrete closure — record the closure body, not the
+                        // trait method.
+                        if is_fn_trait_method(db, trait_id, trait_method_name.as_str())
+                            && let Some(self_ty) = receiver_ty
+                            && let TyKind::Closure(closure_id, closure_subst) =
+                                peel_ref_layers(self_ty).kind()
+                        {
+                            let key = (closure_id.0, closure_subst.store());
+                            if closure_visited.insert(key.clone()) {
+                                closure_result.push(key);
                             }
+                            continue;
                         }
 
                         match db.lookup_impl_method(env.as_ref(), callee_id, callee_args) {
