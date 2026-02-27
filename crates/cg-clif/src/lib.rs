@@ -4374,6 +4374,12 @@ fn codegen_intrinsic_call(
             let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             Some(val) // pass through
         }
+        "is_val_statically_known" => {
+            assert_eq!(args.len(), 1);
+            // This intrinsic is explicitly non-deterministic; returning false
+            // is always semantically valid and avoids leaving unresolved imports.
+            Some(fx.bcx.ins().iconst(types::I8, 0))
+        }
         "black_box" => {
             assert_eq!(args.len(), 1);
             let val = codegen_operand(fx, &args[0].kind);
