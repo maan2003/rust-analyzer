@@ -2274,72 +2274,101 @@ fn codegen_binop(
     let body = fx.ra_body();
     let lhs_cval = codegen_operand(fx, &lhs.kind);
     let rhs_cval = codegen_operand(fx, &rhs.kind);
-    let lhs_val = lhs_cval.load_scalar(fx);
-    let rhs_val = rhs_cval.load_scalar(fx);
 
-    let BackendRepr::Scalar(scalar) = lhs_cval.layout.backend_repr else {
-        panic!("expected scalar type for binop lhs");
-    };
+    match lhs_cval.layout.backend_repr {
+        BackendRepr::Scalar(scalar) => {
+            let lhs_val = lhs_cval.load_scalar(fx);
+            let rhs_val = rhs_cval.load_scalar(fx);
 
-    // Overflow binops return (T, bool) as a ScalarPair
-    if matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow) {
-        let Primitive::Int(_, signed) = scalar.primitive() else {
-            panic!("overflow binop on non-integer type");
-        };
-        let (res, has_overflow) = codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
-        let BackendRepr::ScalarPair(_, overflow_scalar) = result_layout.backend_repr else {
-            panic!("overflow binop must return ScalarPair");
-        };
-        let overflow_ty = scalar_to_clif_type(fx.dl, &overflow_scalar);
-        let has_overflow = if fx.bcx.func.dfg.value_type(has_overflow) == overflow_ty {
-            has_overflow
-        } else {
-            let one = fx.bcx.ins().iconst(overflow_ty, 1);
-            let zero = fx.bcx.ins().iconst(overflow_ty, 0);
-            fx.bcx.ins().select(has_overflow, one, zero)
-        };
-        return CValue::by_val_pair(res, has_overflow, result_layout.clone());
-    }
-
-    let val = match scalar.primitive() {
-        Primitive::Int(_, signed) => codegen_int_binop(fx, op, lhs_val, rhs_val, signed),
-        Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
-        Primitive::Pointer(_) => match op {
-            BinOp::Offset => {
-                let lhs_ty = operand_ty(fx.db(), body, &lhs.kind);
-                let pointee_ty = lhs_ty
-                    .as_ref()
-                    .builtin_deref(true)
-                    .expect("Offset lhs must be a pointer/reference");
-                let pointee_layout = fx
-                    .db()
-                    .layout_of_ty(pointee_ty.store(), fx.env().clone())
-                    .expect("layout error for pointee type");
-                let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
-                let rhs_ty = fx.bcx.func.dfg.value_type(rhs_val);
-                let rhs_signed = ty_is_signed_int(operand_ty(fx.db(), body, &rhs.kind));
-                let rhs = if rhs_ty == ptr_ty {
-                    rhs_val
-                } else if ptr_ty.wider_or_equal(rhs_ty) {
-                    if rhs_signed {
-                        fx.bcx.ins().sextend(ptr_ty, rhs_val)
-                    } else {
-                        fx.bcx.ins().uextend(ptr_ty, rhs_val)
-                    }
-                } else {
-                    fx.bcx.ins().ireduce(ptr_ty, rhs_val)
+            // Overflow binops return (T, bool) as a ScalarPair
+            if matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow)
+            {
+                let Primitive::Int(_, signed) = scalar.primitive() else {
+                    panic!("overflow binop on non-integer type");
                 };
-                let byte_offset = fx.bcx.ins().imul_imm(rhs, pointee_layout.size.bytes() as i64);
-                fx.bcx.ins().iadd(lhs_val, byte_offset)
+                let (res, has_overflow) = codegen_checked_int_binop(fx, op, lhs_val, rhs_val, signed);
+                let BackendRepr::ScalarPair(_, overflow_scalar) = result_layout.backend_repr else {
+                    panic!("overflow binop must return ScalarPair");
+                };
+                let overflow_ty = scalar_to_clif_type(fx.dl, &overflow_scalar);
+                let has_overflow = if fx.bcx.func.dfg.value_type(has_overflow) == overflow_ty {
+                    has_overflow
+                } else {
+                    let one = fx.bcx.ins().iconst(overflow_ty, 1);
+                    let zero = fx.bcx.ins().iconst(overflow_ty, 0);
+                    fx.bcx.ins().select(has_overflow, one, zero)
+                };
+                return CValue::by_val_pair(res, has_overflow, result_layout.clone());
             }
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
-                let cc = bin_op_to_intcc(op, false);
-                fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
-            }
-            _ => todo!("pointer binop: {:?}", op),
-        },
-    };
-    CValue::by_val(val, result_layout.clone())
+
+            let val = match scalar.primitive() {
+                Primitive::Int(_, signed) => codegen_int_binop(fx, op, lhs_val, rhs_val, signed),
+                Primitive::Float(_) => codegen_float_binop(fx, op, lhs_val, rhs_val),
+                Primitive::Pointer(_) => match op {
+                    BinOp::Offset => {
+                        let lhs_ty = operand_ty(fx.db(), body, &lhs.kind);
+                        let pointee_ty = lhs_ty
+                            .as_ref()
+                            .builtin_deref(true)
+                            .expect("Offset lhs must be a pointer/reference");
+                        let pointee_layout = fx
+                            .db()
+                            .layout_of_ty(pointee_ty.store(), fx.env().clone())
+                            .expect("layout error for pointee type");
+                        let ptr_ty = fx.bcx.func.dfg.value_type(lhs_val);
+                        let rhs_ty = fx.bcx.func.dfg.value_type(rhs_val);
+                        let rhs_signed = ty_is_signed_int(operand_ty(fx.db(), body, &rhs.kind));
+                        let rhs = if rhs_ty == ptr_ty {
+                            rhs_val
+                        } else if ptr_ty.wider_or_equal(rhs_ty) {
+                            if rhs_signed {
+                                fx.bcx.ins().sextend(ptr_ty, rhs_val)
+                            } else {
+                                fx.bcx.ins().uextend(ptr_ty, rhs_val)
+                            }
+                        } else {
+                            fx.bcx.ins().ireduce(ptr_ty, rhs_val)
+                        };
+                        let byte_offset =
+                            fx.bcx.ins().imul_imm(rhs, pointee_layout.size.bytes() as i64);
+                        fx.bcx.ins().iadd(lhs_val, byte_offset)
+                    }
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
+                        let cc = bin_op_to_intcc(op, false);
+                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                    }
+                    _ => todo!("pointer binop: {:?}", op),
+                },
+            };
+            CValue::by_val(val, result_layout.clone())
+        }
+        BackendRepr::ScalarPair(_, _) => {
+            let (lhs_a, lhs_b) = lhs_cval.load_scalar_pair(fx);
+            let (rhs_a, rhs_b) = rhs_cval.load_scalar_pair(fx);
+            let val = match op {
+                BinOp::Eq => {
+                    let a_eq = fx.bcx.ins().icmp(IntCC::Equal, lhs_a, rhs_a);
+                    let b_eq = fx.bcx.ins().icmp(IntCC::Equal, lhs_b, rhs_b);
+                    fx.bcx.ins().band(a_eq, b_eq)
+                }
+                BinOp::Ne => {
+                    let a_ne = fx.bcx.ins().icmp(IntCC::NotEqual, lhs_a, rhs_a);
+                    let b_ne = fx.bcx.ins().icmp(IntCC::NotEqual, lhs_b, rhs_b);
+                    fx.bcx.ins().bor(a_ne, b_ne)
+                }
+                BinOp::Lt | BinOp::Le | BinOp::Ge | BinOp::Gt => {
+                    let cc = bin_op_to_intcc(op, false);
+                    let a_eq = fx.bcx.ins().icmp(IntCC::Equal, lhs_a, rhs_a);
+                    let a_cmp = fx.bcx.ins().icmp(cc, lhs_a, rhs_a);
+                    let b_cmp = fx.bcx.ins().icmp(cc, lhs_b, rhs_b);
+                    fx.bcx.ins().select(a_eq, b_cmp, a_cmp)
+                }
+                _ => panic!("unsupported ScalarPair binop: {:?}", op),
+            };
+            CValue::by_val(val, result_layout.clone())
+        }
+        _ => panic!("expected scalar or scalarpair type for binop lhs"),
+    }
 }
 
 pub(crate) fn codegen_int_binop(
