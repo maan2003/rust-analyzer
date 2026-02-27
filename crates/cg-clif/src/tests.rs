@@ -2883,7 +2883,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: monomorphization resulted in errors in HashMap path"]
 fn std_jit_hashmap_insert_get_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2895,6 +2894,42 @@ fn foo() -> i32 {
         Some(v) => ((*v == 32) && (map.len() == 2)) as i32,
         None => 0,
     }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_hashmap_insert_get_with_capacity_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::HashMap<i32, i32> =
+        std::collections::HashMap::with_capacity(16);
+    map.insert(1, 10);
+    map.insert(2, 32);
+    match map.get(&2) {
+        Some(v) => ((*v == 32) && (map.len() == 2)) as i32,
+        None => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_hashmap_resize_only_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    map.insert(1, 10);
+    map.insert(2, 32);
+    (map.len() == 2) as i32
 }
 "#,
         "foo",
@@ -3688,6 +3723,37 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1987);
+}
+
+#[test]
+fn jit_mem_replace_memory_repr_struct_probe() {
+    let result: u64 = jit_run_with_std(
+        r#"
+struct FourU64 {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+fn foo() -> u64 {
+    let mut x = FourU64 { a: 1, b: 2, c: 3, d: 4 };
+    let y = FourU64 { a: 0x70, b: 0x80, c: 5, d: 6 };
+    let old = core::mem::replace(&mut x, y);
+
+    ((x.a == 0x70) as u64)
+        | (((x.b == 0x80) as u64) << 1)
+        | (((x.c == 5) as u64) << 2)
+        | (((x.d == 6) as u64) << 3)
+        | (((old.a == 1) as u64) << 4)
+        | (((old.b == 2) as u64) << 5)
+        | (((old.c == 3) as u64) << 6)
+        | (((old.d == 4) as u64) << 7)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 0xFF);
 }
 
 #[test]
