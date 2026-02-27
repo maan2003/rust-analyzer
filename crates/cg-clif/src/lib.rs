@@ -10,8 +10,8 @@ use std::sync::Arc;
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, ArgumentPurpose, AtomicRmwOp, Block, InstBuilder, MemFlags, Signature, Type, Value,
-    types,
+    AbiParam, ArgumentPurpose, AtomicRmwOp, Block, BlockArg, InstBuilder, MemFlags, Signature,
+    Type, Value, types,
 };
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -997,7 +997,7 @@ fn codegen_unsize_coercion(
 /// Build or retrieve a vtable for `concrete_ty` implementing `trait_id`.
 ///
 /// Vtable layout (matches rustc):
-/// - Slot 0: drop_in_place fn ptr (null for now)
+/// - Slot 0: drop_in_place fn ptr (null when the concrete type has no drop glue)
 /// - Slot 1: size of concrete type (usize)
 /// - Slot 2: alignment of concrete type (usize)
 /// - Slot 3+: trait methods in declaration order
@@ -1106,6 +1106,9 @@ fn get_or_create_vtable(
     trait_id: TraitId,
 ) -> Value {
     let ptr_size = fx.dl.pointer_size().bytes() as usize;
+    let drop_interner = DbInterner::new_with(fx.db(), fx.local_crate());
+    let concrete_has_drop_glue =
+        hir_ty::drop::has_drop_glue_mono(drop_interner, concrete_ty.as_ref());
 
     // Get concrete type layout for size/align
     let concrete_layout = fx
@@ -1188,8 +1191,7 @@ fn get_or_create_vtable(
     let mut data = DataDescription::new();
     let mut vtable_bytes = vec![0u8; total_size];
 
-    // Slot 0: drop_in_place — null for now (no drop glue)
-    // (already zeroed)
+    // Slot 0: drop_in_place — left null for trivially dropless types.
 
     // Slot 1: size
     vtable_bytes[ptr_size..ptr_size * 2]
@@ -1200,6 +1202,22 @@ fn get_or_create_vtable(
         .copy_from_slice(&(concrete_align as u64).to_le_bytes()[..ptr_size]);
 
     data.define(vtable_bytes.into_boxed_slice());
+
+    if concrete_has_drop_glue {
+        let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+        drop_sig.params.push(AbiParam::new(fx.pointer_type));
+        let drop_fn_name = symbol_mangling::mangle_drop_in_place(
+            fx.db(),
+            concrete_ty.as_ref(),
+            fx.ext_crate_disambiguators(),
+        );
+        let drop_func_id = fx
+            .module
+            .declare_function(&drop_fn_name, Linkage::Import, &drop_sig)
+            .expect("declare vtable drop_in_place");
+        let drop_func_ref = fx.module.declare_func_in_data(drop_func_id, &mut data);
+        data.write_function_addr(0, drop_func_ref);
+    }
 
     // Slot 3+: trait method fn ptrs — emit as relocations
     let closure_func_id = closure_fallback.as_ref().map(|(closure_id, closure_subst)| {
@@ -3699,35 +3717,23 @@ fn codegen_builtin_derive_method_call(
         BuiltinDeriveImplMethod::clone => {
             assert_eq!(args.len(), 1, "builtin Clone::clone expects one receiver argument");
 
-            let self_ty = if generic_args.is_empty() {
-                let receiver_ref_ty = operand_ty(fx.db(), fx.ra_body(), &args[0].kind);
-                receiver_ref_ty
-                    .as_ref()
-                    .builtin_deref(true)
-                    .expect("builtin Clone::clone receiver must be a reference")
-            } else {
-                generic_args.type_at(0)
-            };
+            let self_ty = place_ty(fx.db(), fx.ra_body(), destination);
             let interner = DbInterner::new_with(fx.db(), fx.local_crate());
             let infcx = interner.infer_ctxt().build(hir_ty::next_solver::TypingMode::PostAnalysis);
             assert!(
-                infcx.type_is_copy_modulo_regions(fx.env().param_env(), self_ty),
+                infcx.type_is_copy_modulo_regions(fx.env().param_env(), self_ty.as_ref()),
                 "builtin Clone::clone for non-Copy Self is not supported yet: {:?}",
                 self_ty
             );
 
-            let self_layout = fx
-                .db()
-                .layout_of_ty(self_ty.store(), fx.env().clone())
-                .expect("layout for builtin Clone::clone receiver");
+            let dest = codegen_place(fx, destination);
             let self_ref = codegen_operand(fx, &args[0].kind);
             let BackendRepr::Scalar(_) = self_ref.layout.backend_repr else {
                 panic!("builtin Clone::clone expects a thin &Self receiver");
             };
             let self_ptr = self_ref.load_scalar(fx);
-            let self_val = CValue::by_ref(pointer::Pointer::new(self_ptr), self_layout);
+            let self_val = CValue::by_ref(pointer::Pointer::new(self_ptr), dest.layout.clone());
 
-            let dest = codegen_place(fx, destination);
             dest.write_cvalue(fx, self_val);
 
             if target.is_some()
@@ -3882,27 +3888,115 @@ fn codegen_direct_call(
         let interner = DbInterner::new_with(fx.db(), fx.local_crate());
         if hir_ty::drop::has_drop_glue_mono(interner, pointee_ty.as_ref()) {
             let arg = codegen_operand(fx, &args[0].kind);
-            let ptr = match arg.layout.backend_repr {
-                BackendRepr::Scalar(_) => arg.load_scalar(fx),
+            match arg.layout.backend_repr {
+                BackendRepr::Scalar(_) => {
+                    let ptr = arg.load_scalar(fx);
+
+                    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+                    drop_sig.params.push(AbiParam::new(fx.pointer_type));
+                    let fn_name = symbol_mangling::mangle_drop_in_place(
+                        fx.db(),
+                        pointee_ty.as_ref(),
+                        fx.ext_crate_disambiguators(),
+                    );
+                    let callee_id = fx
+                        .module
+                        .declare_function(&fn_name, Linkage::Import, &drop_sig)
+                        .expect("declare drop_in_place glue");
+                    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+                    fx.bcx.ins().call(callee_ref, &[ptr]);
+                }
                 BackendRepr::ScalarPair(_, _) => {
-                    panic!("drop_in_place for unsized type with drop glue is not supported yet")
+                    let (data_ptr, metadata) = arg.load_scalar_pair(fx);
+                    match pointee_ty.as_ref().kind() {
+                        TyKind::Dynamic(..) => {
+                            let drop_fn =
+                                fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), metadata, 0);
+                            let is_null = fx.bcx.ins().icmp_imm(IntCC::Equal, drop_fn, 0);
+
+                            let skip_drop = fx.bcx.create_block();
+                            let do_drop = fx.bcx.create_block();
+                            fx.bcx.ins().brif(is_null, skip_drop, &[], do_drop, &[]);
+
+                            fx.bcx.switch_to_block(do_drop);
+                            let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+                            drop_sig.params.push(AbiParam::new(fx.pointer_type));
+                            let drop_sig_ref = fx.bcx.import_signature(drop_sig);
+                            fx.bcx.ins().call_indirect(drop_sig_ref, drop_fn, &[data_ptr]);
+                            fx.bcx.ins().jump(skip_drop, &[]);
+
+                            fx.bcx.switch_to_block(skip_drop);
+                        }
+                        TyKind::Slice(elem_ty) => {
+                            if !hir_ty::drop::has_drop_glue_mono(interner, elem_ty) {
+                                // Nothing to do; this only happens for degenerate mono paths.
+                                // `has_drop_glue_mono([T])` implies `has_drop_glue_mono(T)`.
+                            } else {
+                                let elem_ty_stored = elem_ty.store();
+                                let elem_layout = fx
+                                    .db()
+                                    .layout_of_ty(elem_ty_stored.clone(), fx.env().clone())
+                                    .expect("layout for slice element drop");
+
+                                let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+                                drop_sig.params.push(AbiParam::new(fx.pointer_type));
+                                let drop_fn_name = symbol_mangling::mangle_drop_in_place(
+                                    fx.db(),
+                                    elem_ty,
+                                    fx.ext_crate_disambiguators(),
+                                );
+                                let drop_func_id = fx
+                                    .module
+                                    .declare_function(&drop_fn_name, Linkage::Import, &drop_sig)
+                                    .expect("declare slice element drop_in_place");
+                                let drop_callee_ref =
+                                    fx.module.declare_func_in_func(drop_func_id, fx.bcx.func);
+
+                                let loop_block = fx.bcx.create_block();
+                                let body_block = fx.bcx.create_block();
+                                let done_block = fx.bcx.create_block();
+
+                                fx.bcx.append_block_param(loop_block, fx.pointer_type);
+                                let zero = fx.bcx.ins().iconst(fx.pointer_type, 0);
+                                fx.bcx.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+                                fx.bcx.switch_to_block(loop_block);
+                                let idx = fx.bcx.block_params(loop_block)[0];
+                                let finished = fx.bcx.ins().icmp(
+                                    IntCC::UnsignedGreaterThanOrEqual,
+                                    idx,
+                                    metadata,
+                                );
+                                fx.bcx.ins().brif(finished, done_block, &[], body_block, &[]);
+
+                                fx.bcx.switch_to_block(body_block);
+                                let elem_ptr = if elem_layout.size.bytes() == 0 {
+                                    data_ptr
+                                } else {
+                                    let elem_size = fx
+                                        .bcx
+                                        .ins()
+                                        .iconst(fx.pointer_type, elem_layout.size.bytes() as i64);
+                                    let byte_offset = fx.bcx.ins().imul(idx, elem_size);
+                                    fx.bcx.ins().iadd(data_ptr, byte_offset)
+                                };
+                                fx.bcx.ins().call(drop_callee_ref, &[elem_ptr]);
+                                let next_idx = fx.bcx.ins().iadd_imm(idx, 1);
+                                fx.bcx.ins().jump(loop_block, &[BlockArg::Value(next_idx)]);
+
+                                fx.bcx.switch_to_block(done_block);
+                            }
+                        }
+                        _ => {
+                            panic!(
+                                "drop_in_place for unsized type with drop glue is not supported yet: {:?}",
+                                pointee_ty.as_ref().kind()
+                            );
+                        }
+                    }
                 }
                 _ => panic!("drop_in_place argument must be a pointer"),
-            };
-
-            let mut drop_sig = Signature::new(fx.isa.default_call_conv());
-            drop_sig.params.push(AbiParam::new(fx.pointer_type));
-            let fn_name = symbol_mangling::mangle_drop_in_place(
-                fx.db(),
-                pointee_ty.as_ref(),
-                fx.ext_crate_disambiguators(),
-            );
-            let callee_id = fx
-                .module
-                .declare_function(&fn_name, Linkage::Import, &drop_sig)
-                .expect("declare drop_in_place glue");
-            let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
-            fx.bcx.ins().call(callee_ref, &[ptr]);
+            }
         }
 
         if let Some(target) = target {
@@ -5782,6 +5876,7 @@ fn collect_vtable_methods(
     target_ty: &StoredTy,
     local_crate: base_db::Crate,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
     // Extract the trait from the target type
     let Some(pointee_ty) = target_ty.as_ref().builtin_deref(true) else { return };
@@ -5791,6 +5886,10 @@ fn collect_vtable_methods(
     let from_ty = operand_ty(db, body, &operand.kind);
     let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
     let source_pointee_stored = source_pointee.store();
+
+    // Vtable slot 0 references concrete `drop_in_place::<T>`, so discover and
+    // generate drop glue for unsized source pointees used in dyn coercions.
+    collect_drop_info(db, local_crate, &source_pointee_stored, queue, drop_types);
 
     // Add all trait method implementations to the queue
     let trait_items = trait_id.trait_items(db);
@@ -6265,6 +6364,7 @@ fn scan_body_for_callees(
                                 target_ty,
                                 local_crate,
                                 queue,
+                                drop_types,
                             );
                         }
                         // ReifyFnPointer: fn item → fn pointer. The target fn needs compilation.
