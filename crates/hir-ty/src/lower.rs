@@ -320,7 +320,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     unknown_const(const_type)
                 }
             }
-            hir_def::hir::Expr::BinaryOp { .. }
+            hir_def::hir::Expr::BinaryOp { .. } | hir_def::hir::Expr::Call { .. }
                 if matches!(const_type.kind(), TyKind::Uint(UintTy::Usize)) =>
             {
                 self.try_eval_const_usize_expr(const_expr_id)
@@ -348,6 +348,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 let c = self.path_to_const(path)?;
                 crate::consteval::try_const_usize(self.db, c)
             }
+            hir_def::hir::Expr::Call { callee, args } => {
+                self.try_eval_const_usize_call(*callee, args)
+            }
             hir_def::hir::Expr::BinaryOp {
                 lhs,
                 rhs,
@@ -374,6 +377,55 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             _ => None,
         }
+    }
+
+    fn try_eval_const_usize_call(
+        &mut self,
+        callee: hir_def::hir::ExprId,
+        args: &[hir_def::hir::ExprId],
+    ) -> Option<u128> {
+        if !args.is_empty() {
+            return None;
+        }
+
+        let hir_def::hir::Expr::Path(path) = &self.store[callee] else { return None };
+        let ValueNs::FunctionId(func_id) =
+            self.resolver.resolve_path_in_value_ns_fully(self.db, path, HygieneId::ROOT)?
+        else {
+            return None;
+        };
+
+        let fn_sig = self.db.function_signature(func_id);
+        let fn_name = fn_sig.name.as_str();
+        if !matches!(fn_name, "size_of" | "align_of") {
+            return None;
+        }
+
+        let type_arg_ref = path
+            .segments()
+            .last()
+            .and_then(|segment| segment.args_and_bindings)
+            .and_then(|generic_args| {
+                if generic_args.args.len() != 1 {
+                    return None;
+                }
+                match generic_args.args[0] {
+                    hir_def::expr_store::path::GenericArg::Type(ty) => Some(ty),
+                    _ => None,
+                }
+            })?;
+
+        let ty = self.lower_ty(type_arg_ref);
+        let env = ParamEnvAndCrate {
+            param_env: self.db.trait_environment(self.def),
+            krate: self.resolver.krate(),
+        };
+        let layout = self.db.layout_of_ty(ty.store(), env.store()).ok()?;
+        Some(match fn_name {
+            "size_of" => layout.size.bytes().into(),
+            "align_of" => layout.align.abi.bytes().into(),
+            _ => unreachable!(),
+        })
     }
 
     pub(crate) fn path_to_const(&mut self, path: &Path) -> Option<Const<'db>> {
