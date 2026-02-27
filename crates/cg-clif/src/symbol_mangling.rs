@@ -353,11 +353,7 @@ impl<'a> SymbolMangler<'a> {
 
         // FNV-1a over the module debug identity keeps this deterministic per
         // database while avoiding dependence on HashMap's randomized hasher.
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in format!("{module:?}").bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
+        let hash = stable_hash_bytes(format!("{module:?}").as_bytes());
         hash.max(1)
     }
 
@@ -469,7 +465,6 @@ impl<'a> SymbolMangler<'a> {
             TyKind::Float(FloatTy::F32) => "f",
             TyKind::Float(FloatTy::F64) => "d",
             TyKind::Float(FloatTy::F128) => "C4f128",
-            TyKind::Param(_) => "p",
             TyKind::Tuple(tys) if tys.is_empty() => "u", // unit
             _ => "",
         };
@@ -513,9 +508,17 @@ impl<'a> SymbolMangler<'a> {
             TyKind::Adt(adt_def, substs) => {
                 self.print_adt_path(adt_def.inner().id, substs);
             }
+            TyKind::Param(param) => {
+                // `p` alone collides when unrelated generic parameters share the
+                // same index. Include both index and defining param identity.
+                self.out.push('p');
+                self.push_integer_62(param.index as u64);
+                self.push_integer_62(stable_hash_bytes(format!("{:?}", param.id).as_bytes()));
+            }
             // Fallback for anything else.
             _ => {
                 self.out.push('u');
+                self.push_integer_62(stable_hash_bytes(format!("{ty:?}").as_bytes()));
             }
         }
     }
@@ -593,6 +596,15 @@ fn push_integer_62(x: u64, output: &mut String) {
         base_62_encode(x, output);
     }
     output.push('_');
+}
+
+fn stable_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn push_ident(ident: &str, output: &mut String) {

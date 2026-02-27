@@ -100,6 +100,15 @@ fn iconst_from_bits(bcx: &mut FunctionBuilder<'_>, ty: Type, bits: u128) -> Valu
     }
 }
 
+fn stable_hash64_with_seed(bytes: &[u8], seed: u64) -> u64 {
+    let mut hash = seed;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// Append a return type to a Cranelift signature based on its layout.
 /// Returns `true` if the return is memory-repr and needs an sret pointer.
 pub(crate) fn append_ret_to_sig(
@@ -330,10 +339,9 @@ fn peel_ref_layers<'db>(mut ty: hir_ty::next_solver::Ty<'db>) -> hir_ty::next_so
 fn is_fn_trait_method(db: &dyn HirDatabase, trait_id: TraitId, method_name: &str) -> bool {
     let trait_krate = trait_id.module(db).krate(db);
     let lang_items = hir_def::lang_item::lang_items(db, trait_krate);
-    let is_fn_trait =
-        Some(trait_id) == lang_items.Fn
-            || Some(trait_id) == lang_items.FnMut
-            || Some(trait_id) == lang_items.FnOnce;
+    let is_fn_trait = Some(trait_id) == lang_items.Fn
+        || Some(trait_id) == lang_items.FnMut
+        || Some(trait_id) == lang_items.FnOnce;
     is_fn_trait && matches!(method_name, "call" | "call_mut" | "call_once")
 }
 
@@ -660,38 +668,52 @@ fn codegen_cast(
         let TyKind::FnDef(def, generic_args) = from_ty.as_ref().kind() else {
             panic!("ReifyFnPointer on non-FnDef type: {:?}", from_ty);
         };
-        let CallableDefId::FunctionId(callee_func_id) = def.0 else {
+        let CallableDefId::FunctionId(trait_or_callee_func_id) = def.0 else {
             panic!("ReifyFnPointer on non-function: {:?}", def);
         };
-        let (callee_func_id, generic_args) = if let ItemContainerId::TraitId(_) =
-            callee_func_id.loc(fx.db()).container
-        {
+        let env = fx.env().clone();
+        let mut callee_func_id = trait_or_callee_func_id;
+        let mut generic_args = generic_args;
+        let mut builtin_derive_shim_id = None;
+
+        if let ItemContainerId::TraitId(_) = trait_or_callee_func_id.loc(fx.db()).container {
             let interner = DbInterner::new_no_crate(fx.db());
             if hir_ty::method_resolution::is_dyn_method(
                 interner,
-                fx.env().param_env(),
-                callee_func_id,
+                env.param_env(),
+                trait_or_callee_func_id,
                 generic_args,
             )
             .is_some()
             {
                 // Keep trait item identity for dyn methods; they don't have a
                 // concrete impl target at reify time.
-                (callee_func_id, generic_args)
             } else {
-                match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, generic_args) {
-                    (Either::Left(resolved_id), resolved_args) => (resolved_id, resolved_args),
-                    (Either::Right((derive_impl_id, derive_method)), _) => {
-                        panic!(
-                            "cannot reify builtin-derive method pointer: {:?}::{:?}",
-                            derive_impl_id, derive_method
-                        );
+                let lookup_result =
+                    fx.db().lookup_impl_method(env.as_ref(), trait_or_callee_func_id, generic_args);
+                match lookup_result {
+                    (Either::Left(resolved_id), resolved_args) => {
+                        callee_func_id = resolved_id;
+                        generic_args = resolved_args;
+                    }
+                    (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
+                        builtin_derive_shim_id = Some(declare_builtin_derive_method_shim(
+                            fx,
+                            trait_or_callee_func_id,
+                            derive_impl_id,
+                            derive_method,
+                            resolved_args,
+                        ));
                     }
                 }
             }
-        } else {
-            (callee_func_id, generic_args)
-        };
+        }
+
+        if let Some(shim_id) = builtin_derive_shim_id {
+            let callee_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+            let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, callee_ref);
+            return CValue::by_val(func_addr, result_layout.clone());
+        }
 
         // Declare the function in the module and get its address
         let is_extern =
@@ -771,7 +793,11 @@ fn codegen_cast(
 
         let closure_body = fx
             .db()
-            .monomorphized_mir_body_for_closure(closure_id.0, closure_subst.store(), fx.env().clone())
+            .monomorphized_mir_body_for_closure(
+                closure_id.0,
+                closure_subst.store(),
+                fx.env().clone(),
+            )
             .expect("failed to get closure MIR for ClosureFnPointer");
         let closure_sig =
             build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
@@ -985,18 +1011,14 @@ fn trait_method_substs_for_receiver<'db>(
 ) -> GenericArgs<'db> {
     let interner = DbInterner::new_with(db, local_crate);
     let identity = GenericArgs::identity_for_item(interner, trait_method_func_id.into());
-    assert!(
-        !identity.is_empty(),
-        "trait method has no generic args: {:?}",
-        trait_method_func_id
-    );
+    assert!(!identity.is_empty(), "trait method has no generic args: {:?}", trait_method_func_id);
     GenericArgs::new_from_iter(
         interner,
         std::iter::once(concrete_self_ty.as_ref().into()).chain(identity.iter().skip(1)),
     )
 }
 
-fn declare_builtin_derive_vtable_shim(
+fn declare_builtin_derive_method_shim(
     fx: &mut FunctionCx<'_, impl Module>,
     trait_method_func_id: hir_def::FunctionId,
     derive_impl_id: BuiltinDeriveImplId,
@@ -1010,18 +1032,12 @@ fn declare_builtin_derive_vtable_shim(
         derive_method
     );
 
-    let sig = build_fn_sig_from_ty(
-        fx.isa,
-        fx.db(),
-        fx.dl,
-        fx.env(),
-        trait_method_func_id,
-        resolved_args,
-    )
-    .expect("builtin-derive vtable method sig");
+    let sig =
+        build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), trait_method_func_id, resolved_args)
+            .expect("builtin-derive method shim sig");
     assert!(
         !sig.params.iter().any(|param| param.purpose == ArgumentPurpose::StructReturn),
-        "builtin-derive vtable shim with sret return is unsupported: {:?}::{:?}",
+        "builtin-derive method shim with sret return is unsupported: {:?}::{:?}",
         derive_impl_id,
         derive_method
     );
@@ -1032,12 +1048,12 @@ fn declare_builtin_derive_vtable_shim(
         resolved_args,
         fx.ext_crate_disambiguators(),
     );
-    let shim_name = format!("__builtin_derive_vtable_shim_{trait_method_name}");
+    let shim_name = format!("__builtin_derive_method_shim_{trait_method_name}");
 
     let shim_id = fx
         .module
         .declare_function(&shim_name, Linkage::Local, &sig)
-        .expect("declare builtin-derive vtable shim");
+        .expect("declare builtin-derive method shim");
 
     let mut func = cranelift_codegen::ir::Function::with_name_signature(
         cranelift_codegen::ir::UserFuncName::user(0, shim_id.as_u32()),
@@ -1063,10 +1079,8 @@ fn declare_builtin_derive_vtable_shim(
                 bcx.ins().f64const(0.0)
             } else {
                 panic!(
-                    "builtin-derive vtable shim return type is unsupported: {:?}::{:?} ret_ty={:?}",
-                    derive_impl_id,
-                    derive_method,
-                    ty
+                    "builtin-derive method shim return type is unsupported: {:?}::{:?} ret_ty={:?}",
+                    derive_impl_id, derive_method, ty
                 );
             };
             ret_values.push(zero);
@@ -1080,7 +1094,7 @@ fn declare_builtin_derive_vtable_shim(
     let mut ctx = Context::for_function(func);
     match fx.module.define_function(shim_id, &mut ctx) {
         Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
-        Err(e) => panic!("define builtin-derive vtable shim: {e}"),
+        Err(e) => panic!("define builtin-derive method shim: {e}"),
     }
 
     shim_id
@@ -1191,7 +1205,11 @@ fn get_or_create_vtable(
     let closure_func_id = closure_fallback.as_ref().map(|(closure_id, closure_subst)| {
         let closure_body = fx
             .db()
-            .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), fx.env().clone())
+            .monomorphized_mir_body_for_closure(
+                *closure_id,
+                closure_subst.clone(),
+                fx.env().clone(),
+            )
             .expect("failed to get closure MIR for vtable");
         let closure_sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
             .expect("closure sig for vtable");
@@ -1223,18 +1241,18 @@ fn get_or_create_vtable(
                 *trait_method_func_id,
                 &concrete_ty,
             );
-            let resolved_method =
-                match fx
-                    .db()
-                    .lookup_impl_method(fx.env().as_ref(), *trait_method_func_id, trait_method_subst)
-                {
-                    (Either::Left(resolved_id), resolved_args) => {
-                        Either::Left((resolved_id, resolved_args.store()))
-                    }
-                    (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
-                        Either::Right((derive_impl_id, derive_method, resolved_args.store()))
-                    }
-                };
+            let resolved_method = match fx.db().lookup_impl_method(
+                fx.env().as_ref(),
+                *trait_method_func_id,
+                trait_method_subst,
+            ) {
+                (Either::Left(resolved_id), resolved_args) => {
+                    Either::Left((resolved_id, resolved_args.store()))
+                }
+                (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
+                    Either::Right((derive_impl_id, derive_method, resolved_args.store()))
+                }
+            };
             match resolved_method {
                 Either::Left((impl_func_id, impl_generic_args)) => {
                     let impl_generic_args = impl_generic_args.as_ref();
@@ -1261,7 +1279,7 @@ fn get_or_create_vtable(
                         .expect("declare vtable method")
                 }
                 Either::Right((derive_impl_id, derive_method, resolved_args)) => {
-                    declare_builtin_derive_vtable_shim(
+                    declare_builtin_derive_method_shim(
                         fx,
                         *trait_method_func_id,
                         derive_impl_id,
@@ -1437,7 +1455,6 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 cur_ty = elem_ty;
             }
             ProjectionElem::ConstantIndex { offset, from_end } => {
-
                 // r-a MIR can emit `ConstantIndex` directly on `&[T]` / `&[T; N]`
                 // without an explicit `Deref` projection.
                 if !matches!(cur_ty.as_ref().kind(), TyKind::Array(_, _) | TyKind::Slice(_)) {
@@ -2223,14 +2240,21 @@ pub(crate) fn codegen_set_discriminant(
                         let niche_value = (niche_value as u128).wrapping_add(*niche_start);
                         let niche_value = iconst_from_bits(&mut fx.bcx, niche_type, niche_value);
 
-                        if let BackendRepr::ScalarPair(a_scalar, b_scalar) = place.layout.backend_repr {
+                        if let BackendRepr::ScalarPair(a_scalar, b_scalar) =
+                            place.layout.backend_repr
+                        {
                             let lane = scalar_pair_tag_lane(a_scalar, b_scalar, tag, *tag_field);
                             let niche = place.place_scalar_pair_lane(fx, lane, tag_layout);
-                            niche
-                                .write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
+                            niche.write_cvalue(
+                                fx,
+                                CValue::by_val(niche_value, niche.layout.clone()),
+                            );
                         } else {
                             let niche = place.place_field(fx, tag_field.as_usize(), tag_layout);
-                            niche.write_cvalue(fx, CValue::by_val(niche_value, niche.layout.clone()));
+                            niche.write_cvalue(
+                                fx,
+                                CValue::by_val(niche_value, niche.layout.clone()),
+                            );
                         }
                     }
                 }
@@ -2785,9 +2809,15 @@ fn codegen_const_callable_from_vtable_id(
             let empty_args = GenericArgs::empty(interner);
 
             let (callee_sig, callee_name) = if is_extern {
-                let sig =
-                    build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
-                        .expect("extern fn sig for const fn ptr");
+                let sig = build_fn_sig_from_ty(
+                    fx.isa,
+                    fx.db(),
+                    fx.dl,
+                    fx.env(),
+                    callee_func_id,
+                    empty_args,
+                )
+                .expect("extern fn sig for const fn ptr");
                 let name = extern_fn_symbol_name(fx.db(), callee_func_id);
                 (sig, name)
             } else if is_cross_crate {
@@ -2810,10 +2840,14 @@ fn codegen_const_callable_from_vtable_id(
             } else {
                 let callee_body = fx
                     .db()
-                    .monomorphized_mir_body(callee_func_id.into(), callee_args.store(), fx.env().clone())
+                    .monomorphized_mir_body(
+                        callee_func_id.into(),
+                        callee_args.store(),
+                        fx.env().clone(),
+                    )
                     .expect("failed to get local callee MIR for const fn ptr");
-                let sig =
-                    build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("const fn ptr sig");
+                let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+                    .expect("const fn ptr sig");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     callee_func_id,
@@ -2831,10 +2865,11 @@ fn codegen_const_callable_from_vtable_id(
             Some(fx.bcx.ins().func_addr(fx.pointer_type, callee_ref))
         }
         TyKind::Closure(closure_id, closure_subst) => {
-            let (closure_sig, closure_name) = match fx
-                .db()
-                .monomorphized_mir_body_for_closure(closure_id.0, closure_subst.store(), fx.env().clone())
-            {
+            let (closure_sig, closure_name) = match fx.db().monomorphized_mir_body_for_closure(
+                closure_id.0,
+                closure_subst.store(),
+                fx.env().clone(),
+            ) {
                 Ok(closure_body) => {
                     let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
                         .expect("closure sig for const fn ptr");
@@ -2848,7 +2883,8 @@ fn codegen_const_callable_from_vtable_id(
                 }
                 Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
                     let fn_ptr_ty = closure_subst.split_closure_args().closure_sig_as_fn_ptr_ty;
-                    let sig = build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)?;
+                    let sig =
+                        build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)?;
                     (sig, name)
                 }
                 Err(_) => return None,
@@ -2910,8 +2946,8 @@ fn codegen_scalar_const(
                 fx.bcx.ins().symbol_value(fx.pointer_type, gv)
             } else if addr == 0 {
                 iconst_from_bits(&mut fx.bcx, fx.pointer_type, 0)
-            } else if let Some(ptr) = memory_map
-                .and_then(|mm| codegen_const_callable_from_vtable_id(fx, addr, mm))
+            } else if let Some(ptr) =
+                memory_map.and_then(|mm| codegen_const_callable_from_vtable_id(fx, addr, mm))
             {
                 ptr
             } else {
@@ -3756,43 +3792,41 @@ fn codegen_direct_call(
                             );
                             return;
                         }
-                        TyKind::FnDef(def, fn_args) => {
-                            match def.0 {
-                                CallableDefId::FunctionId(fn_id) => {
-                                    codegen_direct_call(
-                                        fx,
-                                        fn_id,
-                                        fn_args,
-                                        args.get(1..).unwrap_or(&[]),
-                                        destination,
-                                        target,
-                                    );
-                                    return;
-                                }
-                                CallableDefId::StructId(struct_id) => {
-                                    codegen_adt_constructor_call(
-                                        fx,
-                                        VariantId::StructId(struct_id),
-                                        fn_args,
-                                        args.get(1..).unwrap_or(&[]),
-                                        destination,
-                                        target,
-                                    );
-                                    return;
-                                }
-                                CallableDefId::EnumVariantId(variant_id) => {
-                                    codegen_adt_constructor_call(
-                                        fx,
-                                        VariantId::EnumVariantId(variant_id),
-                                        fn_args,
-                                        args.get(1..).unwrap_or(&[]),
-                                        destination,
-                                        target,
-                                    );
-                                    return;
-                                }
+                        TyKind::FnDef(def, fn_args) => match def.0 {
+                            CallableDefId::FunctionId(fn_id) => {
+                                codegen_direct_call(
+                                    fx,
+                                    fn_id,
+                                    fn_args,
+                                    args.get(1..).unwrap_or(&[]),
+                                    destination,
+                                    target,
+                                );
+                                return;
                             }
-                        }
+                            CallableDefId::StructId(struct_id) => {
+                                codegen_adt_constructor_call(
+                                    fx,
+                                    VariantId::StructId(struct_id),
+                                    fn_args,
+                                    args.get(1..).unwrap_or(&[]),
+                                    destination,
+                                    target,
+                                );
+                                return;
+                            }
+                            CallableDefId::EnumVariantId(variant_id) => {
+                                codegen_adt_constructor_call(
+                                    fx,
+                                    VariantId::EnumVariantId(variant_id),
+                                    fn_args,
+                                    args.get(1..).unwrap_or(&[]),
+                                    destination,
+                                    target,
+                                );
+                                return;
+                            }
+                        },
                         TyKind::FnPtr(sig_tys, _) if !args.is_empty() => {
                             codegen_fn_ptr_call(
                                 fx,
@@ -3859,6 +3893,7 @@ fn codegen_direct_call(
     // Check if this is an extern function (no MIR available)
     let is_extern =
         matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
+    let is_c_variadic = is_extern && fx.db().function_signature(callee_func_id).is_varargs();
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
 
     let interner = DbInterner::new_no_crate(fx.db());
@@ -3914,6 +3949,7 @@ fn codegen_direct_call(
 
     // Import into current function to get a FuncRef
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+    let fixed_param_count = callee_sig.params.len();
 
     // Determine destination layout to check for sret return
     let dest = codegen_place(fx, destination);
@@ -3956,6 +3992,57 @@ fn codegen_direct_call(
                 call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
             }
         }
+    }
+
+    if is_c_variadic {
+        assert!(
+            call_args.len() >= fixed_param_count,
+            "c-variadic call passed fewer args than fixed params for {callee_name}: fixed={} args={} callee={:?}",
+            fixed_param_count,
+            call_args.len(),
+            callee_func_id,
+        );
+
+        let sig_ref = fx.bcx.func.dfg.ext_funcs[callee_ref].signature;
+        let mut sig_params = fx.bcx.func.dfg.signatures[sig_ref].params.clone();
+
+        if sig_params.len() < call_args.len() {
+            for arg in &call_args[sig_params.len()..] {
+                sig_params.push(AbiParam::new(fx.bcx.func.dfg.value_type(*arg)));
+            }
+        } else if sig_params.len() > call_args.len() {
+            let pad_param_tys: Vec<_> =
+                sig_params[call_args.len()..].iter().map(|param| param.value_type).collect();
+            for param_ty in pad_param_tys {
+                assert!(
+                    param_ty.is_int(),
+                    "unsupported c-variadic pad type for {callee_name}: {:?}",
+                    param_ty,
+                );
+                call_args.push(fx.bcx.ins().iconst(param_ty, 0));
+            }
+        }
+
+        for (arg, param) in call_args.iter().zip(sig_params.iter()) {
+            let arg_ty = fx.bcx.func.dfg.value_type(*arg);
+            assert_eq!(
+                arg_ty, param.value_type,
+                "c-variadic arg type mismatch for {callee_name}: arg={:?} param={:?} callee={:?}",
+                arg_ty, param.value_type, callee_func_id
+            );
+        }
+
+        fx.bcx.func.dfg.signatures[sig_ref].params = sig_params;
+    } else {
+        assert_eq!(
+            call_args.len(),
+            callee_sig.params.len(),
+            "direct call ABI mismatch for {callee_name}: params={} args={} callee={:?} generic_args={:?}",
+            callee_sig.params.len(),
+            call_args.len(),
+            callee_func_id,
+            generic_args,
+        );
     }
 
     // Emit the call
@@ -4290,9 +4377,16 @@ fn codegen_intrinsic_call(
             };
             Some(fx.bcx.ins().iadd(data_ptr, byte_offset))
         }
-        "type_id" | "type_name" => {
-            // These are complex; fall through to let them be unresolved
-            // (they need const eval or string allocation)
+        "type_id" => {
+            let ty = generic_ty.as_ref().expect("type_id requires a generic arg");
+            let ty_dbg = format!("{:?}", ty.as_ref());
+            let lo = stable_hash64_with_seed(ty_dbg.as_bytes(), 0xcbf29ce484222325);
+            let hi = stable_hash64_with_seed(ty_dbg.as_bytes(), 0x9e3779b185ebca87);
+            let type_id_bits = ((hi as u128) << 64) | (lo as u128);
+            Some(iconst_from_bits(&mut fx.bcx, types::I128, type_id_bits))
+        }
+        "type_name" => {
+            // Requires emitting a stable &'static str constant.
             return false;
         }
         "ub_checks" => {
@@ -4538,8 +4632,7 @@ fn codegen_intrinsic_call(
             let signed = matches!(arg_ty.as_ref().kind(), TyKind::Int(_));
 
             let lt_cc = if signed { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
-            let gt_cc =
-                if signed { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan };
+            let gt_cc = if signed { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan };
             let is_lt = fx.bcx.ins().icmp(lt_cc, lhs, rhs);
             let is_gt = fx.bcx.ins().icmp(gt_cc, lhs, rhs);
 
@@ -4555,7 +4648,9 @@ fn codegen_intrinsic_call(
             let ordering = fx.bcx.ins().select(is_lt, less, non_lt);
 
             dest.write_cvalue(fx, CValue::by_val(ordering, dest.layout.clone()));
-            if target.is_some() && destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+            if target.is_some()
+                && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+            {
                 fx.set_drop_flag(destination.local);
             }
             if let Some(target) = target {
@@ -5541,8 +5636,12 @@ fn collect_vtable_methods(
     let trait_items = trait_id.trait_items(db);
     for (_trait_method_name, trait_item) in trait_items.items.iter() {
         let AssocItemId::FunctionId(trait_method_func_id) = trait_item else { continue };
-        let trait_method_subst =
-            trait_method_substs_for_receiver(db, local_crate, *trait_method_func_id, &source_pointee_stored);
+        let trait_method_subst = trait_method_substs_for_receiver(
+            db,
+            local_crate,
+            *trait_method_func_id,
+            &source_pointee_stored,
+        );
         if let (Either::Left(impl_func_id), impl_generic_args) =
             db.lookup_impl_method(env.as_ref(), *trait_method_func_id, trait_method_subst)
         {
@@ -6241,7 +6340,8 @@ pub fn compile_executable(
 
     // Compile drop_in_place glue functions
     for ty in &drop_types {
-        let drop_name = symbol_mangling::mangle_drop_in_place(db, ty.as_ref(), ext_crate_disambiguators);
+        let drop_name =
+            symbol_mangling::mangle_drop_in_place(db, ty.as_ref(), ext_crate_disambiguators);
         if !compiled_drop_symbols.insert(drop_name) {
             continue;
         }
