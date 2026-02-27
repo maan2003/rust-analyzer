@@ -2675,7 +2675,6 @@ fn foo() {
 }
 
 #[test]
-#[ignore = "investigation probe: sync Once path"]
 fn std_jit_once_call_once_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2709,7 +2708,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "investigation probe: String allocation/drop path"]
 fn std_jit_string_push_str_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2751,7 +2749,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: runtime double-free in String path"]
 fn std_jit_string_from_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2826,7 +2823,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails during codegen: non-value const in ScalarPair constant"]
 fn std_jit_env_var_roundtrip() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2929,7 +2925,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: IncompleteExpr in std::sys::fs::unix debug fd assert"]
 fn std_jit_fs_write_read_remove_probe() {
     let result: i32 = jit_run_with_std(
         r#"
