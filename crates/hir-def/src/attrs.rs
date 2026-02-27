@@ -1139,6 +1139,27 @@ impl AttrFlags {
         }
     }
 
+    /// Returns `#[link_name = "..."]` for an extern function, if present.
+    #[inline]
+    pub fn link_name(db: &dyn DefDatabase, owner: FunctionId) -> Option<Symbol> {
+        return link_name(db, owner);
+
+        #[salsa::tracked]
+        fn link_name(db: &dyn DefDatabase, owner: FunctionId) -> Option<Symbol> {
+            collect_attrs(db, owner.into(), |attr| {
+                if let Meta::NamedKeyValue { name: Some(name), value: Some(value), .. } = attr
+                    && name.text() == "link_name"
+                    && let Some(value) = ast::String::cast(value)
+                    && let Ok(value) = value.value()
+                {
+                    ControlFlow::Break(Symbol::intern(&value))
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+        }
+    }
+
     #[inline]
     pub fn rustc_layout_scalar_valid_range(
         db: &dyn DefDatabase,

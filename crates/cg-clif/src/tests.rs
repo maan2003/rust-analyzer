@@ -1,4 +1,9 @@
-use std::{alloc::Layout, collections::{HashMap, HashSet}, fmt, panic, sync::Mutex};
+use std::{
+    alloc::Layout,
+    collections::{HashMap, HashSet},
+    fmt, panic,
+    sync::Mutex,
+};
 
 use cranelift_module::Module;
 
@@ -397,7 +402,8 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         // Use the first function's crate as local_crate (all test fns are in same crate)
@@ -1732,7 +1738,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -1781,8 +1788,12 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             let body = db
                 .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
-            let closure_name =
-                crate::symbol_mangling::mangle_closure(&db, *closure_id, closure_subst.as_ref(), &empty_map);
+            let closure_name = crate::symbol_mangling::mangle_closure(
+                &db,
+                *closure_id,
+                closure_subst.as_ref(),
+                &empty_map,
+            );
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 continue;
             }
@@ -1803,7 +1814,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile drop_in_place glue functions
         for ty in &drop_types {
-            let drop_name = crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
+            let drop_name =
+                crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
             if !compiled_drop_symbols.insert(drop_name) {
                 continue;
             }
@@ -1908,12 +1920,11 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
     let mut cargo_config = CargoConfig::default();
     cargo_config.sysroot = Some(RustLibSource::Discover);
 
-    let mut workspace = ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
-        .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
-    workspace.kind = ProjectWorkspaceKind::DetachedFile {
-        file: detached_file_manifest.clone(),
-        cargo: None,
-    };
+    let mut workspace =
+        ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
+            .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
+    workspace.kind =
+        ProjectWorkspaceKind::DetachedFile { file: detached_file_manifest.clone(), cargo: None };
 
     let mut source_change = FileChange::default();
     let mut local_file_set = FileSet::default();
@@ -2037,7 +2048,8 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             "miri_promise_symbolic_alignment",
             jit_miri_promise_symbolic_alignment as *const u8,
         );
-        jit_builder.symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
+        jit_builder
+            .symbol("__rust_std_internal_init_fn", jit_rust_std_internal_init_fn as *const u8);
         let mut jit_module = cranelift_jit::JITModule::new(jit_builder);
 
         let entry_func_id = find_fn(&db, file_id, entry);
@@ -2840,6 +2852,239 @@ fn foo() -> i32 {
     let a = std::process::id();
     let b = std::process::id();
     (a == b) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_fs_metadata_current_dir_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    match std::fs::metadata(".") {
+        Ok(meta) => meta.is_dir() as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: unresolved HasErrorType in fs create-dir path"]
+fn std_jit_fs_create_dir_metadata_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut dir = std::env::temp_dir();
+    dir.push("cg_clif_std_jit_fs_create_dir_metadata_smoke");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if std::fs::create_dir(&dir).is_err() {
+        return 0;
+    }
+
+    let is_dir = match std::fs::metadata(&dir) {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return 0;
+        }
+    };
+
+    let removed = std::fs::remove_dir_all(&dir).is_ok();
+    (is_dir && removed) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: unsized drop glue in std::sync::mpsc path"]
+fn std_jit_mpsc_channel_send_recv_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let (tx, rx) = std::sync::mpsc::channel::<i32>();
+    if tx.send(42).is_err() {
+        return 0;
+    }
+
+    match rx.recv() {
+        Ok(value) => (value == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: IncompleteExpr in std::sys::fs::unix debug fd assert"]
+fn std_jit_fs_write_read_remove_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut path = std::env::temp_dir();
+    path.push("cg_clif_std_jit_fs_write_read_remove_probe.txt");
+    let _ = std::fs::remove_file(&path);
+
+    if std::fs::write(&path, b"hello-from-jit").is_err() {
+        return 0;
+    }
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return 0;
+        }
+    };
+
+    let removed = std::fs::remove_file(&path).is_ok();
+    ((content == "hello-from-jit") && removed) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_time_duration_decompose_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let d = std::time::Duration::from_millis(1234);
+    ((d.as_secs() == 1) && (d.subsec_millis() == 234)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_ipv4_octets_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    let octets = ip.octets();
+    ((octets[0] == 127) && (octets[3] == 1)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_ipv6_segments_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+    let segments = ip.segments();
+    ((segments[0] == 0) && (segments[7] == 1)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_socketaddr_v4_parts_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 42), 8080);
+    let ip = addr.ip().octets();
+    ((addr.port() == 8080) && (ip[0] == 10) && (ip[3] == 42)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_ipaddr_match_private_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 2));
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() as i32,
+        std::net::IpAddr::V6(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_tcp_listener_bind_local_addr_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let listener = match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(listener) => listener,
+        Err(_) => return 0,
+    };
+
+    match listener.local_addr() {
+        Ok(addr) => (addr.is_ipv4() && addr.port() != 0) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_net_udp_loopback_send_recv_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let receiver = match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(socket) => socket,
+        Err(_) => return 0,
+    };
+    let receiver_addr = match receiver.local_addr() {
+        Ok(addr) => addr,
+        Err(_) => return 0,
+    };
+
+    let sender = match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0_u16)) {
+        Ok(socket) => socket,
+        Err(_) => return 0,
+    };
+    if sender.send_to(&[99_u8], receiver_addr).is_err() {
+        return 0;
+    }
+
+    let mut buf = [0_u8; 1];
+    match receiver.recv_from(&mut buf) {
+        Ok((received, source)) => {
+            (received == 1 && buf[0] == 99_u8 && source.is_ipv4()) as i32
+        }
+        Err(_) => 0,
+    }
 }
 "#,
         "foo",
@@ -3760,9 +4005,15 @@ fn foo() -> u64 {
 fn jit_slice_get_unchecked_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"
+//- minicore: slice, unsize, coerce_unsized
+//- /main.rs
+extern "rust-intrinsic" {
+    pub fn slice_get_unchecked<T>(slice: *const [T], index: usize) -> *const T;
+}
 fn foo() -> i32 {
     let arr = [11_i32, 22, 33];
-    unsafe { *arr.get_unchecked(1usize) }
+    let s: &[i32] = &arr;
+    unsafe { *slice_get_unchecked(s as *const [i32], 1usize) }
 }
 "#,
         &["foo"],

@@ -34,7 +34,10 @@ use crate::{
     },
     item_scope::{BUILTIN_SCOPE, BuiltinShadowMode, ImportOrExternCrate, ItemScope},
     lang_item::LangItemTarget,
-    nameres::{DefMap, LocalDefMap, MacroSubNs, ResolvePathResultPrefixInfo, block_def_map},
+    nameres::{
+        DefMap, LocalDefMap, MacroSubNs, ResolvePathResultPrefixInfo, block_def_map,
+        crate_local_def_map,
+    },
     per_ns::PerNs,
     src::HasSource,
     type_ref::LifetimeRef,
@@ -456,6 +459,17 @@ impl<'db> Resolver<'db> {
         }
 
         if let Some(res) = self.module_scope.resolve_path_in_value_ns(db, path) {
+            return Some(res);
+        }
+
+        // WORKAROUND
+        // Def-site hygiene fallback for single-segment plain paths inside macro
+        // expansions. This mirrors rustc behavior for macros that emit
+        // unqualified helper names (e.g. `const_eval_select(...)`) that are
+        // intended to resolve in the defining module.
+        if n_segments == 1 && path.kind == PathKind::Plain
+            && let Some(res) = resolve_macro_def_site_value_path(db, path, hygiene_id)
+        {
             return Some(res);
         }
 
@@ -915,6 +929,37 @@ impl<'db> Resolver<'db> {
     pub fn reset_to_guard(&mut self, UpdateGuard(start): UpdateGuard) {
         self.scopes.truncate(start);
     }
+}
+
+fn resolve_macro_def_site_value_path(
+    db: &dyn DefDatabase,
+    path: &ModPath,
+    hygiene_id: HygieneId,
+) -> Option<(ResolveValueResult, ResolvePathResultPrefixInfo)> {
+    let mut syntax_ctx = hygiene_id.syntax_context();
+    while let Some(expansion) = syntax_ctx.outer_expn(db) {
+        let macro_call = db.lookup_intern_macro_call(expansion.into());
+        let macro_def = macro_call.def;
+
+        let def_map_pair = crate_local_def_map(db, macro_def.krate);
+        let def_map = def_map_pair.def_map(db);
+        let local_def_map = def_map_pair.local(db);
+
+        let Some(&macro_id) = def_map.macro_def_to_macro_id.get(&macro_def.kind.erased_ast_id())
+        else {
+            syntax_ctx = syntax_ctx.parent(db);
+            continue;
+        };
+
+        let macro_module = macro_id.module(db);
+        let module_scope = ModuleItemMap { def_map, local_def_map, module_id: macro_module };
+        if let Some(res) = module_scope.resolve_path_in_value_ns(db, path) {
+            return Some(res);
+        }
+
+        syntax_ctx = syntax_ctx.parent(db);
+    }
+    None
 }
 
 #[inline]
