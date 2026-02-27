@@ -15,9 +15,7 @@ use hir_def::{
     lang_item::LangItems,
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
 };
-use hir_expand::mod_path::{ModPath, PathKind};
 use hir_expand::name::Name;
-use intern::Symbol;
 use la_arena::ArenaMap;
 use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
@@ -341,43 +339,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.infcx.interner.lang_items()
     }
 
-    /// Resolve an expression path in value namespace, preferring expression
-    /// hygiene and falling back to root hygiene for macro expansions that
-    /// reference helper items via def-site context.
+    /// Resolve an expression path in value namespace with expression hygiene.
     fn resolve_value_path_in_expr(&mut self, expr_id: ExprId, path: &Path) -> Option<ValueNs> {
         let resolver_guard = self.resolver.update_to_inner_scope(self.db, self.owner, expr_id);
         let hygiene = self.body.expr_path_hygiene(expr_id);
-        let resolved = self
-            .resolver
-            .resolve_path_in_value_ns_fully(self.db, path, hygiene)
-            .or_else(|| {
-                if hygiene == HygieneId::ROOT {
-                    None
-                } else {
-                    self.resolver.resolve_path_in_value_ns_fully(self.db, path, HygieneId::ROOT)
-                }
-            })
-            .or_else(|| {
-                // `macro` helpers in core often invoke intrinsics by plain
-                // identifier (e.g. `const_eval_select(...)`) relying on
-                // def-site context. If hygienic resolution fails, fall back to
-                // `crate::intrinsics::<name>` for macro-expanded single-segment
-                // paths.
-                if hygiene == HygieneId::ROOT {
-                    return None;
-                }
-                let segments = path.segments();
-                if segments.len() != 1 {
-                    return None;
-                }
-                let Some(seg) = segments.first() else { return None };
-                let intrinsic_path = Path::from_known_path_with_no_generic(ModPath::from_segments(
-                    PathKind::Crate,
-                    [Name::new_symbol_root(Symbol::intern("intrinsics")), seg.name.clone()],
-                ));
-                self.resolver
-                    .resolve_path_in_value_ns_fully(self.db, &intrinsic_path, HygieneId::ROOT)
-            });
+        let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
         self.resolver.reset_to_guard(resolver_guard);
         resolved
     }
