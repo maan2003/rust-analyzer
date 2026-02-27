@@ -3588,6 +3588,30 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn jit_typed_swap_nonoverlapping_intrinsic_probe() {
+    let result: i32 = jit_run(
+        r#"
+extern "rust-intrinsic" {
+    pub fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T);
+}
+fn foo() -> i32 {
+    let mut a = [1_i32, 2, 3];
+    let mut b = [7_i32, 8, 9];
+    unsafe {
+        let a_ptr = &mut a as *mut [i32; 3];
+        let b_ptr = &mut b as *mut [i32; 3];
+        typed_swap_nonoverlapping(a_ptr, b_ptr);
+    }
+    a[0usize] + a[1usize] * 10 + a[2usize] * 100 + b[0usize] * 1000
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 1987);
+}
+
+#[test]
 fn jit_write_bytes_intrinsic_probe() {
     let result: i32 = jit_run(
         r#"

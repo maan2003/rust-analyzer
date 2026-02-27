@@ -4025,6 +4025,29 @@ fn codegen_intrinsic_call(
             fx.bcx.call_memcpy(tc, dst, src, byte_amount);
             None
         }
+        "typed_swap_nonoverlapping" => {
+            assert_eq!(args.len(), 2, "typed_swap_nonoverlapping expects 2 args");
+            let x_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let y_ptr = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+
+            let layout =
+                generic_ty_layout.clone().expect("typed_swap_nonoverlapping: layout error");
+            if !layout.is_zst() {
+                let x_place = CPlace::for_ptr(pointer::Pointer::new(x_ptr), layout.clone());
+                let y_place = CPlace::for_ptr(pointer::Pointer::new(y_ptr), layout.clone());
+                let tmp = CPlace::new_stack_slot(fx, layout.clone());
+
+                let x_val = x_place.to_cvalue(fx);
+                tmp.write_cvalue(fx, x_val);
+
+                let y_val = y_place.to_cvalue(fx);
+                x_place.write_cvalue(fx, y_val);
+
+                let tmp_val = tmp.to_cvalue(fx);
+                y_place.write_cvalue(fx, tmp_val);
+            }
+            None
+        }
         "copy" => {
             assert_eq!(args.len(), 3, "copy expects 3 args");
             let src = codegen_operand(fx, &args[0].kind).load_scalar(fx);
