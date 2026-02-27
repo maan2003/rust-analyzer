@@ -725,6 +725,42 @@ fn codegen_cast(
         return CValue::by_val(func_addr, result_layout.clone());
     }
 
+    // Handle ClosureFnPointer: non-capturing closure -> fn pointer.
+    // Must be before the generic scalar path because closures are memory-repr.
+    if let CastKind::PointerCoercion(PointerCast::ClosureFnPointer(_)) = kind {
+        let from_ty = operand_ty(fx.db(), body, &operand.kind);
+        let TyKind::Closure(closure_id, closure_subst) = from_ty.as_ref().kind() else {
+            panic!("ClosureFnPointer on non-closure type: {:?}", from_ty);
+        };
+
+        let closure_layout = fx
+            .db()
+            .layout_of_ty(from_ty.clone(), fx.env().clone())
+            .expect("ClosureFnPointer source layout");
+        if !closure_layout.is_zst() {
+            panic!(
+                "ClosureFnPointer requires a non-capturing closure; got layout {:?}",
+                closure_layout.backend_repr
+            );
+        }
+
+        let closure_body = fx
+            .db()
+            .monomorphized_mir_body_for_closure(closure_id.0, closure_subst.store(), fx.env().clone())
+            .expect("failed to get closure MIR for ClosureFnPointer");
+        let closure_sig =
+            build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
+        let closure_name =
+            symbol_mangling::mangle_closure(fx.db(), closure_id.0, fx.ext_crate_disambiguators());
+        let closure_func_id = fx
+            .module
+            .declare_function(&closure_name, Linkage::Import, &closure_sig)
+            .expect("declare closure for ClosureFnPointer");
+        let closure_ref = fx.module.declare_func_in_func(closure_func_id, fx.bcx.func);
+        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, closure_ref);
+        return CValue::by_val(func_addr, result_layout.clone());
+    }
+
     let from_ty = operand_ty(fx.db(), body, &operand.kind);
     let from_cval = codegen_operand(fx, &operand.kind);
 
@@ -3197,6 +3233,82 @@ fn codegen_builtin_derive_method_call(
                 fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             }
         }
+        BuiltinDeriveImplMethod::eq => {
+            assert_eq!(args.len(), 2, "builtin PartialEq::eq expects two receiver arguments");
+
+            let self_ty = if generic_args.is_empty() {
+                let receiver_ref_ty = operand_ty(fx.db(), fx.ra_body(), &args[0].kind);
+                receiver_ref_ty
+                    .as_ref()
+                    .builtin_deref(true)
+                    .expect("builtin PartialEq::eq receiver must be a reference")
+            } else {
+                generic_args.type_at(0)
+            };
+
+            let self_layout = fx
+                .db()
+                .layout_of_ty(self_ty.store(), fx.env().clone())
+                .expect("layout for builtin PartialEq::eq receiver");
+
+            let lhs_ref = codegen_operand(fx, &args[0].kind);
+            let rhs_ref = codegen_operand(fx, &args[1].kind);
+            let BackendRepr::Scalar(_) = lhs_ref.layout.backend_repr else {
+                panic!("builtin PartialEq::eq expects a thin &Self lhs receiver");
+            };
+            let BackendRepr::Scalar(_) = rhs_ref.layout.backend_repr else {
+                panic!("builtin PartialEq::eq expects a thin &Self rhs receiver");
+            };
+
+            let lhs_ptr = lhs_ref.load_scalar(fx);
+            let rhs_ptr = rhs_ref.load_scalar(fx);
+            let lhs_val = CValue::by_ref(pointer::Pointer::new(lhs_ptr), self_layout.clone());
+            let rhs_val = CValue::by_ref(pointer::Pointer::new(rhs_ptr), self_layout.clone());
+
+            let eq = match self_layout.backend_repr {
+                BackendRepr::Scalar(scalar) => {
+                    let lhs = lhs_val.load_scalar(fx);
+                    let rhs = rhs_val.load_scalar(fx);
+                    match scalar.primitive() {
+                        Primitive::Float(_) => fx.bcx.ins().fcmp(FloatCC::Equal, lhs, rhs),
+                        _ => fx.bcx.ins().icmp(IntCC::Equal, lhs, rhs),
+                    }
+                }
+                BackendRepr::ScalarPair(a_scalar, b_scalar) => {
+                    let (lhs_a, lhs_b) = lhs_val.load_scalar_pair(fx);
+                    let (rhs_a, rhs_b) = rhs_val.load_scalar_pair(fx);
+                    let a_eq = match a_scalar.primitive() {
+                        Primitive::Float(_) => fx.bcx.ins().fcmp(FloatCC::Equal, lhs_a, rhs_a),
+                        _ => fx.bcx.ins().icmp(IntCC::Equal, lhs_a, rhs_a),
+                    };
+                    let b_eq = match b_scalar.primitive() {
+                        Primitive::Float(_) => fx.bcx.ins().fcmp(FloatCC::Equal, lhs_b, rhs_b),
+                        _ => fx.bcx.ins().icmp(IntCC::Equal, lhs_b, rhs_b),
+                    };
+                    fx.bcx.ins().band(a_eq, b_eq)
+                }
+                _ => panic!(
+                    "builtin PartialEq::eq for memory-repr Self is not supported yet: {:?}",
+                    self_layout.backend_repr
+                ),
+            };
+
+            let dest = codegen_place(fx, destination);
+            dest.write_cvalue(fx, CValue::by_val(eq, dest.layout.clone()));
+
+            if target.is_some()
+                && destination.projection.lookup(&fx.ra_body().projection_store).is_empty()
+            {
+                fx.set_drop_flag(destination.local);
+            }
+
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            } else {
+                fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            }
+        }
         _ => panic!(
             "unsupported builtin-derive method during codegen: {:?}::{:?}",
             derive_impl_id, derive_method
@@ -5581,6 +5693,8 @@ pub fn compile_executable(
     let (reachable_fns, reachable_closures, drop_types) =
         collect_reachable_fns(db, env, main_func_id, local_crate);
     let mut user_main_id = None;
+    let mut compiled_closure_symbols = std::collections::HashSet::new();
+    let mut compiled_drop_symbols = std::collections::HashSet::new();
 
     for (func_id, generic_args) in &reachable_fns {
         let body = db
@@ -5617,6 +5731,9 @@ pub fn compile_executable(
             .map_err(|e| format!("MIR error for closure: {:?}", e))?;
         let closure_name =
             symbol_mangling::mangle_closure(db, *closure_id, ext_crate_disambiguators);
+        if !compiled_closure_symbols.insert(closure_name.clone()) {
+            continue;
+        }
         compile_fn(
             &mut module,
             &*isa,
@@ -5633,6 +5750,10 @@ pub fn compile_executable(
 
     // Compile drop_in_place glue functions
     for ty in &drop_types {
+        let drop_name = symbol_mangling::mangle_drop_in_place(db, ty.as_ref(), ext_crate_disambiguators);
+        if !compiled_drop_symbols.insert(drop_name) {
+            continue;
+        }
         compile_drop_in_place(
             &mut module,
             &*isa,

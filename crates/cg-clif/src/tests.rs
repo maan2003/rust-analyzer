@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::HashMap, fmt, panic, sync::Mutex};
+use std::{alloc::Layout, collections::{HashMap, HashSet}, fmt, panic, sync::Mutex};
 
 use cranelift_module::Module;
 
@@ -1717,6 +1717,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile all reachable functions
         let dl = get_target_data_layout(&db, entry_func_id);
+        let mut compiled_closure_symbols = HashSet::new();
+        let mut compiled_drop_symbols = HashSet::new();
         for (func_id, generic_args) in &reachable_fns {
             let fn_name = crate::symbol_mangling::mangle_function(
                 &db,
@@ -1748,6 +1750,9 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name = crate::symbol_mangling::mangle_closure(&db, *closure_id, &empty_map);
+            if !compiled_closure_symbols.insert(closure_name.clone()) {
+                continue;
+            }
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -1765,6 +1770,10 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile drop_in_place glue functions
         for ty in &drop_types {
+            let drop_name = crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
+            if !compiled_drop_symbols.insert(drop_name) {
+                continue;
+            }
             crate::compile_drop_in_place(
                 &mut jit_module,
                 &*isa,
@@ -2034,6 +2043,8 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         let dl = get_target_data_layout(&db, entry_func_id);
         let trace_enabled = std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some();
         let mut compiled_fn_symbols = std::collections::HashSet::new();
+        let mut compiled_closure_symbols = std::collections::HashSet::new();
+        let mut compiled_drop_symbols = std::collections::HashSet::new();
         let mut finalized_symbol_ids: Vec<(String, cranelift_module::FuncId)> = Vec::new();
 
         for (func_id, generic_args) in &reachable_fns {
@@ -2105,6 +2116,12 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name =
                 crate::symbol_mangling::mangle_closure(&db, *closure_id, &disambiguators);
+            if !compiled_closure_symbols.insert(closure_name.clone()) {
+                if trace_enabled {
+                    eprintln!("std-jit: skipping duplicate closure definition for {closure_name}");
+                }
+                continue;
+            }
             let closure_id = crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2124,6 +2141,14 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         }
 
         for ty in &drop_types {
+            let drop_name =
+                crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &disambiguators);
+            if !compiled_drop_symbols.insert(drop_name.clone()) {
+                if trace_enabled {
+                    eprintln!("std-jit: skipping duplicate drop glue definition for {drop_name}");
+                }
+                continue;
+            }
             let drop_id = crate::compile_drop_in_place(
                 &mut jit_module,
                 &*isa,
@@ -2136,8 +2161,6 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             )
             .unwrap_or_else(|e| panic!("compiling drop_in_place failed: {e}"));
             if trace_enabled {
-                let drop_name =
-                    crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &disambiguators);
                 finalized_symbol_ids.push((drop_name, drop_id));
             }
         }
