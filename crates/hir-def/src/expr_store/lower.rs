@@ -2087,9 +2087,14 @@ impl<'db> ExprCollector<'db> {
             |this, expansion: Option<ast::MacroStmts>| match expansion {
                 Some(expansion) => {
                     expansion.statements().for_each(|stmt| this.collect_stmt(statements, stmt));
-                    expansion.expr().and_then(|expr| match expr {
-                        ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(statements, mac),
-                        expr => Some(this.collect_expr(expr)),
+                    expansion.expr().and_then(|expr| {
+                        if !this.check_cfg(&expr) {
+                            return None;
+                        }
+                        match expr {
+                            ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(statements, mac),
+                            expr => Some(this.collect_expr(expr)),
+                        }
                     })
                 }
                 None => None,
@@ -2119,19 +2124,20 @@ impl<'db> ExprCollector<'db> {
                 statements.push(Statement::Let { pat, type_ref, initializer, else_branch });
             }
             ast::Stmt::ExprStmt(stmt) => {
-                let expr = stmt.expr();
-                match &expr {
-                    Some(expr) if !self.check_cfg(expr) => return,
-                    _ => (),
+                let Some(expr) = stmt.expr() else {
+                    return;
+                };
+                if !self.check_cfg(&expr) {
+                    return;
                 }
                 let has_semi = stmt.semicolon_token().is_some();
                 // Note that macro could be expanded to multiple statements
-                if let Some(ast::Expr::MacroExpr(mac)) = expr {
+                if let ast::Expr::MacroExpr(mac) = expr {
                     if let Some(expr) = self.collect_macro_as_stmt(statements, mac) {
                         statements.push(Statement::Expr { expr, has_semi })
                     }
                 } else {
-                    let expr = self.collect_expr_opt(expr);
+                    let expr = self.collect_expr(expr);
                     statements.push(Statement::Expr { expr, has_semi });
                 }
             }
