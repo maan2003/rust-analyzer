@@ -2578,22 +2578,20 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
             match layout.backend_repr {
                 BackendRepr::Scalar(scalar) => {
                     let raw_bits = const_to_u128(fx.db(), konst.as_ref(), scalar.size(fx.dl));
+                    let const_memory_map = {
+                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        val.value.inner().memory_map.clone()
+                    };
+                    let const_allocs = create_const_data_sections(fx, &const_memory_map);
                     let val = match scalar.primitive() {
-                        Primitive::Pointer(_) => {
-                            let const_memory_map = {
-                                let val = resolve_const_value(fx.db(), konst.as_ref());
-                                val.value.inner().memory_map.clone()
-                            };
-                            let addr_to_gv = create_const_data_sections(fx, &const_memory_map);
-                            codegen_scalar_const(
-                                fx,
-                                &scalar,
-                                raw_bits,
-                                &addr_to_gv,
-                                Some(&const_memory_map),
-                                Some(ty),
-                            )
-                        }
+                        Primitive::Pointer(_) => codegen_scalar_const(
+                            fx,
+                            &scalar,
+                            raw_bits,
+                            &const_allocs,
+                            Some(&const_memory_map),
+                            Some(ty),
+                        ),
                         Primitive::Float(rustc_abi::Float::F32) => {
                             fx.bcx.ins().f32const(f32::from_bits(raw_bits as u32))
                         }
@@ -2603,7 +2601,22 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                         Primitive::Float(_) => todo!("f16/f128 constants"),
                         _ => {
                             let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
-                            iconst_from_bits(&mut fx.bcx, clif_ty, raw_bits)
+                            // Integer constants can carry const-eval virtual addresses
+                            // (e.g. pointer-to-int casts in const fn). If this looks like
+                            // one, lower it as relocation + offset instead of raw bits.
+                            if clif_ty == fx.pointer_type
+                                && looks_like_const_eval_virtual_addr(raw_bits as usize)
+                            {
+                                if let Some(ptr) =
+                                    const_ptr_from_data_alloc(fx, raw_bits as usize, &const_allocs)
+                                {
+                                    ptr
+                                } else {
+                                    iconst_from_bits(&mut fx.bcx, clif_ty, raw_bits)
+                                }
+                            } else {
+                                iconst_from_bits(&mut fx.bcx, clif_ty, raw_bits)
+                            }
                         }
                     };
                     CValue::by_val(val, layout)
@@ -2635,13 +2648,13 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
 
                     // Create data sections for allocations in the memory_map,
                     // building a mapping of old addresses → GlobalValues.
-                    let addr_to_gv = create_const_data_sections(fx, &const_memory_map);
+                    let const_allocs = create_const_data_sections(fx, &const_memory_map);
 
                     let a_val = codegen_scalar_const(
                         fx,
                         &a_scalar,
                         a_raw,
-                        &addr_to_gv,
+                        &const_allocs,
                         Some(&const_memory_map),
                         Some(ty),
                     );
@@ -2649,26 +2662,83 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                         fx,
                         &b_scalar,
                         b_raw,
-                        &addr_to_gv,
+                        &const_allocs,
                         Some(&const_memory_map),
                         Some(ty),
                     );
                     CValue::by_val_pair(a_val, b_val, layout)
                 }
                 _ => {
-                    // Memory-repr constant: store raw bytes in a data section
-                    let const_memory = {
+                    // Memory-repr constant.
+                    let (const_memory, const_memory_map) = {
                         let val = resolve_const_value(fx.db(), konst.as_ref());
-                        val.value.inner().memory.clone()
+                        let const_bytes = val.value.inner();
+                        (const_bytes.memory.clone(), const_bytes.memory_map.clone())
                     };
+
+                    // Fast path: no pointer-bearing side allocations in const-eval map.
+                    if matches!(const_memory_map, hir_ty::MemoryMap::Empty) {
+                        let mut data_desc = DataDescription::new();
+                        data_desc.define(const_memory.clone());
+                        data_desc.set_align(layout.align.abi.bytes());
+                        let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+                        fx.module.define_data(data_id, &data_desc).unwrap();
+                        let local_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+                        let ptr = fx.bcx.ins().symbol_value(fx.pointer_type, local_id);
+                        return CValue::by_ref(pointer::Pointer::new(ptr), layout);
+                    }
+
+                    // Slow path: materialize bytes, then patch pointer-sized words that carry
+                    // const-eval virtual addresses to relocation-based runtime pointers.
                     let mut data_desc = DataDescription::new();
                     data_desc.define(const_memory.clone());
                     data_desc.set_align(layout.align.abi.bytes());
-                    let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
-                    fx.module.define_data(data_id, &data_desc).unwrap();
-                    let local_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-                    let ptr = fx.bcx.ins().symbol_value(fx.pointer_type, local_id);
-                    CValue::by_ref(pointer::Pointer::new(ptr), layout)
+                    let blob_data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+                    fx.module.define_data(blob_data_id, &data_desc).unwrap();
+                    let blob_local_id = fx.module.declare_data_in_func(blob_data_id, fx.bcx.func);
+                    let blob_ptr = fx.bcx.ins().symbol_value(fx.pointer_type, blob_local_id);
+
+                    let slot = CPlace::new_stack_slot(fx, layout.clone());
+                    let dst = slot.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+                    let byte_count = fx.bcx.ins().iconst(fx.pointer_type, const_memory.len() as i64);
+                    fx.bcx.call_memcpy(fx.module.target_config(), dst, blob_ptr, byte_count);
+
+                    let const_allocs = create_const_data_sections(fx, &const_memory_map);
+                    let ptr_size = fx.dl.pointer_size().bytes_usize();
+                    let mut flags = MemFlags::new();
+                    flags.set_notrap();
+                    if const_memory.len() >= ptr_size {
+                        for offset in (0..=const_memory.len() - ptr_size).step_by(ptr_size) {
+                            let raw_addr = match ptr_size {
+                                8 => {
+                                    let mut buf = [0u8; 8];
+                                    buf.copy_from_slice(&const_memory[offset..offset + 8]);
+                                    u64::from_le_bytes(buf) as usize
+                                }
+                                4 => {
+                                    let mut buf = [0u8; 4];
+                                    buf.copy_from_slice(&const_memory[offset..offset + 4]);
+                                    u32::from_le_bytes(buf) as usize
+                                }
+                                _ => unreachable!("unsupported pointer size"),
+                            };
+
+                            if !looks_like_const_eval_virtual_addr(raw_addr) {
+                                continue;
+                            }
+
+                            if let Some(patched_ptr) =
+                                const_ptr_from_data_alloc(fx, raw_addr, &const_allocs)
+                            {
+                                let field_ptr = slot
+                                    .to_ptr()
+                                    .offset_i64(&mut fx.bcx, fx.pointer_type, offset as i64);
+                                field_ptr.store(&mut fx.bcx, patched_ptr, flags);
+                            }
+                        }
+                    }
+
+                    CValue::by_ref(slot.to_ptr(), layout)
                 }
             }
         }
@@ -2686,13 +2756,20 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
 }
 
 /// Create anonymous data sections for each allocation in a `MemoryMap`,
-/// returning a mapping from virtual address → Cranelift GlobalValue.
+/// returning the allocation base/size + Cranelift GlobalValue.
+#[derive(Clone, Copy)]
+struct ConstDataAlloc {
+    base: usize,
+    len: usize,
+    gv: cranelift_codegen::ir::GlobalValue,
+}
+
 fn create_const_data_sections(
     fx: &mut FunctionCx<'_, impl Module>,
     memory_map: &hir_ty::MemoryMap<'_>,
-) -> HashMap<usize, cranelift_codegen::ir::GlobalValue> {
+) -> Vec<ConstDataAlloc> {
     use hir_ty::MemoryMap;
-    let mut map = HashMap::new();
+    let mut allocs = Vec::new();
     match memory_map {
         MemoryMap::Empty => {}
         MemoryMap::Simple(data) => {
@@ -2701,7 +2778,7 @@ fn create_const_data_sections(
             let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
             fx.module.define_data(data_id, &data_desc).unwrap();
             let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-            map.insert(0usize, gv);
+            allocs.push(ConstDataAlloc { base: 0, len: data.len(), gv });
         }
         MemoryMap::Complex(cm) => {
             for (addr, data) in cm.memory_iter() {
@@ -2710,11 +2787,50 @@ fn create_const_data_sections(
                 let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
                 fx.module.define_data(data_id, &data_desc).unwrap();
                 let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-                map.insert(*addr, gv);
+                allocs.push(ConstDataAlloc { base: *addr, len: data.len(), gv });
             }
         }
     }
-    map
+    allocs
+}
+
+fn const_ptr_from_data_alloc(
+    fx: &mut FunctionCx<'_, impl Module>,
+    addr: usize,
+    allocs: &[ConstDataAlloc],
+) -> Option<Value> {
+    for alloc in allocs {
+        let Some(end) = alloc.base.checked_add(alloc.len) else {
+            continue;
+        };
+        if addr < alloc.base || addr > end {
+            continue;
+        }
+
+        let base_ptr = fx.bcx.ins().symbol_value(fx.pointer_type, alloc.gv);
+        let offset = addr - alloc.base;
+        if offset == 0 {
+            return Some(base_ptr);
+        }
+
+        let offset_val = iconst_from_bits(&mut fx.bcx, fx.pointer_type, offset as u128);
+        return Some(fx.bcx.ins().iadd(base_ptr, offset_val));
+    }
+    None
+}
+
+#[cfg(target_pointer_width = "64")]
+fn looks_like_const_eval_virtual_addr(addr: usize) -> bool {
+    const STACK_OFFSET: usize = 1 << 60;
+    const HEAP_OFFSET: usize = 1 << 59;
+    addr >= HEAP_OFFSET || addr >= STACK_OFFSET
+}
+
+#[cfg(target_pointer_width = "32")]
+fn looks_like_const_eval_virtual_addr(addr: usize) -> bool {
+    const STACK_OFFSET: usize = 1 << 30;
+    const HEAP_OFFSET: usize = 1 << 29;
+    addr >= HEAP_OFFSET || addr >= STACK_OFFSET
 }
 
 /// Lower a const-eval vtable-map id to a code pointer when the mapped type
@@ -2868,21 +2984,22 @@ fn build_fn_ptr_sig_from_ty(
 }
 
 /// Emit a Cranelift Value for a single scalar constant.
-/// If the scalar is a pointer and the address matches an entry in `addr_to_gv`,
-/// emits a `symbol_value` (relocation). Otherwise, emits an `iconst` or float const.
+/// If the scalar is a pointer and the address falls within a const-data
+/// allocation, emits `symbol_value + offset`. Otherwise, emits an `iconst`
+/// (or float const).
 fn codegen_scalar_const(
     fx: &mut FunctionCx<'_, impl Module>,
     scalar: &Scalar,
     raw: u128,
-    addr_to_gv: &HashMap<usize, cranelift_codegen::ir::GlobalValue>,
+    const_allocs: &[ConstDataAlloc],
     memory_map: Option<&hir_ty::MemoryMap<'_>>,
     _const_ty: Option<&StoredTy>,
 ) -> Value {
     match scalar.primitive() {
         Primitive::Pointer(_) => {
             let addr = raw as usize;
-            if let Some(&gv) = addr_to_gv.get(&addr) {
-                fx.bcx.ins().symbol_value(fx.pointer_type, gv)
+            if let Some(ptr) = const_ptr_from_data_alloc(fx, addr, const_allocs) {
+                ptr
             } else if addr == 0 {
                 iconst_from_bits(&mut fx.bcx, fx.pointer_type, 0)
             } else if let Some(ptr) = memory_map
@@ -2950,6 +3067,26 @@ fn store_call_result_and_jump(
     } else {
         fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
     }
+}
+
+/// Lower one memory-repr call argument to an indirect pointer argument.
+///
+/// Rust-by-value ABI transfers ownership of the backing storage for `Move`
+/// operands, but `Copy`/constant operands must be copied into temporary storage
+/// before passing to avoid aliasing the caller's live place.
+fn lower_indirect_call_arg(
+    fx: &mut FunctionCx<'_, impl Module>,
+    operand_kind: &OperandKind,
+    cval: CValue,
+) -> Value {
+    let ptr = if matches!(operand_kind, OperandKind::Move(_)) {
+        cval.force_stack(fx)
+    } else {
+        let tmp = CPlace::new_stack_slot(fx, cval.layout.clone());
+        tmp.write_cvalue(fx, cval);
+        tmp.to_ptr()
+    };
+    ptr.get_addr(&mut fx.bcx, fx.pointer_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -3367,8 +3504,7 @@ fn codegen_fn_ptr_call(
                 call_args.push(cval.load_scalar(fx));
             }
             _ => {
-                let ptr = cval.force_stack(fx);
-                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
             }
         }
     }
@@ -3446,8 +3582,7 @@ fn codegen_closure_call(
                 call_args.push(cval.load_scalar(fx));
             }
             _ => {
-                let ptr = cval.force_stack(fx);
-                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
             }
         }
     }
@@ -3866,9 +4001,7 @@ fn codegen_direct_call(
                 call_args.push(cval.load_scalar(fx));
             }
             _ => {
-                // Memory-repr arg: force to stack and pass pointer
-                let ptr = cval.force_stack(fx);
-                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
             }
         }
     }
@@ -3986,10 +4119,8 @@ fn codegen_virtual_call(
                 call_args.push(vb);
             }
             _ => {
-                // Memory-repr arg: force to stack and pass pointer
                 sig.params.push(AbiParam::new(fx.pointer_type));
-                let ptr = cval.force_stack(fx);
-                call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
+                call_args.push(lower_indirect_call_arg(fx, &arg.kind, cval));
             }
         }
     }
@@ -4386,18 +4517,16 @@ fn codegen_intrinsic_call(
             let layout =
                 generic_ty_layout.clone().expect("typed_swap_nonoverlapping: layout error");
             if !layout.is_zst() {
-                let x_place = CPlace::for_ptr(pointer::Pointer::new(x_ptr), layout.clone());
-                let y_place = CPlace::for_ptr(pointer::Pointer::new(y_ptr), layout.clone());
+                // Keep this byte-oriented to avoid representation-specific loads/stores
+                // when swapping larger memory-repr values (e.g. hashbrown internals).
+                let byte_count = fx.bcx.ins().iconst(fx.pointer_type, layout.size.bytes() as i64);
                 let tmp = CPlace::new_stack_slot(fx, layout.clone());
+                let tmp_ptr = tmp.to_ptr().get_addr(&mut fx.bcx, fx.pointer_type);
+                let tc = fx.module.target_config();
 
-                let x_val = x_place.to_cvalue(fx);
-                tmp.write_cvalue(fx, x_val);
-
-                let y_val = y_place.to_cvalue(fx);
-                x_place.write_cvalue(fx, y_val);
-
-                let tmp_val = tmp.to_cvalue(fx);
-                y_place.write_cvalue(fx, tmp_val);
+                fx.bcx.call_memcpy(tc, tmp_ptr, x_ptr, byte_count);
+                fx.bcx.call_memcpy(tc, x_ptr, y_ptr, byte_count);
+                fx.bcx.call_memcpy(tc, y_ptr, tmp_ptr, byte_count);
             }
             None
         }
@@ -5266,12 +5395,14 @@ pub fn compile_fn(
                     param_idx += 2;
                 }
                 _ => {
-                    // Memory-repr param: block param is a pointer to the data
+                    // Memory-repr param: block param is a pointer to caller-owned data.
+                    // Materialize the parameter into the callee local place so
+                    // subsequent local mutations don't alias caller storage.
                     let ptr_val = block_params[param_idx];
                     param_idx += 1;
-                    let layout = place.layout.clone();
-                    local_map[param_idx_local] =
-                        CPlace::for_ptr(pointer::Pointer::new(ptr_val), layout);
+                    let dst = place.to_ptr().get_addr(&mut bcx, pointer_type);
+                    let byte_count = bcx.ins().iconst(pointer_type, place.layout.size.bytes() as i64);
+                    bcx.call_memcpy(module.target_config(), dst, ptr_val, byte_count);
                 }
             }
         }

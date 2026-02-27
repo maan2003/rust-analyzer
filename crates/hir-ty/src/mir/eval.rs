@@ -2276,15 +2276,25 @@ impl<'db> Evaluator<'db> {
                 return Err(MirEvalError::StackOverflow);
             }
             match ty.kind() {
-                TyKind::Ref(_, t, _) => {
+                TyKind::Ref(_, t, _) | TyKind::RawPtr(t, _) => {
+                    let is_raw_ptr = matches!(ty.kind(), TyKind::RawPtr(_, _));
                     let size = this.size_align_of(t, locals)?;
                     match size {
                         Some((size, _)) => {
                             let addr_usize = from_bytes!(usize, bytes);
-                            mm.insert(
-                                addr_usize,
-                                this.read_memory(Address::from_usize(addr_usize), size)?.into(),
-                            )
+                            if size == 0 {
+                                return Ok(());
+                            }
+
+                            let addr = Address::from_usize(addr_usize);
+                            match this.read_memory(addr, size) {
+                                Ok(memory) => mm.insert(addr_usize, memory.into()),
+                                // Raw pointers are allowed to dangle, so only preserve
+                                // relocation/provenance when the pointee is actually backed
+                                // by our interpreter memory.
+                                Err(_) if is_raw_ptr => {}
+                                Err(e) => return Err(e),
+                            }
                         }
                         None => {
                             let mut check_inner = None;
@@ -2308,20 +2318,25 @@ impl<'db> Evaluator<'db> {
                             };
                             let size = element_size * count;
                             let addr = Address::from_bytes(addr)?;
-                            let b = this.read_memory(addr, size)?;
-                            mm.insert(addr.to_usize(), b.into());
-                            if let Some(ty) = check_inner {
-                                for i in 0..count {
-                                    let offset = element_size * i;
-                                    rec(
-                                        this,
-                                        &b[offset..offset + element_size],
-                                        ty,
-                                        locals,
-                                        mm,
-                                        stack_depth_limit - 1,
-                                    )?;
+                            match this.read_memory(addr, size) {
+                                Ok(b) => {
+                                    mm.insert(addr.to_usize(), b.into());
+                                    if let Some(ty) = check_inner {
+                                        for i in 0..count {
+                                            let offset = element_size * i;
+                                            rec(
+                                                this,
+                                                &b[offset..offset + element_size],
+                                                ty,
+                                                locals,
+                                                mm,
+                                                stack_depth_limit - 1,
+                                            )?;
+                                        }
+                                    }
                                 }
+                                Err(_) if is_raw_ptr => {}
+                                Err(e) => return Err(e),
                             }
                         }
                     }
@@ -2444,7 +2459,7 @@ impl<'db> Evaluator<'db> {
         let my_size = self.size_of_sized(ty, locals, "value to patch address")?;
         use rustc_type_ir::TyKind;
         match ty.kind() {
-            TyKind::Ref(_, t, _) => {
+            TyKind::Ref(_, t, _) | TyKind::RawPtr(t, _) => {
                 let size = self.size_align_of(t, locals)?;
                 match size {
                     Some(_) => {
@@ -2531,7 +2546,6 @@ impl<'db> Evaluator<'db> {
             | TyKind::Uint(_)
             | TyKind::Float(_)
             | TyKind::Slice(_)
-            | TyKind::RawPtr(_, _)
             | TyKind::FnDef(_, _)
             | TyKind::Str
             | TyKind::Never
