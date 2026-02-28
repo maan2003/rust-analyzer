@@ -4,8 +4,9 @@
 //! char mapping) are ported from `rustc_symbol_mangling/src/v0.rs` (RFC 2603).
 //! We keep them close to the originals for easier future syncing.
 //!
-//! Deferred: const generic encoding (uses `p` placeholder), `dyn Trait` /
-//! fn-pointer encoding, punycode, closure/coroutine encoding.
+//! Deferred: full rustc-compatible const encoding (we currently hash const
+//! args for uniqueness), `dyn Trait` / fn-pointer encoding, punycode,
+//! closure/coroutine encoding.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -16,7 +17,7 @@ use hir_def::{
 };
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::Mutability;
-use hir_ty::next_solver::{GenericArgKind, GenericArgs, IntoKind, Ty, TyKind};
+use hir_ty::next_solver::{Const, GenericArgKind, GenericArgs, IntoKind, Ty, TyKind};
 use hir_ty::primitive::{FloatTy, IntTy, UintTy};
 
 // ---------------------------------------------------------------------------
@@ -47,16 +48,11 @@ pub fn mangle_function(
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
     let fn_disambiguator = m.function_disambiguator(func_id, container, &fn_name);
 
-    // Collect non-lifetime generic args.
-    let ty_args: Vec<_> = generic_args
+    let has_non_lifetime_args = generic_args
         .iter()
-        .filter_map(|arg| match arg.kind() {
-            GenericArgKind::Type(ty) => Some(ty),
-            _ => None,
-        })
-        .collect();
+        .any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
-    if ty_args.is_empty() {
+    if !has_non_lifetime_args {
         // No generic args — simple path.
         m.out.push_str("N");
         m.out.push('v'); // ValueNs
@@ -71,8 +67,12 @@ pub fn mangle_function(
         m.print_container_path(container);
         m.push_disambiguator(fn_disambiguator);
         m.push_ident(&fn_name);
-        for ty in &ty_args {
-            m.print_type(*ty);
+        for arg in generic_args.iter() {
+            match arg.kind() {
+                GenericArgKind::Type(ty) => m.print_type(ty),
+                GenericArgKind::Const(konst) => m.print_const(konst),
+                GenericArgKind::Lifetime(_) => {}
+            }
         }
         m.out.push_str("E");
     }
@@ -135,17 +135,13 @@ pub fn mangle_closure(
 
     let out = format!("_Rclosure_{}_{:x}_{:?}", crate_name, disamb, closure_id);
 
-    // Mirror function symbol behavior: encode non-lifetime type args so
-    // multiple monomorphized instances of the same closure id don't collide.
-    let ty_args: Vec<_> = generic_args
+    // Mirror function symbol behavior: encode non-lifetime args so multiple
+    // monomorphized instances of the same closure id don't collide.
+    let has_non_lifetime_args = generic_args
         .iter()
-        .filter_map(|arg| match arg.kind() {
-            GenericArgKind::Type(ty) => Some(ty),
-            _ => None,
-        })
-        .collect();
+        .any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
-    if ty_args.is_empty() {
+    if !has_non_lifetime_args {
         return out;
     }
 
@@ -157,8 +153,12 @@ pub fn mangle_closure(
         module_paths: HashMap::new(),
     };
     m.out.push('I');
-    for ty in &ty_args {
-        m.print_type(*ty);
+    for arg in generic_args.iter() {
+        match arg.kind() {
+            GenericArgKind::Type(ty) => m.print_type(ty),
+            GenericArgKind::Const(konst) => m.print_const(konst),
+            GenericArgKind::Lifetime(_) => {}
+        }
     }
     m.out.push('E');
     m.out
@@ -414,29 +414,27 @@ impl<'a> SymbolMangler<'a> {
         };
 
         // TraitRef args are `[Self, ..trait params]`; mangle only real params.
-        let ty_args: Vec<_> = args
+        let has_non_lifetime_args = args
             .iter()
             .enumerate()
-            .filter_map(|(idx, arg)| {
-                if idx == 0 {
-                    return None;
-                }
-                match arg.kind() {
-                    GenericArgKind::Type(ty) => Some(ty),
-                    _ => None,
-                }
-            })
-            .collect();
+            .any(|(idx, arg)| idx != 0 && !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
-        if ty_args.is_empty() {
+        if !has_non_lifetime_args {
             print_simple(self);
             return;
         }
 
         self.out.push('I');
         print_simple(self);
-        for ty in &ty_args {
-            self.print_type(*ty);
+        for (idx, arg) in args.iter().enumerate() {
+            if idx == 0 {
+                continue;
+            }
+            match arg.kind() {
+                GenericArgKind::Type(ty) => self.print_type(ty),
+                GenericArgKind::Const(konst) => self.print_const(konst),
+                GenericArgKind::Lifetime(_) => {}
+            }
         }
         self.out.push('E');
     }
@@ -493,10 +491,10 @@ impl<'a> SymbolMangler<'a> {
                 self.out.push('S');
                 self.print_type(inner_ty);
             }
-            TyKind::Array(inner_ty, _len) => {
+            TyKind::Array(inner_ty, len) => {
                 self.out.push('A');
                 self.print_type(inner_ty);
-                self.out.push('p'); // const placeholder
+                self.print_const(len);
             }
             TyKind::Tuple(tys) => {
                 self.out.push('T');
@@ -523,6 +521,13 @@ impl<'a> SymbolMangler<'a> {
         }
     }
 
+    fn print_const(&mut self, konst: Const<'_>) {
+        // Minimal const encoding for symbol uniqueness between distinct const
+        // generic instantiations.
+        self.out.push('p');
+        self.push_integer_62(stable_hash_bytes(format!("{konst:?}").as_bytes()));
+    }
+
     fn print_adt_path(&mut self, adt_id: AdtId, substs: GenericArgs<'_>) {
         let name = match adt_id {
             AdtId::StructId(id) => self.db.struct_signature(id).name.as_str().to_owned(),
@@ -535,16 +540,10 @@ impl<'a> SymbolMangler<'a> {
             AdtId::UnionId(id) => id.module(self.db),
         };
 
-        // Collect non-lifetime args.
-        let ty_args: Vec<_> = substs
-            .iter()
-            .filter_map(|arg| match arg.kind() {
-                GenericArgKind::Type(ty) => Some(ty),
-                _ => None,
-            })
-            .collect();
+        let has_non_lifetime_args =
+            substs.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
-        if ty_args.is_empty() {
+        if !has_non_lifetime_args {
             self.out.push('N');
             self.out.push('t'); // TypeNs
             self.print_module_path(module);
@@ -557,8 +556,12 @@ impl<'a> SymbolMangler<'a> {
             self.print_module_path(module);
             self.push_disambiguator(0);
             self.push_ident(&name);
-            for ty in &ty_args {
-                self.print_type(*ty);
+            for arg in substs.iter() {
+                match arg.kind() {
+                    GenericArgKind::Type(ty) => self.print_type(ty),
+                    GenericArgKind::Const(konst) => self.print_const(konst),
+                    GenericArgKind::Lifetime(_) => {}
+                }
             }
             self.out.push('E');
         }

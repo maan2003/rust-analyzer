@@ -3169,7 +3169,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std::ptr::swap_nonoverlapping path corrupts vec::sort data"]
+#[ignore = "currently fails in std::slice::revswap / core::mem::swap path"]
 fn std_jit_vec_sort_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3200,7 +3200,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std::ptr::swap_nonoverlapping corrupts adjacent elements"]
 fn std_jit_ptr_swap_nonoverlapping_probe() {
     let result: i32 = jit_run_with_std(
         r#"
