@@ -206,6 +206,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: Meta) -> ControlFlow<Infal
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
                     "pointee" => attr_flags.insert(AttrFlags::IS_POINTEE),
                     "non_exhaustive" => attr_flags.insert(AttrFlags::NON_EXHAUSTIVE),
+                    "default" => attr_flags.insert(AttrFlags::HAS_DEFAULT_ATTR),
                     "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
                     "bench" => attr_flags.insert(AttrFlags::IS_BENCH),
                     "rustc_const_panic_str" => attr_flags.insert(AttrFlags::RUSTC_CONST_PANIC_STR),
@@ -311,6 +312,7 @@ bitflags::bitflags! {
         const MACRO_STYLE_BRACES = 1 << 46;
         const MACRO_STYLE_BRACKETS = 1 << 47;
         const MACRO_STYLE_PARENTHESES = 1 << 48;
+        const HAS_DEFAULT_ATTR = 1 << 49;
     }
 }
 

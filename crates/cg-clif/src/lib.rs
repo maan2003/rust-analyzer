@@ -19,6 +19,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use either::Either;
+use hir_def::attrs::AttrFlags;
 use hir_def::builtin_derive::BuiltinDeriveImplMethod;
 use hir_def::signatures::{FunctionSignature, StaticFlags};
 use hir_def::{
@@ -4052,6 +4053,26 @@ fn enum_variant_idx_by_name(
     panic!("enum variant `{wanted}` not found for enum {enum_id:?}")
 }
 
+fn enum_default_variant_idx(db: &dyn HirDatabase, enum_id: hir_def::EnumId) -> VariantIdx {
+    let variants = &enum_id.enum_variants(db).variants;
+    let mut default_variant_idx = None;
+
+    for (idx, (variant_id, _, _)) in variants.iter().enumerate() {
+        let attrs = AttrFlags::query(db, (*variant_id).into());
+        if attrs.contains(AttrFlags::HAS_DEFAULT_ATTR) {
+            assert!(
+                default_variant_idx.is_none(),
+                "builtin Default::default found multiple #[default] variants for enum {enum_id:?}",
+            );
+            default_variant_idx = Some(VariantIdx::from_u32(idx as u32));
+        }
+    }
+
+    default_variant_idx.unwrap_or_else(|| {
+        panic!("builtin Default::default found no #[default] variant for enum {enum_id:?}")
+    })
+}
+
 #[derive(Clone)]
 struct OptionOrderingInfo {
     option_ty: StoredTy,
@@ -4409,6 +4430,68 @@ fn codegen_builtin_derive_method_impl(
         derive_method.trait_method(fx.db(), derive_impl_id).expect("builtin derive trait method");
 
     match derive_method {
+        BuiltinDeriveImplMethod::default => {
+            assert!(args.is_empty(), "builtin Default::default expects no arguments");
+
+            let TyKind::Adt(adt_id, adt_args) = self_ty.as_ref().kind() else {
+                panic!("builtin Default::default expects ADT self type, got {self_ty:?}");
+            };
+            let interner = DbInterner::new_no_crate(fx.db());
+
+            match adt_id.inner().id {
+                hir_def::AdtId::StructId(struct_id) => {
+                    for (field_idx, (_, field_ty)) in
+                        fx.db().field_types(struct_id.into()).iter().enumerate()
+                    {
+                        let field_ty = field_ty.get().instantiate(interner, adt_args).store();
+                        let field_layout = fx
+                            .db()
+                            .layout_of_ty(field_ty.clone(), fx.env().clone())
+                            .expect("builtin Default::default struct field layout");
+                        let field_default = codegen_trait_method_call_returning_cvalue(
+                            fx,
+                            trait_method_func_id,
+                            field_ty,
+                            false,
+                            &[],
+                        );
+                        let dest_field = dest.place_field(fx, field_idx, field_layout);
+                        dest_field.write_cvalue(fx, field_default);
+                    }
+                }
+                hir_def::AdtId::EnumId(enum_id) => {
+                    let variants = &enum_id.enum_variants(fx.db()).variants;
+                    let variant_idx = enum_default_variant_idx(fx.db(), enum_id);
+                    let variant_layout = variant_layout(&dest.layout, variant_idx);
+                    let dest_variant = dest.downcast_variant(variant_layout);
+                    let variant_id = variants[variant_idx.as_usize()].0;
+
+                    for (field_idx, (_, field_ty)) in
+                        fx.db().field_types(variant_id.into()).iter().enumerate()
+                    {
+                        let field_ty = field_ty.get().instantiate(interner, adt_args).store();
+                        let field_layout = fx
+                            .db()
+                            .layout_of_ty(field_ty.clone(), fx.env().clone())
+                            .expect("builtin Default::default enum field layout");
+                        let field_default = codegen_trait_method_call_returning_cvalue(
+                            fx,
+                            trait_method_func_id,
+                            field_ty,
+                            false,
+                            &[],
+                        );
+                        let dest_field = dest_variant.place_field(fx, field_idx, field_layout);
+                        dest_field.write_cvalue(fx, field_default);
+                    }
+
+                    codegen_set_discriminant(fx, dest, &self_ty, variant_idx);
+                }
+                hir_def::AdtId::UnionId(_) => {
+                    panic!("builtin Default::default is not supported for unions")
+                }
+            }
+        }
         BuiltinDeriveImplMethod::clone => {
             assert_eq!(args.len(), 1, "builtin Clone::clone expects one receiver argument");
 
@@ -5161,8 +5244,15 @@ fn codegen_builtin_derive_method_call(
             .map(|ty| ty.store())
             .or_else(|| (!generic_args.is_empty()).then(|| generic_args.type_at(0).store()))
             .expect("builtin derive method receiver must be a reference")
+    } else if matches!(derive_method, BuiltinDeriveImplMethod::default) {
+        // `Default::default` is an associated function with no receiver.
+        result_ty.clone()
     } else {
-        assert!(!generic_args.is_empty(), "builtin derive method missing generic args");
+        assert!(
+            !generic_args.is_empty(),
+            "builtin derive method missing generic args: impl={derive_impl_id:?} method={derive_method:?} args_len={} result_ty={result_ty:?}",
+            args.len(),
+        );
         generic_args.type_at(0).store()
     };
 
@@ -7774,6 +7864,47 @@ fn collect_builtin_derive_method_dependencies(
     };
 
     match derive_method {
+        BuiltinDeriveImplMethod::default => {
+            let TyKind::Adt(adt_id, adt_args) = self_ty.as_ref().kind() else {
+                return;
+            };
+
+            let interner = DbInterner::new_with(db, local_crate);
+            match adt_id.inner().id {
+                hir_def::AdtId::StructId(struct_id) => {
+                    for (_, field_ty) in db.field_types(struct_id.into()).iter() {
+                        let field_ty = field_ty.get().instantiate(interner, adt_args).store();
+                        collect_builtin_derive_trait_call_dependency(
+                            db,
+                            env,
+                            local_crate,
+                            trait_method_func_id,
+                            field_ty,
+                            false,
+                            queue,
+                        );
+                    }
+                }
+                hir_def::AdtId::EnumId(enum_id) => {
+                    let variants = &enum_id.enum_variants(db).variants;
+                    let default_variant_idx = enum_default_variant_idx(db, enum_id);
+                    let default_variant_id = variants[default_variant_idx.as_usize()].0;
+                    for (_, field_ty) in db.field_types(default_variant_id.into()).iter() {
+                        let field_ty = field_ty.get().instantiate(interner, adt_args).store();
+                        collect_builtin_derive_trait_call_dependency(
+                            db,
+                            env,
+                            local_crate,
+                            trait_method_func_id,
+                            field_ty,
+                            false,
+                            queue,
+                        );
+                    }
+                }
+                hir_def::AdtId::UnionId(_) => {}
+            }
+        }
         BuiltinDeriveImplMethod::clone => {
             collect_builtin_derive_field_trait_calls(
                 db,
