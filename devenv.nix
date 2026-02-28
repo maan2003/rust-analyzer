@@ -4,5 +4,5 @@
     cachix.enable = false;
     languages.rust.enable = true;
     languages.rust.toolchainFile = ./cg_clif/rust-toolchain.toml;
-    packages = [ pkgs.cargo-nextest pkgs.just ];
+    packages = [ pkgs.cargo-nextest pkgs.just pkgs.llvm pkgs.llvmPackages.bintools ];
 }
