@@ -103,6 +103,21 @@ fn iconst_from_bits(bcx: &mut FunctionBuilder<'_>, ty: Type, bits: u128) -> Valu
     }
 }
 
+fn int_min_max_values(bcx: &mut FunctionBuilder<'_>, ty: Type, signed: bool) -> (Value, Value) {
+    assert!(ty.is_int(), "expected integer type, got {ty:?}");
+    let bits = ty.bits();
+    if signed {
+        let sign_bit = 1u128 << (bits - 1);
+        (
+            iconst_from_bits(bcx, ty, sign_bit),
+            iconst_from_bits(bcx, ty, sign_bit - 1),
+        )
+    } else {
+        let max = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
+        (iconst_from_bits(bcx, ty, 0), iconst_from_bits(bcx, ty, max))
+    }
+}
+
 fn stable_hash64_with_seed(bytes: &[u8], seed: u64) -> u64 {
     let mut hash = seed;
     for &byte in bytes {
@@ -1634,6 +1649,26 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
     cplace
 }
 
+fn type_is_copy_for_codegen(fx: &FunctionCx<'_, impl Module>, ty: &StoredTy) -> bool {
+    let Some(copy_trait) = hir_def::lang_item::lang_items(fx.db(), fx.local_crate()).Copy else {
+        return false;
+    };
+    hir_ty::traits::implements_trait_unique(ty.as_ref(), fx.db(), fx.env().as_ref(), copy_trait)
+}
+
+fn copy_operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, place: &Place) -> bool {
+    let ty = place_ty(fx.db(), fx.ra_body(), place);
+    !type_is_copy_for_codegen(fx, &ty)
+}
+
+fn operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, kind: &OperandKind) -> bool {
+    match kind {
+        OperandKind::Move(_) => true,
+        OperandKind::Copy(place) => copy_operand_consumes_ownership(fx, place),
+        OperandKind::Constant { .. } | OperandKind::Static(_) => false,
+    }
+}
+
 /// Get the type of a field from a parent type.
 fn field_type(
     db: &dyn HirDatabase,
@@ -2572,6 +2607,40 @@ pub(crate) fn codegen_checked_int_binop(
     }
 }
 
+pub(crate) fn codegen_saturating_int_binop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    op: &BinOp,
+    lhs: Value,
+    rhs: Value,
+    signed: bool,
+) -> Value {
+    let ty = fx.bcx.func.dfg.value_type(lhs);
+    let (min, max) = int_min_max_values(&mut fx.bcx, ty, signed);
+
+    let checked_op = match op {
+        BinOp::Add => BinOp::AddWithOverflow,
+        BinOp::Sub => BinOp::SubWithOverflow,
+        _ => unreachable!("not a saturating int binop: {op:?}"),
+    };
+    let (val, has_overflow) = codegen_checked_int_binop(fx, &checked_op, lhs, rhs, signed);
+
+    match (op, signed) {
+        (BinOp::Add, false) => fx.bcx.ins().select(has_overflow, max, val),
+        (BinOp::Sub, false) => fx.bcx.ins().select(has_overflow, min, val),
+        (BinOp::Add, true) => {
+            let rhs_ge_zero = fx.bcx.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 0);
+            let sat_val = fx.bcx.ins().select(rhs_ge_zero, max, min);
+            fx.bcx.ins().select(has_overflow, sat_val, val)
+        }
+        (BinOp::Sub, true) => {
+            let rhs_ge_zero = fx.bcx.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 0);
+            let sat_val = fx.bcx.ins().select(rhs_ge_zero, min, max);
+            fx.bcx.ins().select(has_overflow, sat_val, val)
+        }
+        _ => unreachable!(),
+    }
+}
+
 pub(crate) fn codegen_float_binop(
     fx: &mut FunctionCx<'_, impl Module>,
     op: &BinOp,
@@ -2895,7 +2964,16 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                 }
             }
         }
-        OperandKind::Copy(place) => codegen_place(fx, place).to_cvalue(fx),
+        OperandKind::Copy(place) => {
+            let val = codegen_place(fx, place).to_cvalue(fx);
+            // r-a MIR can occasionally encode a by-value use of a non-`Copy`
+            // place as `OperandKind::Copy`. Treat this as ownership transfer,
+            // matching `Move` semantics for our per-local drop flags.
+            if copy_operand_consumes_ownership(fx, place) {
+                fx.clear_drop_flag(place.local);
+            }
+            val
+        }
         OperandKind::Move(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
             // Clear drop flag on any move from this local. Our drop flags are
@@ -3311,9 +3389,10 @@ fn codegen_call_argument_operand(
     fx: &mut FunctionCx<'_, impl Module>,
     operand: &Operand,
 ) -> CallArgument {
+    let is_owned = operand_consumes_ownership(fx, &operand.kind);
     CallArgument {
         cval: codegen_operand(fx, &operand.kind),
-        is_owned: matches!(operand.kind, OperandKind::Move(_)),
+        is_owned,
     }
 }
 
@@ -3577,9 +3656,11 @@ fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: Bas
     // Check drop flag: skip if the local has been moved out.
     // Only simple locals (no projections) have drop flags.
     let projections = place.projection.lookup(&fx.ra_body().projection_store);
+    let mut clear_flag_after_drop = false;
     if projections.is_empty() {
         let local_idx = place.local.into_raw().into_u32();
         if let Some(&flag_var) = fx.drop_flags.get(&local_idx) {
+            clear_flag_after_drop = true;
             let flag_val = fx.bcx.use_var(flag_var);
             let do_drop_block = fx.bcx.create_block();
             fx.bcx.ins().brif(flag_val, do_drop_block, &[], target_block, &[]);
@@ -3622,6 +3703,10 @@ fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: Bas
         fx.module.declare_function(&fn_name, Linkage::Import, &drop_sig).expect("declare drop fn");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
     fx.bcx.ins().call(callee_ref, &[ptr]);
+
+    if clear_flag_after_drop {
+        fx.clear_drop_flag(place.local);
+    }
 
     fx.bcx.ins().jump(target_block, &[]);
 }
@@ -6524,6 +6609,35 @@ fn codegen_intrinsic_call(
             let val = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             Some(val) // pass through
         }
+        "select_unpredictable" => {
+            assert_eq!(args.len(), 3, "select_unpredictable expects 3 args");
+
+            let cond_raw = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let cond_ty = fx.bcx.func.dfg.value_type(cond_raw);
+            let cond = if cond_ty.is_int() {
+                fx.bcx.ins().icmp_imm(IntCC::NotEqual, cond_raw, 0)
+            } else {
+                cond_raw
+            };
+
+            let if_true = codegen_operand(fx, &args[1].kind);
+            let if_false = codegen_operand(fx, &args[2].kind);
+            let dest = codegen_place(fx, destination);
+
+            if !dest.layout.is_zst() {
+                let true_ptr = if_true.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
+                let false_ptr = if_false.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
+                let selected_ptr = fx.bcx.ins().select(cond, true_ptr, false_ptr);
+                let selected = CValue::by_ref(pointer::Pointer::new(selected_ptr), dest.layout.clone());
+                dest.write_cvalue(fx, selected);
+            }
+
+            if let Some(target) = target {
+                let block = fx.clif_block(*target);
+                fx.bcx.ins().jump(block, &[]);
+            }
+            return true;
+        }
         "is_val_statically_known" => {
             assert_eq!(args.len(), 1);
             // This intrinsic is explicitly non-deterministic; returning false
@@ -6602,6 +6716,20 @@ fn codegen_intrinsic_call(
             } else {
                 Some(fx.bcx.ins().udiv(x, y))
             }
+        }
+        "saturating_add" | "saturating_sub" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+
+            let lhs = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let rhs = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            let arg_ty = operand_ty(fx.db(), body, &args[0].kind);
+            if !matches!(arg_ty.as_ref().kind(), TyKind::Int(_) | TyKind::Uint(_)) {
+                panic!("{name} intrinsic expects integer arguments, got {arg_ty:?}");
+            }
+
+            let signed = ty_is_signed_int(arg_ty);
+            let op = if name == "saturating_add" { BinOp::Add } else { BinOp::Sub };
+            Some(codegen_saturating_int_binop(fx, &op, lhs, rhs, signed))
         }
 
         // --- wrapping arithmetic ---

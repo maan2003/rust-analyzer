@@ -3169,7 +3169,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: Index on non-array/slice type in Vec::sort path"]
+#[ignore = "currently fails: std::ptr::swap_nonoverlapping path corrupts vec::sort data"]
 fn std_jit_vec_sort_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3182,6 +3182,41 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "regression probe: vec! ownership/drop path"]
+fn std_jit_vec_macro_drop_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let v = vec![9_i32, 1, 5, 3, 7];
+    v.len() as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 5);
+}
+
+#[test]
+#[ignore = "currently fails: std::ptr::swap_nonoverlapping corrupts adjacent elements"]
+fn std_jit_ptr_swap_nonoverlapping_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut v = [9_i32, 1, 5, 3, 7];
+    unsafe {
+        let a = v.as_mut_ptr();
+        let b = v.as_mut_ptr().add(4);
+        std::ptr::swap_nonoverlapping(a, b, 1usize);
+    }
+    v[0] * 10000 + v[1] * 1000 + v[2] * 100 + v[3] * 10 + v[4]
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 71539);
 }
 
 #[test]
