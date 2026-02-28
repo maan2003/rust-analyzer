@@ -4259,6 +4259,54 @@ fn callable_output_ty(
     (!output.is_never()).then(|| output.store())
 }
 
+fn is_abstract_trait_method_instance(
+    fx: &mut FunctionCx<'_, impl Module>,
+    callee_func_id: hir_def::FunctionId,
+    generic_args: &StoredGenericArgs,
+) -> bool {
+    matches!(
+        fx.db().monomorphized_mir_body(callee_func_id.into(), generic_args.clone(), fx.env().clone()),
+        Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _))
+    )
+}
+
+fn abstract_clone_copy_self_ty(
+    fx: &mut FunctionCx<'_, impl Module>,
+    callee_func_id: hir_def::FunctionId,
+    generic_args: &StoredGenericArgs,
+) -> Option<StoredTy> {
+    let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db()).container else {
+        return None;
+    };
+    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
+    if Some(trait_id) != lang_items.Clone || !is_abstract_trait_method_instance(fx, callee_func_id, generic_args)
+    {
+        return None;
+    }
+    if generic_args.as_ref().is_empty() {
+        return None;
+    }
+    let self_ty = generic_args.as_ref().type_at(0).store();
+    type_is_copy_for_codegen(fx, &self_ty).then_some(self_ty)
+}
+
+fn codegen_clone_copy_from_receiver_ref(
+    fx: &mut FunctionCx<'_, impl Module>,
+    self_ty: &StoredTy,
+    receiver_ref: CValue,
+) -> CValue {
+    // `Copy: Clone` is a language-level guarantee. If method lookup leaves us
+    // at an abstract `Clone::clone` item, lower clone by loading from `&self`.
+    let BackendRepr::Scalar(_) = receiver_ref.layout.backend_repr else {
+        panic!("Clone::clone lowering expects a thin &Self receiver")
+    };
+    let output_layout =
+        fx.db().layout_of_ty(self_ty.clone(), fx.env().clone()).expect("Clone::clone output layout");
+    let self_ptr = receiver_ref.load_scalar(fx);
+    let src_place = CPlace::for_ptr(pointer::Pointer::new(self_ptr), output_layout);
+    src_place.to_cvalue(fx)
+}
+
 fn trait_method_substs_for_derive_call<'db>(
     db: &'db dyn HirDatabase,
     local_crate: base_db::Crate,
@@ -4544,6 +4592,14 @@ fn codegen_direct_call_from_cvalues_into_dest(
     args: &[CValue],
     dest: &CPlace,
 ) {
+    let stored_generic_args = generic_args.store();
+    if let Some(self_ty) = abstract_clone_copy_self_ty(fx, callee_func_id, &stored_generic_args) {
+        let self_ref = args.first().expect("Clone::clone lowering expects a receiver").clone();
+        let cloned_val = codegen_clone_copy_from_receiver_ref(fx, &self_ty, self_ref);
+        dest.write_cvalue(fx, cloned_val);
+        return;
+    }
+
     let is_extern =
         matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
@@ -4556,32 +4612,41 @@ fn codegen_direct_call_from_cvalues_into_dest(
                 .expect("extern fn sig");
         let name = extern_fn_symbol_name(fx.db(), callee_func_id);
         (sig, name)
-    } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
-        callee_func_id.into(),
-        generic_args.store(),
-        fx.env().clone(),
-    ) {
-        let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
-        let name = symbol_mangling::mangle_function(
-            fx.db(),
-            callee_func_id,
-            generic_args,
-            fx.ext_crate_disambiguators(),
-        );
-        (sig, name)
-    } else if is_cross_crate {
-        let sig =
-            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
-                .expect("cross-crate fn sig");
-        let name = symbol_mangling::mangle_function(
-            fx.db(),
-            callee_func_id,
-            generic_args,
-            fx.ext_crate_disambiguators(),
-        );
-        (sig, name)
     } else {
-        panic!("failed to get local callee MIR for {callee_func_id:?}");
+        match fx
+            .db()
+            .monomorphized_mir_body(callee_func_id.into(), stored_generic_args.clone(), fx.env().clone())
+        {
+            Ok(callee_body) => {
+                let sig =
+                    build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    callee_func_id,
+                    generic_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            }
+            Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _)) => {
+                panic!(
+                    "attempted to call abstract trait method without lowering rule: callee={callee_func_id:?} generic_args={generic_args:?}"
+                )
+            }
+            Err(_) if is_cross_crate => {
+                let sig =
+                    build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
+                        .expect("cross-crate fn sig");
+                let name = symbol_mangling::mangle_function(
+                    fx.db(),
+                    callee_func_id,
+                    generic_args,
+                    fx.ext_crate_disambiguators(),
+                );
+                (sig, name)
+            }
+            Err(_) => panic!("failed to get local callee MIR for {callee_func_id:?}"),
+        }
     };
 
     let callee_id = fx
@@ -4675,6 +4740,14 @@ fn codegen_trait_method_call_returning_cvalue(
     let (resolved_callable, resolved_args) =
         fx.db().lookup_impl_method(fx.env().as_ref(), trait_method_func_id, method_substs);
     let resolved_args = resolved_args.store();
+    if let Either::Left(resolved_id) = resolved_callable
+        && is_abstract_trait_method_instance(fx, resolved_id, &resolved_args)
+        && abstract_clone_copy_self_ty(fx, resolved_id, &resolved_args).is_none()
+    {
+        panic!(
+            "unlowered abstract trait call in builtin derive lowering: method={trait_method_func_id:?} resolved={resolved_id:?} self_ty={self_ty:?}"
+        );
+    }
 
     let output_ty = method_output_ty(fx.db(), trait_method_func_id, method_substs);
     let output_layout = fx
@@ -5888,6 +5961,23 @@ fn codegen_direct_call(
     } else {
         call_operand_lowering
     };
+    if let Some(self_ty) = abstract_clone_copy_self_ty(fx, callee_func_id, &generic_args) {
+        assert!(!args.is_empty(), "Clone::clone lowering requires a receiver argument");
+        let self_ref = codegen_operand(fx, &args[0].kind);
+        let cloned_val = codegen_clone_copy_from_receiver_ref(fx, &self_ty, self_ref);
+        let dest = codegen_place(fx, destination);
+        dest.write_cvalue(fx, cloned_val);
+        if let Some(target) = target {
+            let block = fx.clif_block(*target);
+            fx.bcx.ins().jump(block, &[]);
+        }
+        return;
+    }
+    if is_abstract_trait_method_instance(fx, callee_func_id, &generic_args) {
+        panic!(
+            "attempted to call abstract trait method without lowering rule: callee={callee_func_id:?} generic_args={generic_args:?}"
+        );
+    }
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args.as_ref());
     // Check if this is an extern function (no MIR available)
     let is_extern =

@@ -68,6 +68,10 @@ unsafe extern "C" fn jit_rust_alloc_zeroed(size: usize, align: usize) -> *mut u8
 
 unsafe extern "C" fn jit_rust_no_alloc_shim_is_unstable_v2() {}
 
+unsafe extern "C" fn jit_rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+    std::process::abort()
+}
+
 // Miri-only runtime hook used behind `#[cfg(miri)]` in core.
 // In this native JIT harness it is intentionally a no-op.
 extern "C" fn jit_miri_promise_symbolic_alignment(_ptr: *const (), _align: usize) {}
@@ -394,6 +398,8 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder
+            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
@@ -1755,6 +1761,8 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder
+            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
@@ -2069,6 +2077,8 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
+        jit_builder
+            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
