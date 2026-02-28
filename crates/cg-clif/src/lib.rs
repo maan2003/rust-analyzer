@@ -6916,14 +6916,6 @@ fn codegen_intrinsic_call(
         }
 
         _ => {
-            if std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some() {
-                eprintln!(
-                    "std-jit: unhandled intrinsic `{}` (callee={:?}, generic_args={})",
-                    name,
-                    callee_func_id,
-                    generic_args.len(),
-                );
-            }
             return false;
         }
     };
@@ -7376,38 +7368,6 @@ pub fn emit_entry_point(
 
 /// When an unsizing coercion `&T → &dyn Trait` is found, discover the impl
 /// methods that will be placed in the vtable and add them to the work queue.
-fn collect_vtable_methods(
-    db: &dyn HirDatabase,
-    env: &StoredParamEnvAndCrate,
-    body: &MirBody,
-    operand: &Operand,
-    target_ty: &StoredTy,
-    local_crate: base_db::Crate,
-    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
-    closure_visited: &mut std::collections::HashSet<(
-        hir_ty::db::InternedClosureId,
-        StoredGenericArgs,
-    )>,
-    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
-    drop_types: &mut std::collections::HashSet<StoredTy>,
-) {
-    // Extract the concrete source type
-    let from_ty = operand_ty(db, body, &operand.kind);
-    let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
-    let Some(target_pointee) = target_ty.as_ref().builtin_deref(true) else { return };
-    collect_unsize_metadata_dependencies(
-        db,
-        env,
-        local_crate,
-        source_pointee.store(),
-        target_pointee.store(),
-        queue,
-        closure_visited,
-        closure_result,
-        drop_types,
-    );
-}
-
 fn collect_unsize_metadata_dependencies(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
@@ -7454,6 +7414,41 @@ fn collect_unsize_metadata_dependencies(
             queue.push_back((impl_func_id, impl_generic_args.store()));
         }
     }
+}
+
+/// When an unsizing coercion `&T → &dyn Trait` is found, discover the impl
+/// methods that will be placed in the vtable and add them to the work queue.
+fn collect_vtable_methods(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    body: &MirBody,
+    operand: &Operand,
+    target_ty: &StoredTy,
+    local_crate: base_db::Crate,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
+) {
+    // Extract the concrete source type
+    let from_ty = operand_ty(db, body, &operand.kind);
+    let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
+    let Some(target_pointee) = target_ty.as_ref().builtin_deref(true) else { return };
+
+    collect_unsize_metadata_dependencies(
+        db,
+        env,
+        local_crate,
+        source_pointee.store(),
+        target_pointee.store(),
+        queue,
+        closure_visited,
+        closure_result,
+        drop_types,
+    );
 }
 
 /// Generate a `drop_in_place::<T>` glue function for the given type.
@@ -8397,8 +8392,11 @@ fn scan_body_for_callees(
                     );
                 }
 
-                let OperandKind::Constant { ty, .. } = &func.kind else { continue };
-                let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
+                // Call targets can be carried through locals (`Move`/`Copy`) after
+                // `ReifyFnPointer`; inspect the operand type rather than requiring
+                // a direct `Constant` operand to avoid missing reachable callees.
+                let func_ty = operand_ty(db, body, &func.kind);
+                let TyKind::FnDef(def, callee_args) = func_ty.as_ref().kind() else { continue };
                 if let CallableDefId::FunctionId(callee_id) = def.0 {
                     if FunctionSignature::is_intrinsic(db, callee_id) {
                         // Runtime lowering of `const_eval_select` calls its runtime-arm
@@ -8464,7 +8462,35 @@ fn scan_body_for_callees(
                                 }
                                 TyKind::FnDef(def, fn_args) => {
                                     if let CallableDefId::FunctionId(fn_id) = def.0 {
-                                        queue.push_back((fn_id, fn_args.store()));
+                                        let mut resolved_fn_id = fn_id;
+                                        let mut resolved_fn_args = fn_args;
+
+                                        if let ItemContainerId::TraitId(_) = fn_id.loc(db).container {
+                                            if hir_ty::method_resolution::is_dyn_method(
+                                                interner,
+                                                env.param_env(),
+                                                fn_id,
+                                                fn_args,
+                                            )
+                                            .is_none()
+                                            {
+                                                match db.lookup_impl_method(
+                                                    env.as_ref(),
+                                                    fn_id,
+                                                    fn_args,
+                                                ) {
+                                                    (Either::Left(impl_id), impl_args) => {
+                                                        resolved_fn_id = impl_id;
+                                                        resolved_fn_args = impl_args;
+                                                    }
+                                                    (Either::Right(_), _) => {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        queue.push_back((resolved_fn_id, resolved_fn_args.store()));
                                     }
                                     continue;
                                 }
