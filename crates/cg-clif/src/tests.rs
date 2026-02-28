@@ -3179,6 +3179,69 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails: formatting pipeline crashes when rendering Debug for Vec"]
+fn std_jit_format_debug_vec_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let rendered = format!("{:?}", vec![1_i32, 2, 3]);
+    (rendered == "[1, 2, 3]") as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: format! with named arguments crashes in std JIT"]
+fn std_jit_format_named_args_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let who = "world";
+    let rendered = format!("{greet}, {who}!", greet = "hello");
+    (rendered == "hello, world!") as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: write! macro formatting path crashes in std JIT"]
+fn std_jit_write_macro_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::fmt::Write;
+
+fn foo() -> i32 {
+    let mut out = String::new();
+    let ok = write!(&mut out, "{}:{}", 7_i32, 11_i32).is_ok();
+    (ok && out == "7:11") as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_to_string_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let s = 12345_i64.to_string();
+    ((s.len() == 5) && (s == "12345")) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn std_jit_vec_sort_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3360,6 +3423,125 @@ fn foo() -> i32 {
         Ok(guard) => (*guard == 42) as i32,
         Err(_) => 0,
     }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: GenericArgNotProvided while collecting std::thread::spawn drop glue"]
+fn std_jit_thread_spawn_join_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let handle = std::thread::spawn(|| 40_i32 + 2);
+    match handle.join() {
+        Ok(v) => (v == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_pathbuf_parent_file_name_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::path::PathBuf;
+
+fn foo() -> i32 {
+    let mut p = PathBuf::from("/tmp");
+    p.push("alpha");
+    p.push("beta.txt");
+
+    let parent_ok = p.parent().map(|q| q.ends_with("alpha")).unwrap_or(false);
+    let name_ok = p.file_name().map(|n| n == "beta.txt").unwrap_or(false);
+    (parent_ok && name_ok) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_cstring_bytes_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::ffi::CString;
+
+fn foo() -> i32 {
+    match CString::new("abc") {
+        Ok(s) => ((s.as_bytes().len() == 3) && (s.as_bytes()[1] == b'b')) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_io_cursor_read_write_seek_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+
+fn foo() -> i32 {
+    let mut cursor = Cursor::new(vec![0_u8; 4]);
+    if cursor.write_all(&[1_u8, 2, 3, 4]).is_err() {
+        return 0;
+    }
+    if cursor.seek(SeekFrom::Start(0)).is_err() {
+        return 0;
+    }
+    let mut out = [0_u8; 4];
+    if cursor.read_exact(&mut out).is_err() {
+        return 0;
+    }
+    ((out[0] == 1_u8) && (out[3] == 4_u8)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: HashMap::entry/or_insert path returns wrong value"]
+fn std_jit_hashmap_entry_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut map: std::collections::HashMap<&'static str, i32> = std::collections::HashMap::new();
+    *map.entry("k").or_insert(1) += 41;
+    match map.get("k") {
+        Some(v) => (*v == 42) as i32,
+        None => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_rc_weak_upgrade_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::rc::Rc;
+
+fn foo() -> i32 {
+    let strong = Rc::new(42_i32);
+    let weak = Rc::downgrade(&strong);
+    ((Rc::strong_count(&strong) == 1) && weak.upgrade().is_some()) as i32
 }
 "#,
         "foo",
@@ -4005,6 +4187,85 @@ fn foo() -> i32 {
 }
 
 #[test]
+#[ignore = "currently fails: enum drop glue does not drop active variant fields"]
+fn jit_enum_variant_field_drop_probe() {
+    let result: i32 = jit_run(
+        r#"
+static mut SLOT: *mut i32 = 0 as *mut i32;
+
+struct Bump;
+impl Drop for Bump {
+    fn drop(&mut self) {
+        unsafe {
+            if !SLOT.is_null() {
+                *SLOT += 1;
+            }
+        }
+    }
+}
+
+enum Wrap {
+    Hold(Bump),
+    Empty,
+}
+
+fn foo() -> i32 {
+    let mut dropped = 0_i32;
+    unsafe {
+        SLOT = &mut dropped;
+    }
+    {
+        let _value = Wrap::Hold(Bump);
+    }
+    dropped
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: reassigning enum values does not drop old variant fields"]
+fn jit_enum_reassign_drop_probe() {
+    let result: i32 = jit_run(
+        r#"
+static mut SLOT: *mut i32 = 0 as *mut i32;
+
+struct Bump;
+impl Drop for Bump {
+    fn drop(&mut self) {
+        unsafe {
+            if !SLOT.is_null() {
+                *SLOT += 1;
+            }
+        }
+    }
+}
+
+enum Wrap {
+    Hold(Bump),
+    Empty,
+}
+
+fn foo() -> i32 {
+    let mut dropped = 0_i32;
+    unsafe {
+        SLOT = &mut dropped;
+    }
+    let mut value = Wrap::Hold(Bump);
+    value = Wrap::Empty;
+    dropped
+}
+"#,
+        &["foo"],
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn jit_float_scalar_pair_const_probe() {
     let result: i32 = jit_run(
         r#"
@@ -4019,6 +4280,26 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 21);
+}
+
+#[test]
+fn jit_const_fn_pointer_smoke() {
+    let result: i32 = jit_run(
+        r#"
+fn add_one(x: i32) -> i32 {
+    x + 1
+}
+
+const FP: fn(i32) -> i32 = add_one;
+
+fn foo() -> i32 {
+    FP(41)
+}
+"#,
+        &["add_one", "foo"],
+        "foo",
+    );
+    assert_eq!(result, 42);
 }
 
 #[test]
@@ -4173,6 +4454,63 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 20);
+}
+
+#[test]
+#[ignore = "currently fails: std MIR lowering cannot resolve AtomicU128::fetch_add yet"]
+fn std_jit_atomic_u128_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::sync::atomic::{AtomicU128, Ordering};
+
+fn foo() -> i32 {
+    let x = AtomicU128::new(5_u128);
+    let prev = x.fetch_add(37_u128, Ordering::AcqRel);
+    ((prev == 5_u128) && (x.load(Ordering::Acquire) == 42_u128)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: std MIR lowering cannot resolve AtomicU128::compare_exchange yet"]
+fn std_jit_atomic_u128_compare_exchange_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::sync::atomic::{AtomicU128, Ordering};
+
+fn foo() -> i32 {
+    let x = AtomicU128::new(10_u128);
+    let exchanged = match x.compare_exchange(10_u128, 42_u128, Ordering::SeqCst, Ordering::Relaxed) {
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    (exchanged && x.load(Ordering::Acquire) == 42_u128) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "currently fails: std MIR lowering cannot resolve AtomicI128::fetch_sub yet"]
+fn std_jit_atomic_i128_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::sync::atomic::{AtomicI128, Ordering};
+
+fn foo() -> i32 {
+    let x = AtomicI128::new(100_i128);
+    let prev = x.fetch_sub(58_i128, Ordering::AcqRel);
+    ((prev == 100_i128) && (x.load(Ordering::Acquire) == 42_i128)) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
 }
 
 // ---------------------------------------------------------------------------
