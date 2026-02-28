@@ -2662,7 +2662,7 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
     let layout =
         db.layout_of_ty(static_ref_ty, fx.env().clone()).expect("layout error for static operand");
 
-    let ptr = if is_extern || !is_local_static {
+    let ptr = if is_extern {
         let data_id = fx
             .module
             .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
@@ -2670,34 +2670,46 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
         let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
         fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
     } else {
-        let data_id = fx
-            .module
-            .declare_data(&symbol_name, Linkage::Local, is_mutable, false)
-            .unwrap_or_else(|e| panic!("declare static `{symbol_name}` failed: {e}"));
+        let const_eval_result = db.const_eval_static(static_id);
+        if !is_local_static && const_eval_result.is_err() {
+            let data_id = fx
+                .module
+                .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
+                .unwrap_or_else(|e| {
+                    panic!("declare imported static `{symbol_name}` failed: {e}")
+                });
+            let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+            fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+        } else {
+            let data_id = fx
+                .module
+                .declare_data(&symbol_name, Linkage::Local, is_mutable, false)
+                .unwrap_or_else(|e| panic!("declare static `{symbol_name}` failed: {e}"));
 
-        match db.const_eval_static(static_id) {
-            Ok(konst) => {
-                let const_value = resolve_const_value(db, konst);
-                let mut data_desc = DataDescription::new();
-                data_desc.define(const_value.value.inner().memory.clone());
+            match const_eval_result {
+                Ok(konst) => {
+                    let const_value = resolve_const_value(db, konst);
+                    let mut data_desc = DataDescription::new();
+                    data_desc.define(const_value.value.inner().memory.clone());
 
-                let pointee_layout = db
-                    .layout_of_ty(static_pointee_ty(db, static_id).store(), fx.env().clone())
-                    .expect("layout error for static pointee");
-                data_desc.set_align(pointee_layout.align.abi.bytes());
+                    let pointee_layout = db
+                        .layout_of_ty(static_pointee_ty(db, static_id).store(), fx.env().clone())
+                        .expect("layout error for static pointee");
+                    data_desc.set_align(pointee_layout.align.abi.bytes());
 
-                match fx.module.define_data(data_id, &data_desc) {
-                    Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
-                    Err(e) => panic!("define static `{symbol_name}` failed: {e}"),
+                    match fx.module.define_data(data_id, &data_desc) {
+                        Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
+                        Err(e) => panic!("define static `{symbol_name}` failed: {e}"),
+                    }
+                }
+                Err(err) => {
+                    panic!("const_eval_static failed for local static `{symbol_name}`: {err:?}",);
                 }
             }
-            Err(err) => {
-                panic!("const_eval_static failed for local static `{symbol_name}`: {err:?}",);
-            }
-        }
 
-        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-        fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+            let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+            fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+        }
     };
 
     CValue::by_val(ptr, layout)
@@ -2886,10 +2898,10 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
         OperandKind::Copy(place) => codegen_place(fx, place).to_cvalue(fx),
         OperandKind::Move(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
-            // Clear drop flag: the value has been moved out.
-            if place.projection.lookup(&fx.ra_body().projection_store).is_empty() {
-                fx.clear_drop_flag(place.local);
-            }
+            // Clear drop flag on any move from this local. Our drop flags are
+            // tracked per-local (not per-field), so projected moves must also
+            // make the local non-droppable to avoid dropping moved-out fields.
+            fx.clear_drop_flag(place.local);
             val
         }
         OperandKind::Static(static_id) => codegen_static_operand(fx, *static_id),
@@ -7372,31 +7384,70 @@ fn collect_vtable_methods(
     target_ty: &StoredTy,
     local_crate: base_db::Crate,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
     drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
-    // Extract the trait from the target type
-    let Some(pointee_ty) = target_ty.as_ref().builtin_deref(true) else { return };
-    let Some(trait_id) = pointee_ty.dyn_trait() else { return };
-
     // Extract the concrete source type
     let from_ty = operand_ty(db, body, &operand.kind);
     let Some(source_pointee) = from_ty.as_ref().builtin_deref(true) else { return };
-    let source_pointee_stored = source_pointee.store();
+    let Some(target_pointee) = target_ty.as_ref().builtin_deref(true) else { return };
+    collect_unsize_metadata_dependencies(
+        db,
+        env,
+        local_crate,
+        source_pointee.store(),
+        target_pointee.store(),
+        queue,
+        closure_visited,
+        closure_result,
+        drop_types,
+    );
+}
 
-    // Vtable slot 0 references concrete `drop_in_place::<T>`, so discover and
-    // generate drop glue for unsized source pointees used in dyn coercions.
-    collect_drop_info(db, local_crate, &source_pointee_stored, queue, drop_types);
+fn collect_unsize_metadata_dependencies(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    local_crate: base_db::Crate,
+    source_pointee: StoredTy,
+    target_pointee: StoredTy,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
+) {
+    let (source_tail, target_tail) = lockstep_unsized_tails(db, source_pointee, target_pointee);
+    let Some(trait_id) = target_tail.as_ref().dyn_trait() else {
+        return;
+    };
 
-    // Add all trait method implementations to the queue
+    // dyn->dyn metadata propagation doesn't construct a concrete vtable.
+    if matches!(source_tail.as_ref().kind(), TyKind::Dynamic(..)) {
+        return;
+    }
+
+    if let TyKind::Closure(closure_id, closure_subst) = source_tail.as_ref().kind() {
+        let key = (closure_id.0, closure_subst.store());
+        if closure_visited.insert(key.clone()) {
+            closure_result.push(key);
+        }
+    }
+
+    // Slot 0 stores drop glue for the concrete source tail.
+    collect_drop_info(db, local_crate, &source_tail, queue, drop_types);
+
+    // Slots 3+ store trait method implementations.
     let trait_items = trait_id.trait_items(db);
     for (_trait_method_name, trait_item) in trait_items.items.iter() {
         let AssocItemId::FunctionId(trait_method_func_id) = trait_item else { continue };
-        let trait_method_subst = trait_method_substs_for_receiver(
-            db,
-            local_crate,
-            *trait_method_func_id,
-            &source_pointee_stored,
-        );
+        let trait_method_subst =
+            trait_method_substs_for_receiver(db, local_crate, *trait_method_func_id, &source_tail);
         if let (Either::Left(impl_func_id), impl_generic_args) =
             db.lookup_impl_method(env.as_ref(), *trait_method_func_id, trait_method_subst)
         {
@@ -7993,6 +8044,191 @@ fn collect_builtin_derive_method_dependencies(
     }
 }
 
+fn const_addr_points_to_alloc(memory_map: &hir_ty::MemoryMap<'_>, addr: usize) -> bool {
+    match memory_map {
+        hir_ty::MemoryMap::Empty => false,
+        hir_ty::MemoryMap::Simple(data) => addr <= data.len(),
+        hir_ty::MemoryMap::Complex(cm) => cm.memory_iter().any(|(base, bytes)| {
+            let Some(end) = base.checked_add(bytes.len()) else {
+                return false;
+            };
+            addr >= *base && addr <= end
+        }),
+    }
+}
+
+fn read_usize_le(bytes: &[u8], offset: usize) -> Option<usize> {
+    let ptr_size = std::mem::size_of::<usize>();
+    let end = offset.checked_add(ptr_size)?;
+    let raw = bytes.get(offset..end)?;
+    Some(match ptr_size {
+        8 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(raw);
+            u64::from_le_bytes(buf) as usize
+        }
+        4 => {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(raw);
+            u32::from_le_bytes(buf) as usize
+        }
+        _ => unreachable!("unsupported pointer width"),
+    })
+}
+
+fn enqueue_callable_from_mapped_ty(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    interner: DbInterner,
+    mapped_ty: hir_ty::next_solver::Ty<'_>,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+) {
+    match mapped_ty.kind() {
+        TyKind::FnDef(def, callee_args) => {
+            let CallableDefId::FunctionId(mut callee_id) = def.0 else {
+                return;
+            };
+            let mut resolved_args = callee_args;
+
+            if let ItemContainerId::TraitId(_) = callee_id.loc(db).container
+                && hir_ty::method_resolution::is_dyn_method(
+                    interner,
+                    env.param_env(),
+                    callee_id,
+                    callee_args,
+                )
+                .is_none()
+            {
+                match db.lookup_impl_method(env.as_ref(), callee_id, callee_args) {
+                    (Either::Left(impl_id), impl_args) => {
+                        callee_id = impl_id;
+                        resolved_args = impl_args;
+                    }
+                    (Either::Right(_), _) => return,
+                }
+            }
+
+            queue.push_back((callee_id, resolved_args.store()));
+        }
+        TyKind::Closure(closure_id, closure_subst) => {
+            let key = (closure_id.0, closure_subst.store());
+            if closure_visited.insert(key.clone()) {
+                closure_result.push(key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_const_operand_callables(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    interner: DbInterner,
+    operand: &Operand,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+) {
+    let OperandKind::Constant { konst, ty } = &operand.kind else {
+        return;
+    };
+    let Ok(layout) = db.layout_of_ty(ty.clone(), env.clone()) else {
+        return;
+    };
+    let value = resolve_const_value(db, konst.as_ref());
+    let const_bytes = value.value.inner();
+    let memory_map = &const_bytes.memory_map;
+
+    let mut maybe_collect = |offset: usize| {
+        let Some(addr) = read_usize_le(&const_bytes.memory, offset) else {
+            return;
+        };
+        if addr == 0 || const_addr_points_to_alloc(memory_map, addr) {
+            return;
+        }
+        let Ok(mapped_ty) = memory_map.vtable_ty(addr) else {
+            return;
+        };
+        enqueue_callable_from_mapped_ty(
+            db,
+            env,
+            interner,
+            mapped_ty,
+            queue,
+            closure_visited,
+            closure_result,
+        );
+    };
+
+    match &layout.backend_repr {
+        BackendRepr::Scalar(scalar) => {
+            if matches!(scalar.primitive(), Primitive::Pointer(_)) {
+                maybe_collect(0);
+            }
+        }
+        BackendRepr::ScalarPair(a, b) => {
+            if matches!(a.primitive(), Primitive::Pointer(_)) {
+                maybe_collect(0);
+            }
+            if matches!(b.primitive(), Primitive::Pointer(_)) {
+                maybe_collect(layout.fields.offset(1).bytes() as usize);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_const_rvalue_callables(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    interner: DbInterner,
+    rvalue: &Rvalue,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+) {
+    let mut collect_operand = |operand: &Operand| {
+        collect_const_operand_callables(
+            db,
+            env,
+            interner,
+            operand,
+            queue,
+            closure_visited,
+            closure_result,
+        );
+    };
+
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Repeat(operand, _)
+        | Rvalue::Cast(_, operand, _)
+        | Rvalue::UnaryOp(_, operand)
+        | Rvalue::ShallowInitBox(operand, _) => collect_operand(operand),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            collect_operand(lhs);
+            collect_operand(rhs);
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for operand in operands.iter() {
+                collect_operand(operand);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Scan a MIR body for callees (functions and closures) and push them onto
 /// the respective work queues.
 fn scan_body_for_callees(
@@ -8014,6 +8250,18 @@ fn scan_body_for_callees(
     for (_, bb) in body.basic_blocks.iter() {
         // Scan statements for coercions and closure constructions
         for stmt in &bb.statements {
+            if let StatementKind::Assign(_, rvalue) = &stmt.kind {
+                collect_const_rvalue_callables(
+                    db,
+                    env,
+                    interner,
+                    rvalue,
+                    queue,
+                    closure_visited,
+                    closure_result,
+                );
+            }
+
             match &stmt.kind {
                 StatementKind::Assign(_, Rvalue::Cast(cast_kind, operand, target_ty)) => {
                     match cast_kind {
@@ -8027,6 +8275,8 @@ fn scan_body_for_callees(
                                 target_ty,
                                 local_crate,
                                 queue,
+                                closure_visited,
+                                closure_result,
                                 drop_types,
                             );
                         }
@@ -8068,6 +8318,18 @@ fn scan_body_for_callees(
                                 }
                             }
                         }
+                        // ClosureFnPointer: non-capturing closure -> fn pointer.
+                        // The closure body is codegen'd as a standalone symbol.
+                        CastKind::PointerCoercion(PointerCast::ClosureFnPointer(_)) => {
+                            let from_ty = operand_ty(db, body, &operand.kind);
+                            if let TyKind::Closure(closure_id, closure_subst) = from_ty.as_ref().kind()
+                            {
+                                let key = (closure_id.0, closure_subst.store());
+                                if closure_visited.insert(key.clone()) {
+                                    closure_result.push(key);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -8086,7 +8348,55 @@ fn scan_body_for_callees(
 
         let Some(term) = &bb.terminator else { continue };
         match &term.kind {
-            TerminatorKind::Call { func, args, .. } => {
+            TerminatorKind::SwitchInt { discr, .. } => {
+                collect_const_operand_callables(
+                    db,
+                    env,
+                    interner,
+                    discr,
+                    queue,
+                    closure_visited,
+                    closure_result,
+                );
+            }
+            TerminatorKind::Assert { cond, .. } => {
+                collect_const_operand_callables(
+                    db,
+                    env,
+                    interner,
+                    cond,
+                    queue,
+                    closure_visited,
+                    closure_result,
+                );
+            }
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } => {
+                collect_const_operand_callables(
+                    db,
+                    env,
+                    interner,
+                    func,
+                    queue,
+                    closure_visited,
+                    closure_result,
+                );
+                for arg in args.iter() {
+                    collect_const_operand_callables(
+                        db,
+                        env,
+                        interner,
+                        arg,
+                        queue,
+                        closure_visited,
+                        closure_result,
+                    );
+                }
+
                 let OperandKind::Constant { ty, .. } = &func.kind else { continue };
                 let TyKind::FnDef(def, callee_args) = ty.as_ref().kind() else { continue };
                 if let CallableDefId::FunctionId(callee_id) = def.0 {
@@ -8103,6 +8413,15 @@ fn scan_body_for_callees(
                             {
                                 queue.push_back((runtime_func_id, runtime_args.store()));
                             }
+                        }
+                        continue;
+                    }
+
+                    let lang_items = hir_def::lang_item::lang_items(db, local_crate);
+                    if Some(callee_id) == lang_items.DropInPlace {
+                        if !callee_args.is_empty() {
+                            let pointee_ty = callee_args.type_at(0).store();
+                            collect_drop_info(db, local_crate, &pointee_ty, queue, drop_types);
                         }
                         continue;
                     }
@@ -8188,6 +8507,27 @@ fn scan_body_for_callees(
                         }
                     }
                     queue.push_back((resolved_id, resolved_args.store()));
+
+                    if let Some(source_return_ty) = callable_output_ty(db, resolved_id, resolved_args)
+                    {
+                        let dest_ty = place_ty(db, body, destination);
+                        if let (Some(src_pointee), Some(dest_pointee)) = (
+                            source_return_ty.as_ref().builtin_deref(true),
+                            dest_ty.as_ref().builtin_deref(true),
+                        ) {
+                            collect_unsize_metadata_dependencies(
+                                db,
+                                env,
+                                local_crate,
+                                src_pointee.store(),
+                                dest_pointee.store(),
+                                queue,
+                                closure_visited,
+                                closure_result,
+                                drop_types,
+                            );
+                        }
+                    }
                 }
             }
             TerminatorKind::Drop { place, .. } => {
@@ -8255,9 +8595,6 @@ pub fn compile_executable(
 
     // Compile reachable closure bodies
     for (closure_id, closure_subst) in &reachable_closures {
-        let body = db
-            .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-            .map_err(|e| format!("MIR error for closure: {:?}", e))?;
         let closure_name = symbol_mangling::mangle_closure(
             db,
             *closure_id,
@@ -8267,6 +8604,15 @@ pub fn compile_executable(
         if !compiled_closure_symbols.insert(closure_name.clone()) {
             continue;
         }
+        let body = match db.monomorphized_mir_body_for_closure(
+            *closure_id,
+            closure_subst.clone(),
+            env.clone(),
+        ) {
+            Ok(body) => body,
+            Err(hir_ty::mir::MirLowerError::UnresolvedName(_)) => continue,
+            Err(e) => return Err(format!("MIR error for closure {closure_name}: {e:?}")),
+        };
         compile_fn(
             &mut module,
             &*isa,

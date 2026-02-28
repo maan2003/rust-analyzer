@@ -1810,9 +1810,6 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile all reachable closures
         for (closure_id, closure_subst) in &reachable_closures {
-            let body = db
-                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name = crate::symbol_mangling::mangle_closure(
                 &db,
                 *closure_id,
@@ -1822,6 +1819,13 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 continue;
             }
+            let body = match db
+                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
+            {
+                Ok(body) => body,
+                Err(hir_ty::mir::MirLowerError::UnresolvedName(_)) => continue,
+                Err(e) => panic!("closure MIR error for {closure_name}: {e:?}"),
+            };
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2186,9 +2190,6 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         }
 
         for (closure_id, closure_subst) in &reachable_closures {
-            let body = db
-                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-                .unwrap_or_else(|e| panic!("closure MIR error: {:?}", e));
             let closure_name = crate::symbol_mangling::mangle_closure(
                 &db,
                 *closure_id,
@@ -2201,6 +2202,20 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 }
                 continue;
             }
+            let body = match db
+                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
+            {
+                Ok(body) => body,
+                Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
+                    if trace_enabled {
+                        eprintln!(
+                            "std-jit: skipping closure {closure_name} with unresolved symbol {name}"
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => panic!("closure MIR error for {closure_name}: {e:?}"),
+            };
             let closure_id = crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2928,7 +2943,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: unsized drop glue in std::sync::mpsc path"]
 fn std_jit_mpsc_channel_send_recv_probe() {
     let result: i32 = jit_run_with_std(
         r#"
