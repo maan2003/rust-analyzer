@@ -328,6 +328,7 @@ fn static_operand_ty(db: &dyn HirDatabase, static_id: StaticId) -> StoredTy {
 
 fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
     let mut ty = body.locals[place.local].ty.clone();
+    let local_crate = body.owner.krate(db);
     let projections = place.projection.lookup(&body.projection_store);
     for proj in projections {
         ty = match proj {
@@ -337,11 +338,25 @@ fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
             }
             ProjectionElem::Downcast(_) => ty, // Downcast doesn't change the Rust type
             ProjectionElem::ClosureField(idx) => closure_field_type(db, &ty, *idx),
-            ProjectionElem::Index(_) => match ty.as_ref().kind() {
-                TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
-                _ => panic!("Index on non-array/slice type"),
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                match ty.as_ref().kind() {
+                    TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
+                    _ => panic!("Index on non-array/slice type"),
+                }
+            }
+            ProjectionElem::Subslice { from, to } => match ty.as_ref().kind() {
+                TyKind::Array(elem, len) => {
+                    let new_len =
+                        try_const_usize(db, len).and_then(|n| n.checked_sub(u128::from(*from + *to)));
+                    let new_len_const = usize_const(db, new_len, local_crate);
+                    let interner = DbInterner::new_no_crate(db);
+                    hir_ty::next_solver::Ty::new_array_with_const_len(interner, elem, new_len_const)
+                        .store()
+                }
+                TyKind::Slice(_) | TyKind::Str => ty,
+                _ => panic!("Subslice projection on non-array/slice/str type"),
             },
-            _ => todo!("place_ty for {:?}", proj),
+            ProjectionElem::OpaqueCast(cast_ty) => cast_ty.clone(),
         };
     }
     ty
