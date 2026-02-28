@@ -540,10 +540,16 @@ impl ProjectWorkspace {
         config: &CargoConfig,
     ) -> anyhow::Result<ProjectWorkspace> {
         let dir = detached_file.parent();
-        let mut sysroot = match &config.sysroot {
-            Some(RustLibSource::Path(path)) => Sysroot::discover_rust_lib_src_dir(path.clone()),
-            Some(RustLibSource::Discover) => Sysroot::discover(dir, &config.extra_env),
-            None => Sysroot::empty(),
+        let mut sysroot = match (&config.sysroot, &config.sysroot_src) {
+            (Some(RustLibSource::Discover), None) => Sysroot::discover(dir, &config.extra_env),
+            (Some(RustLibSource::Discover), Some(sysroot_src)) => {
+                Sysroot::discover_with_src_override(dir, &config.extra_env, sysroot_src.clone())
+            }
+            (Some(RustLibSource::Path(path)), None) => Sysroot::discover_rust_lib_src_dir(path.clone()),
+            (Some(RustLibSource::Path(sysroot)), Some(sysroot_src)) => {
+                Sysroot::new(Some(sysroot.clone()), Some(sysroot_src.clone()))
+            }
+            (None, _) => Sysroot::empty(),
         };
 
         let config_file = CargoConfigFile::load(detached_file, &config.extra_env, &sysroot);

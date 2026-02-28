@@ -1941,6 +1941,22 @@ fn walk_rs_files(
     }
 }
 
+fn discover_rustc_sysroot_src_override() -> Option<vfs::AbsPathBuf> {
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if sysroot.is_empty() {
+        return None;
+    }
+    let src_root = std::path::PathBuf::from(sysroot).join("lib/rustlib/src/rust/library");
+    src_root.join("core/src/lib.rs").is_file().then(|| vfs::AbsPathBuf::assert_utf8(src_root))
+}
+
 /// Load sysroot crates through project-model's metadata-first flow (with stitched
 /// fallback), then attach detached user source as the local crate.
 fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_db::Crate) {
@@ -1956,6 +1972,7 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 
     let mut cargo_config = CargoConfig::default();
     cargo_config.sysroot = Some(RustLibSource::Discover);
+    cargo_config.sysroot_src = discover_rustc_sysroot_src_override();
 
     let mut workspace =
         ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
