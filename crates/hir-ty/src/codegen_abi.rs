@@ -130,6 +130,7 @@ impl<'a: 'db, 'db> TyAbiInterface<'a, CodegenCx<'a>> for AbiTy<'db> {
                 let field_ty = (*field_ty).get().instantiate(DbInterner::new_no_crate(cx.db), args);
                 cx.layout_of(field_ty).expect("field layout")
             }
+            TyKind::Array(elem_ty, _) => cx.layout_of(elem_ty).expect("array element layout"),
             TyKind::Tuple(tys) => {
                 let field_ty = tys.iter().nth(i).expect("tuple field index out of bounds");
                 cx.layout_of(field_ty).expect("tuple field layout")

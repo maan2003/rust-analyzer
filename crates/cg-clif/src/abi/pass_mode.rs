@@ -3,6 +3,7 @@
 use cranelift_codegen::ir::{
     AbiParam, ArgumentPurpose, MemFlags, StackSlotData, StackSlotKind, Value, types,
 };
+use cranelift_codegen::ir::InstBuilder;
 use cranelift_module::Module;
 use rac_abi::callconv::{ArgAttributes, ArgExtension, CastTarget, PassMode, Reg, RegKind};
 use rustc_abi::{BackendRepr, Size, TargetDataLayout};
@@ -262,7 +263,13 @@ pub(crate) fn adjust_arg_for_abi(
             let (a, b) = arg.load_scalar_pair(fx);
             vec![a, b]
         }
-        PassMode::Cast { ref cast, .. } => to_casted_value(fx, arg, cast),
+        PassMode::Cast { ref cast, pad_i32 } => {
+            let mut values = to_casted_value(fx, arg, cast);
+            if pad_i32 {
+                values.insert(0, fx.bcx.ins().iconst(types::I32, 0));
+            }
+            values
+        }
         PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
             if is_owned {
                 vec![arg.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type)]
