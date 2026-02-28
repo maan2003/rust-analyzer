@@ -1718,11 +1718,30 @@ fn place_operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, place: &Pl
     !type_is_copy_for_codegen(fx, &ty)
 }
 
+/// Drop-flag update policy for `OperandKind::Copy`.
+///
+/// We only clear when ownership transfer is proven (`Some(non-Copy)`), and do
+/// not clear on unresolved projection typing. This avoids spuriously skipping
+/// required drops (e.g. guard writeback paths) on ambiguous projection forms.
+fn copy_operand_consumes_ownership_for_drop_flag(
+    fx: &FunctionCx<'_, impl Module>,
+    place: &Place,
+) -> bool {
+    if !place.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+        return false;
+    }
+    let Some(ty) = place_ty_for_ownership(fx.db(), fx.ra_body(), place) else {
+        return false;
+    };
+    !type_is_copy_for_codegen(fx, &ty)
+}
+
 fn operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, kind: &OperandKind) -> bool {
     match kind {
-        OperandKind::Move(place) | OperandKind::Copy(place) => {
-            place_operand_consumes_ownership(fx, place)
-        }
+        // For ABI argument lowering, preserve upstream cg_clif behavior:
+        // syntactic `Move` passes ownership of the backing storage.
+        OperandKind::Move(_) => true,
+        OperandKind::Copy(place) => place_operand_consumes_ownership(fx, place),
         OperandKind::Constant { .. } | OperandKind::Static(_) => false,
     }
 }
@@ -3038,23 +3057,19 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
         }
         OperandKind::Copy(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
-            // r-a MIR can occasionally encode a by-value use of a non-`Copy`
-            // place as `OperandKind::Copy`. Treat this as ownership transfer,
-            // matching `Move` semantics for our per-local drop flags.
-            if place_operand_consumes_ownership(fx, place) {
+            if copy_operand_consumes_ownership_for_drop_flag(fx, place) {
                 fx.clear_drop_flag(place.local);
             }
             val
         }
         OperandKind::Move(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
-            // Apply the same type-based ownership rule as `OperandKind::Copy`.
-            // This keeps drop-flag updates and ABI lowering consistent for
-            // `Move` operands of Copy projections.
-            if place_operand_consumes_ownership(fx, place) {
-                // Drop flags are tracked per-local (not per-field), so projected
-                // moves of non-Copy fields conservatively make the whole local
-                // non-droppable to avoid use-after-move drops.
+            // Whole-local moves always consume ownership for drop-flag purposes.
+            // For projected moves, use type-based classification to avoid
+            // spuriously killing drops on moved Copy subfields.
+            let projection_is_empty =
+                place.projection.lookup(&fx.ra_body().projection_store).is_empty();
+            if projection_is_empty || place_operand_consumes_ownership(fx, place) {
                 fx.clear_drop_flag(place.local);
             }
             val
