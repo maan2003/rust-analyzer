@@ -367,6 +367,64 @@ fn unsized_tail_ty(db: &dyn HirDatabase, mut ty: StoredTy) -> StoredTy {
     }
 }
 
+/// Walk source/target types together to the structural unsized tail.
+///
+/// This mirrors rustc's lockstep-tail behavior for unsizing:
+/// `S<[T; N]> -> S<[T]>` yields `[T; N] -> [T]`, while `T -> dyn Trait`
+/// remains unchanged.
+fn lockstep_unsized_tails(
+    db: &dyn HirDatabase,
+    mut source_ty: StoredTy,
+    mut target_ty: StoredTy,
+) -> (StoredTy, StoredTy) {
+    loop {
+        let interner = DbInterner::new_no_crate(db);
+        match (source_ty.as_ref().kind(), target_ty.as_ref().kind()) {
+            (TyKind::Adt(source_adt, source_args), TyKind::Adt(target_adt, target_args))
+                if source_adt.inner().id == target_adt.inner().id =>
+            {
+                let hir_def::AdtId::StructId(source_struct_id) = source_adt.inner().id else {
+                    return (source_ty, target_ty);
+                };
+                let hir_def::AdtId::StructId(target_struct_id) = target_adt.inner().id else {
+                    return (source_ty, target_ty);
+                };
+                let source_fields = db.field_types(source_struct_id.into());
+                let target_fields = db.field_types(target_struct_id.into());
+                let (Some((_, source_field_ty)), Some((_, target_field_ty))) =
+                    (source_fields.iter().last(), target_fields.iter().last())
+                else {
+                    return (source_ty, target_ty);
+                };
+                let next_source = source_field_ty.get().instantiate(interner, source_args).store();
+                let next_target = target_field_ty.get().instantiate(interner, target_args).store();
+                if next_source == source_ty && next_target == target_ty {
+                    return (source_ty, target_ty);
+                }
+                source_ty = next_source;
+                target_ty = next_target;
+            }
+            (TyKind::Tuple(source_tys), TyKind::Tuple(target_tys))
+                if source_tys.len() == target_tys.len() =>
+            {
+                let (Some(source_last), Some(target_last)) =
+                    (source_tys.as_slice().last(), target_tys.as_slice().last())
+                else {
+                    return (source_ty, target_ty);
+                };
+                let next_source = source_last.store();
+                let next_target = target_last.store();
+                if next_source == source_ty && next_target == target_ty {
+                    return (source_ty, target_ty);
+                }
+                source_ty = next_source;
+                target_ty = next_target;
+            }
+            _ => return (source_ty, target_ty),
+        }
+    }
+}
+
 /// Compute runtime size/alignment for a potentially-DST pointee type.
 ///
 /// Mirrors upstream cg_clif's `unsize::size_and_align_of` behavior for
@@ -865,6 +923,56 @@ pub(crate) fn clif_bitcast(
     if src_ty == dst_ty { val } else { fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), val) }
 }
 
+fn unsize_metadata_for_pointees(
+    fx: &mut FunctionCx<'_, impl Module>,
+    source_pointee: StoredTy,
+    target_pointee: StoredTy,
+    from_meta: Option<Value>,
+) -> Value {
+    // Follow source/target in lockstep so we only peel matching wrappers.
+    let (source_tail, target_tail) =
+        lockstep_unsized_tails(fx.db(), source_pointee.clone(), target_pointee.clone());
+
+    match target_tail.as_ref().kind() {
+        TyKind::Dynamic(..) => match source_tail.as_ref().kind() {
+            TyKind::Dynamic(..) => {
+                from_meta.expect("dyn unsize from wide source requires metadata")
+            }
+            _ => {
+                let trait_id = target_tail
+                    .as_ref()
+                    .dyn_trait()
+                    .expect("dyn unsize target pointee must have a principal trait");
+                get_or_create_vtable(fx, source_tail, trait_id)
+            }
+        },
+        TyKind::Slice(_) | TyKind::Str => match source_tail.as_ref().kind() {
+            TyKind::Array(_, len) => {
+                let len = try_const_usize(fx.db(), len)
+                    .expect("array->slice unsize requires monomorphic array length")
+                    as i64;
+                fx.bcx.ins().iconst(fx.pointer_type, len)
+            }
+            TyKind::Slice(_) | TyKind::Str => {
+                from_meta.expect("slice/str unsize from wide source requires metadata")
+            }
+            _ => panic!(
+                "unsupported unsize to slice/str: source tail kind {:?} (source pointee {:?}, target pointee {:?})",
+                source_tail.as_ref().kind(),
+                source_pointee.as_ref().kind(),
+                target_pointee.as_ref().kind(),
+            ),
+        },
+        _ => panic!(
+            "unsupported unsize target tail kind {:?} (source tail {:?}, source pointee {:?}, target pointee {:?})",
+            target_tail.as_ref().kind(),
+            source_tail.as_ref().kind(),
+            source_pointee.as_ref().kind(),
+            target_pointee.as_ref().kind(),
+        ),
+    }
+}
+
 /// Handle `PointerCoercion(Unsize)`.
 ///
 /// Produces a fat pointer `(data_ptr, metadata)` for:
@@ -897,40 +1005,12 @@ fn codegen_unsize_coercion(
         .as_ref()
         .builtin_deref(true)
         .expect("Unsize source must be a pointer/reference type");
-
-    let metadata = match target_pointee.kind() {
-        TyKind::Dynamic(..) => match source_pointee.kind() {
-            TyKind::Dynamic(..) => {
-                from_meta.expect("dyn unsize from wide source requires metadata")
-            }
-            _ => {
-                let trait_id = target_pointee
-                    .dyn_trait()
-                    .expect("dyn unsize target pointee must have a principal trait");
-                get_or_create_vtable(fx, source_pointee.store(), trait_id)
-            }
-        },
-        TyKind::Slice(_) | TyKind::Str => match source_pointee.kind() {
-            TyKind::Array(_, len) => {
-                let len = try_const_usize(fx.db(), len)
-                    .expect("array->slice unsize requires monomorphic array length")
-                    as i64;
-                fx.bcx.ins().iconst(fx.pointer_type, len)
-            }
-            TyKind::Slice(_) | TyKind::Str => {
-                from_meta.expect("slice/str unsize from wide source requires metadata")
-            }
-            _ => panic!(
-                "unsupported unsize to slice/str: source pointee kind {:?}",
-                source_pointee.kind()
-            ),
-        },
-        _ => panic!(
-            "unsupported unsize target pointee kind {:?} (source {:?})",
-            target_pointee.kind(),
-            source_pointee.kind()
-        ),
-    };
+    let metadata = unsize_metadata_for_pointees(
+        fx,
+        source_pointee.store(),
+        target_pointee.store(),
+        from_meta,
+    );
 
     match result_layout.backend_repr {
         BackendRepr::ScalarPair(_, _) => {
@@ -3105,26 +3185,7 @@ fn call_result_unsize_metadata(
         panic!("call destination for unsize return is not a pointer: {:?}", dest_ty);
     };
 
-    match dest_pointee.kind() {
-        TyKind::Dynamic(..) => {
-            let dyn_trait_id = dest_pointee
-                .dyn_trait()
-                .expect("dyn destination pointer must have principal trait");
-            get_or_create_vtable(fx, src_pointee.store(), dyn_trait_id)
-        }
-        TyKind::Slice(_) | TyKind::Str => match src_pointee.kind() {
-            TyKind::Array(_, len) => {
-                let len = try_const_usize(fx.db(), len)
-                    .expect("array->slice return requires monomorphic length")
-                    as i64;
-                fx.bcx.ins().iconst(fx.pointer_type, len)
-            }
-            _ => {
-                panic!("unsupported call return unsize to slice/str from {:?}", src_pointee.kind())
-            }
-        },
-        _ => panic!("unsupported call return unsize destination kind: {:?}", dest_pointee.kind()),
-    }
+    unsize_metadata_for_pointees(fx, src_pointee.store(), dest_pointee.store(), None)
 }
 
 /// Prepare a call result `CValue` for the destination place.
