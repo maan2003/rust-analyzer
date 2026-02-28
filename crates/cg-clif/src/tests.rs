@@ -2950,6 +2950,29 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_derive_default_enum_uses_default_variant() {
+    let result: i32 = jit_run_with_std(
+        r#"
+#[derive(Default)]
+enum Choice {
+    Left(i32),
+    #[default]
+    Right(i32),
+}
+
+fn foo() -> i32 {
+    match Choice::default() {
+        Choice::Left(_) => 0,
+        Choice::Right(value) => (value == 0) as i32,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn std_jit_fs_write_read_remove_probe() {
     let result: i32 = jit_run_with_std(
         r#"
