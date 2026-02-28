@@ -3221,6 +3221,18 @@ struct CallArgument {
     is_owned: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallOperandLowering {
+    Standard,
+    RustCall,
+}
+
+impl CallOperandLowering {
+    fn from_rust_call_abi(is_rust_call_abi: bool) -> Self {
+        if is_rust_call_abi { Self::RustCall } else { Self::Standard }
+    }
+}
+
 fn codegen_call_argument_operand(
     fx: &mut FunctionCx<'_, impl Module>,
     operand: &Operand,
@@ -3301,6 +3313,20 @@ fn lower_rust_call_operands_for_abi(
         args.len(),
     );
     lowered
+}
+
+fn lower_call_operands_with_lowering(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+    arg_abis: &[abi::ArgAbi],
+    operand_lowering: CallOperandLowering,
+) -> Vec<CallArgument> {
+    match operand_lowering {
+        CallOperandLowering::Standard => lower_call_operands_for_abi(fx, args),
+        CallOperandLowering::RustCall => {
+            lower_rust_call_operands_for_abi(fx, args, arg_abis.len())
+        }
+    }
 }
 
 fn append_lowered_call_args(
@@ -3677,6 +3703,7 @@ fn codegen_call(
                         fx,
                         callee_func_id,
                         generic_args,
+                        CallOperandLowering::Standard,
                         args,
                         destination,
                         target,
@@ -3705,11 +3732,13 @@ fn codegen_call(
             }
         }
         TyKind::FnPtr(sig_tys, header) => {
+            let fn_ptr_is_rust_call_abi = matches!(header.abi, hir_ty::FnAbi::RustCall);
             codegen_fn_ptr_call(
                 fx,
                 func,
                 &sig_tys,
-                matches!(header.abi, hir_ty::FnAbi::RustCall),
+                fn_ptr_is_rust_call_abi,
+                CallOperandLowering::from_rust_call_abi(fn_ptr_is_rust_call_abi),
                 header.c_variadic,
                 args,
                 destination,
@@ -3758,7 +3787,8 @@ fn codegen_fn_ptr_call(
     fx: &mut FunctionCx<'_, impl Module>,
     func_operand: &Operand,
     sig_tys: &rustc_type_ir::Binder<DbInterner, rustc_type_ir::FnSigTys<DbInterner>>,
-    is_rust_call_abi: bool,
+    fn_ptr_is_rust_call_abi: bool,
+    operand_lowering: CallOperandLowering,
     c_variadic: bool,
     args: &[Operand],
     destination: &Place,
@@ -3779,7 +3809,7 @@ fn codegen_fn_ptr_call(
         fx.dl,
         fx.env(),
         sig_tys,
-        is_rust_call_abi,
+        fn_ptr_is_rust_call_abi,
         c_variadic,
     )
     .expect("fn pointer ABI");
@@ -3804,11 +3834,8 @@ fn codegen_fn_ptr_call(
         None
     };
 
-    let lowered_args = if is_rust_call_abi {
-        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
-    } else {
-        lower_call_operands_for_abi(fx, args)
-    };
+    let lowered_args =
+        lower_call_operands_with_lowering(fx, args, &callee_abi.args, operand_lowering);
     append_lowered_call_args(
         fx,
         &mut call_args,
@@ -3849,7 +3876,7 @@ fn codegen_closure_call(
     fx: &mut FunctionCx<'_, impl Module>,
     closure_id: hir_ty::db::InternedClosureId,
     closure_subst: StoredGenericArgs,
-    is_rust_call_abi: bool,
+    operand_lowering: CallOperandLowering,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -3878,11 +3905,8 @@ fn codegen_closure_call(
         .expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
-    let lowered_args = if is_rust_call_abi {
-        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
-    } else {
-        lower_call_operands_for_abi(fx, args)
-    };
+    let lowered_args =
+        lower_call_operands_with_lowering(fx, args, &callee_abi.args, operand_lowering);
 
     assert!(!lowered_args.is_empty(), "closure call is missing receiver argument");
 
@@ -5170,6 +5194,7 @@ fn codegen_direct_call(
     fx: &mut FunctionCx<'_, impl Module>,
     callee_func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
+    call_operand_lowering: CallOperandLowering,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -5352,7 +5377,7 @@ fn codegen_direct_call(
                                 fx,
                                 closure_id.0,
                                 closure_subst.store(),
-                                trait_method_is_rust_call,
+                                CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
                                 args,
                                 destination,
                                 target,
@@ -5365,6 +5390,7 @@ fn codegen_direct_call(
                                     fx,
                                     fn_id,
                                     fn_args,
+                                    CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
                                     args.get(1..).unwrap_or(&[]),
                                     destination,
                                     target,
@@ -5395,11 +5421,19 @@ fn codegen_direct_call(
                             }
                         },
                         TyKind::FnPtr(sig_tys, header) if !args.is_empty() => {
+                            let fn_ptr_is_rust_call_abi =
+                                matches!(header.abi, hir_ty::FnAbi::RustCall);
+                            let operand_lowering = if trait_method_is_rust_call {
+                                CallOperandLowering::RustCall
+                            } else {
+                                CallOperandLowering::from_rust_call_abi(fn_ptr_is_rust_call_abi)
+                            };
                             codegen_fn_ptr_call(
                                 fx,
                                 &args[0],
                                 &sig_tys,
-                                matches!(header.abi, hir_ty::FnAbi::RustCall),
+                                fn_ptr_is_rust_call_abi,
+                                operand_lowering,
                                 header.c_variadic,
                                 args.get(1..).unwrap_or(&[]),
                                 destination,
@@ -5467,8 +5501,13 @@ fn codegen_direct_call(
             (callee_func_id, generic_args.store())
         };
 
-    let is_rust_call_abi =
+    let callee_is_rust_call_abi =
         fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let operand_lowering = if callee_is_rust_call_abi {
+        CallOperandLowering::RustCall
+    } else {
+        call_operand_lowering
+    };
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args.as_ref());
     // Check if this is an extern function (no MIR available)
     let is_extern =
@@ -5557,11 +5596,8 @@ fn codegen_direct_call(
         None
     };
 
-    let lowered_args = if is_rust_call_abi {
-        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
-    } else {
-        lower_call_operands_for_abi(fx, args)
-    };
+    let lowered_args =
+        lower_call_operands_with_lowering(fx, args, &callee_abi.args, operand_lowering);
     append_lowered_call_args(
         fx,
         &mut call_args,
@@ -5641,6 +5677,7 @@ fn codegen_virtual_call(
 
     let is_rust_call_abi =
         fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let operand_lowering = CallOperandLowering::from_rust_call_abi(is_rust_call_abi);
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args);
     let expected_abi = abi::fn_abi_for_fn_item_from_ty(
         fx.isa,
@@ -5674,11 +5711,8 @@ fn codegen_virtual_call(
             expected_abi_sig.params.remove(receiver_param_idx + 1);
         }
     }
-    let lowered_args = if is_rust_call_abi {
-        lower_rust_call_operands_for_abi(fx, args, expected_abi.args.len())
-    } else {
-        lower_call_operands_for_abi(fx, args)
-    };
+    let lowered_args =
+        lower_call_operands_with_lowering(fx, args, &expected_abi.args, operand_lowering);
     let self_arg = lowered_args.first().expect("virtual call requires receiver argument");
     assert!(
         !expected_abi.args.is_empty(),
