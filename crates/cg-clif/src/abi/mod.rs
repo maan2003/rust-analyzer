@@ -10,6 +10,7 @@ use hir_ty::db::HirDatabase;
 use hir_ty::mir::MirBody;
 use hir_ty::next_solver::{DbInterner, GenericArgs, IntoKind, StoredTy, TyKind};
 use hir_ty::traits::StoredParamEnvAndCrate;
+use intern::sym;
 use rac_abi::callconv::{ArgAttributes, PassMode};
 use rustc_abi::{BackendRepr, TargetDataLayout};
 
@@ -90,6 +91,16 @@ fn fn_abi_from_arg_and_ret_tys(
     Ok(fn_abi)
 }
 
+fn flatten_rust_call_arg_tys(arg_tys: &mut Vec<StoredTy>) {
+    if let Some((packed_tuple_ty, prefix_tys)) = arg_tys.split_last()
+        && let TyKind::Tuple(tuple_fields) = packed_tuple_ty.as_ref().kind()
+    {
+        let mut flattened = prefix_tys.to_vec();
+        flattened.extend(tuple_fields.iter().map(|field_ty| field_ty.store()));
+        *arg_tys = flattened;
+    }
+}
+
 pub(crate) fn fn_abi_for_body(
     isa: &dyn TargetIsa,
     db: &dyn HirDatabase,
@@ -125,8 +136,13 @@ pub(crate) fn fn_abi_for_fn_item_from_ty(
         let output = *fn_sig.inputs_and_output.as_slice().split_last().unwrap().0;
         (!output.is_never()).then(|| output.store())
     };
-    let arg_tys = fn_sig.inputs_and_output.inputs().iter().map(|ty| ty.store()).collect::<Vec<_>>();
-    let c_variadic = db.function_signature(func_id).is_varargs();
+    let mut arg_tys = fn_sig.inputs_and_output.inputs().iter().map(|ty| ty.store()).collect::<Vec<_>>();
+    let fn_sig_data = db.function_signature(func_id);
+    let c_variadic = fn_sig_data.is_varargs();
+    let is_rust_call_abi = fn_sig_data.abi == Some(sym::rust_dash_call);
+    if is_rust_call_abi {
+        flatten_rust_call_arg_tys(&mut arg_tys);
+    }
     fn_abi_from_arg_and_ret_tys(isa, db, dl, env, &arg_tys, ret_ty, c_variadic)
 }
 
@@ -148,13 +164,7 @@ pub(crate) fn fn_abi_for_fn_ptr(
 
     let mut arg_tys = sig_tys_inner.inputs().iter().map(|ty| ty.store()).collect::<Vec<_>>();
     if is_rust_call_abi {
-        if let Some((packed_tuple_ty, prefix_tys)) = arg_tys.split_last() {
-            if let TyKind::Tuple(tuple_fields) = packed_tuple_ty.as_ref().kind() {
-                let mut flattened = prefix_tys.to_vec();
-                flattened.extend(tuple_fields.iter().map(|field_ty| field_ty.store()));
-                arg_tys = flattened;
-            }
-        }
+        flatten_rust_call_arg_tys(&mut arg_tys);
     }
 
     fn_abi_from_arg_and_ret_tys(isa, db, dl, env, &arg_tys, ret_ty, c_variadic)

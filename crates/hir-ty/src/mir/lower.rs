@@ -16,6 +16,7 @@ use hir_def::{
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
 };
 use hir_expand::name::Name;
+use intern::sym;
 use la_arena::ArenaMap;
 use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
@@ -715,6 +716,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Call { callee, args, .. } => {
                 if let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id) {
+                    let rust_call_input_count = self.rust_call_input_count_for_fn_item(func_id);
                     let ty = Ty::new_fn_def(
                         self.interner(),
                         CallableDefId::FunctionId(func_id).into(),
@@ -724,6 +726,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     return self.lower_call_and_args(
                         func,
                         iter::once(*callee).chain(args.iter().copied()),
+                        rust_call_input_count,
                         place,
                         current,
                         self.is_uninhabited(expr_id),
@@ -771,6 +774,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.lower_call_and_args(
                             func,
                             args.iter().copied(),
+                            None,
                             place,
                             current,
                             self.is_uninhabited(expr_id),
@@ -786,6 +790,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.lower_call_and_args(
                             func,
                             args.iter().copied(),
+                            None,
                             place,
                             current,
                             self.is_uninhabited(expr_id),
@@ -814,6 +819,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.lower_call_and_args(
                     func,
                     iter::once(*receiver).chain(args.iter().copied()),
+                    None,
                     place,
                     current,
                     self.is_uninhabited(expr_id),
@@ -1198,6 +1204,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     return self.lower_call_and_args(
                         func,
                         [*lhs, *rhs].into_iter(),
+                        None,
                         place,
                         current,
                         self.is_uninhabited(expr_id),
@@ -1737,12 +1744,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         &mut self,
         func: Operand,
         args: impl Iterator<Item = ExprId>,
+        rust_call_input_count: Option<usize>,
         place: Place,
         mut current: BasicBlockId,
         is_uninhabited: bool,
         span: MirSpan,
     ) -> Result<'db, Option<BasicBlockId>> {
-        let Some(args) = args
+        let arg_exprs = args.collect::<Vec<_>>();
+        let Some(mut args) = arg_exprs
+            .iter()
+            .copied()
             .map(|arg| {
                 if let Some((temp, c)) = self.lower_expr_to_some_operand(arg, current)? {
                     current = c;
@@ -1755,7 +1766,74 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
+        if let Some(rust_call_input_count) = rust_call_input_count {
+            args = self.canonicalize_rust_call_args(
+                args,
+                &arg_exprs,
+                rust_call_input_count,
+                current,
+                span,
+            )?;
+        }
         self.lower_call(func, args.into(), place, current, is_uninhabited, span)
+    }
+
+    fn canonicalize_rust_call_args(
+        &mut self,
+        mut args: Vec<Operand>,
+        arg_exprs: &[ExprId],
+        rust_call_input_count: usize,
+        current: BasicBlockId,
+        span: MirSpan,
+    ) -> Result<'db, Vec<Operand>> {
+        let Some(leading_arg_count) = rust_call_input_count.checked_sub(1) else {
+            return Err(MirLowerError::TypeError("rust-call ABI requires tuple argument"));
+        };
+
+        let has_packed_tuple_tail = args.len() == rust_call_input_count
+            && arg_exprs.get(leading_arg_count).is_some_and(|expr_id| {
+                matches!(self.expr_ty_after_adjustments(*expr_id).kind(), TyKind::Tuple(_))
+            });
+        if has_packed_tuple_tail {
+            return Ok(args);
+        }
+
+        if args.len() < leading_arg_count {
+            return Err(MirLowerError::TypeError("rust-call call has too few arguments"));
+        }
+
+        let tuple_field_tys = arg_exprs[leading_arg_count..]
+            .iter()
+            .map(|&expr_id| self.expr_ty_after_adjustments(expr_id))
+            .collect::<Vec<_>>();
+        let tuple_ty = Ty::new_tup(self.interner(), &tuple_field_tys);
+        let tuple_ty_stored = tuple_ty.store();
+        let tuple_fields = args.split_off(leading_arg_count);
+
+        let tuple_local = self.temp(tuple_ty, current, span)?;
+        let tuple_place: Place = tuple_local.into();
+        self.push_assignment(
+            current,
+            tuple_place,
+            Rvalue::Aggregate(AggregateKind::Tuple(tuple_ty_stored), tuple_fields.into_boxed_slice()),
+            span,
+        );
+        args.push(Operand { kind: OperandKind::Move(tuple_place), span: Some(span) });
+
+        debug_assert_eq!(args.len(), rust_call_input_count);
+        Ok(args)
+    }
+
+    fn rust_call_input_count_for_fn_item(&self, func_id: hir_def::FunctionId) -> Option<usize> {
+        (self.db.function_signature(func_id).abi == Some(sym::rust_dash_call)).then(|| {
+            self.db
+                .callable_item_signature(func_id.into())
+                .skip_binder()
+                .skip_binder()
+                .inputs_and_output
+                .inputs()
+                .len()
+        })
     }
 
     fn lower_call(

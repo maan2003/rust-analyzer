@@ -3234,18 +3234,20 @@ fn codegen_call_argument_operand(
 fn lower_call_operands_for_abi(
     fx: &mut FunctionCx<'_, impl Module>,
     args: &[Operand],
-    flatten_rust_call_tuple: bool,
 ) -> Vec<CallArgument> {
-    if !flatten_rust_call_tuple {
-        return args.iter().map(|arg| codegen_call_argument_operand(fx, arg)).collect();
-    }
+    args.iter().map(|arg| codegen_call_argument_operand(fx, arg)).collect()
+}
 
+fn lower_rust_call_tuple_operands_for_abi(
+    fx: &mut FunctionCx<'_, impl Module>,
+    args: &[Operand],
+) -> Vec<CallArgument> {
     let (tuple_operand, prefix_operands) =
-        args.split_last().expect("rust-call tuple flattening requires at least one argument");
+        args.split_last().expect("rust-call tuple lowering requires at least one argument");
 
     let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_operand.kind);
     let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
-        panic!("rust-call tuple flattening expected final tuple argument, got {tuple_ty:?}");
+        panic!("rust-call tuple lowering expected final tuple argument, got {tuple_ty:?}");
     };
 
     let mut lowered = prefix_operands
@@ -3276,79 +3278,29 @@ fn lower_call_operands_for_abi(
     lowered
 }
 
-fn call_operand_abi_types(fx: &mut FunctionCx<'_, impl Module>, operand: &Operand) -> Vec<Type> {
-    let layout = fx
-        .db()
-        .layout_of_ty(operand_ty(fx.db(), fx.ra_body(), &operand.kind), fx.env().clone())
-        .expect("call operand layout");
-
-    if layout.is_zst() {
-        Vec::new()
-    } else {
-        match layout.backend_repr {
-            BackendRepr::Scalar(scalar) => vec![scalar_to_clif_type(fx.dl, &scalar)],
-            BackendRepr::ScalarPair(a, b) => {
-                vec![scalar_to_clif_type(fx.dl, &a), scalar_to_clif_type(fx.dl, &b)]
-            }
-            _ => vec![fx.pointer_type],
-        }
-    }
-}
-
-fn flattened_rust_call_operand_abi_types(
+fn lower_rust_call_operands_for_abi(
     fx: &mut FunctionCx<'_, impl Module>,
     args: &[Operand],
-) -> Option<Vec<Type>> {
-    let (tuple_operand, prefix_operands) = args.split_last()?;
-    let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_operand.kind);
-    let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
-        return None;
-    };
-
-    let mut result = prefix_operands
-        .iter()
-        .flat_map(|operand| call_operand_abi_types(fx, operand).into_iter())
-        .collect::<Vec<_>>();
-    for field_ty in tuple_fields.iter() {
-        let field_layout = fx
-            .db()
-            .layout_of_ty(field_ty.store(), fx.env().clone())
-            .expect("rust-call tuple field layout");
-        if field_layout.is_zst() {
-            continue;
-        }
-        match field_layout.backend_repr {
-            BackendRepr::Scalar(scalar) => result.push(scalar_to_clif_type(fx.dl, &scalar)),
-            BackendRepr::ScalarPair(a, b) => {
-                result.push(scalar_to_clif_type(fx.dl, &a));
-                result.push(scalar_to_clif_type(fx.dl, &b));
-            }
-            _ => result.push(fx.pointer_type),
-        }
-    }
-    Some(result)
-}
-
-fn should_flatten_rust_call_args_for_signature(
-    fx: &mut FunctionCx<'_, impl Module>,
-    args: &[Operand],
-    callee_sig: &Signature,
-) -> bool {
-    let expected = callee_sig
-        .params
-        .iter()
-        .filter(|param| param.purpose != ArgumentPurpose::StructReturn)
-        .map(|param| param.value_type)
-        .collect::<Vec<_>>();
-    let plain = args
-        .iter()
-        .flat_map(|operand| call_operand_abi_types(fx, operand).into_iter())
-        .collect::<Vec<_>>();
-    if plain == expected {
-        return false;
+    expected_arg_count: usize,
+) -> Vec<CallArgument> {
+    if !matches!(args, [_] | [_, _]) {
+        panic!(
+            "rust-call ABI requires one or two operands (self + tuple), got {}",
+            args.len(),
+        );
     }
 
-    flattened_rust_call_operand_abi_types(fx, args).is_some_and(|flattened| flattened == expected)
+    let lowered = lower_rust_call_tuple_operands_for_abi(fx, args);
+
+    assert_eq!(
+        lowered.len(),
+        expected_arg_count,
+        "rust-call argument count mismatch after tuple lowering: lowered={} expected={} args_len={}",
+        lowered.len(),
+        expected_arg_count,
+        args.len(),
+    );
+    lowered
 }
 
 fn append_lowered_call_args(
@@ -3838,8 +3790,6 @@ fn codegen_fn_ptr_call(
         PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
     );
 
-    let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
     let sig_ref = fx.bcx.import_signature(callee_abi.sig.clone());
 
     // Build argument values
@@ -3854,7 +3804,11 @@ fn codegen_fn_ptr_call(
         None
     };
 
-    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    let lowered_args = if is_rust_call_abi {
+        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
+    } else {
+        lower_call_operands_for_abi(fx, args)
+    };
     append_lowered_call_args(
         fx,
         &mut call_args,
@@ -3924,9 +3878,11 @@ fn codegen_closure_call(
         .expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
-    let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
-    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    let lowered_args = if is_rust_call_abi {
+        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
+    } else {
+        lower_call_operands_for_abi(fx, args)
+    };
 
     assert!(!lowered_args.is_empty(), "closure call is missing receiver argument");
 
@@ -5601,9 +5557,11 @@ fn codegen_direct_call(
         None
     };
 
-    let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
-    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    let lowered_args = if is_rust_call_abi {
+        lower_rust_call_operands_for_abi(fx, args, callee_abi.args.len())
+    } else {
+        lower_call_operands_for_abi(fx, args)
+    };
     append_lowered_call_args(
         fx,
         &mut call_args,
@@ -5716,9 +5674,11 @@ fn codegen_virtual_call(
             expected_abi_sig.params.remove(receiver_param_idx + 1);
         }
     }
-    let flatten_rust_call_args = is_rust_call_abi
-        && should_flatten_rust_call_args_for_signature(fx, args, &expected_abi_sig);
-    let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
+    let lowered_args = if is_rust_call_abi {
+        lower_rust_call_operands_for_abi(fx, args, expected_abi.args.len())
+    } else {
+        lower_call_operands_for_abi(fx, args)
+    };
     let self_arg = lowered_args.first().expect("virtual call requires receiver argument");
     assert!(
         !expected_abi.args.is_empty(),
