@@ -331,7 +331,9 @@ impl CPlace {
                             );
                         }
                         BackendRepr::Scalar(_) => {
-                            panic!("cannot write ScalarPair register value into scalar memory place")
+                            panic!(
+                                "cannot write ScalarPair register value into scalar memory place"
+                            )
                         }
                         _ => panic!("writing ByValPair to non-scalar memory is unsupported"),
                     },

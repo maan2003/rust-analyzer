@@ -33,24 +33,26 @@ use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
     Rvalue, StatementKind, TerminatorKind, UnOp,
 };
-use intern::sym;
 use hir_ty::next_solver::{
     Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
     ValueConst,
 };
 use hir_ty::traits::StoredParamEnvAndCrate;
+use intern::sym;
 use rac_abi::VariantIdx;
 use rustc_abi::{BackendRepr, Primitive, Scalar, Size, TargetDataLayout};
 use rustc_type_ir::elaborate::supertrait_def_ids;
 use rustc_type_ir::inherent::{GenericArgs as _, Region as _, Ty as _};
 use triomphe::Arc as TArc;
 
+mod abi;
 pub mod link;
 mod pointer;
 pub mod symbol_mangling;
 mod value_and_place;
 
 use hir_ty::layout::Layout;
+use rac_abi::callconv::PassMode;
 use value_and_place::{CPlace, CValue};
 
 /// Layout Arc type alias (triomphe::Arc from hir-ty's layout_of_ty).
@@ -109,73 +111,11 @@ fn stable_hash64_with_seed(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
-/// Append a return type to a Cranelift signature based on its layout.
-/// Returns `true` if the return is memory-repr and needs an sret pointer.
-pub(crate) fn append_ret_to_sig(
-    sig: &mut Signature,
-    dl: &TargetDataLayout,
-    layout: &Layout,
-) -> bool {
-    match layout.backend_repr {
-        BackendRepr::Scalar(scalar) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-            false
-        }
-        BackendRepr::ScalarPair(a, b) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
-            false
-        }
-        _ if layout.is_zst() => false,
-        _ => {
-            sig.params.push(AbiParam::special(
-                pointer_ty(dl),
-                cranelift_codegen::ir::ArgumentPurpose::StructReturn,
-            ));
-            true
-        }
-    }
-}
-
-/// Append a parameter to a Cranelift signature based on its layout.
-pub(crate) fn append_param_to_sig(sig: &mut Signature, dl: &TargetDataLayout, layout: &Layout) {
-    match layout.backend_repr {
-        BackendRepr::Scalar(scalar) => {
-            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &scalar)));
-        }
-        BackendRepr::ScalarPair(a, b) => {
-            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &a)));
-            sig.params.push(AbiParam::new(scalar_to_clif_type(dl, &b)));
-        }
-        _ if layout.is_zst() => {}
-        _ => {
-            sig.params.push(AbiParam::new(pointer_ty(dl)));
-        }
-    }
-}
-
 /// Emit a return instruction from the given return place.
-/// Handles ZST, Scalar, ScalarPair, and Memory (sret) returns.
+/// ABI-driven via `fx.fn_abi.ret`.
 pub(crate) fn codegen_return(fx: &mut FunctionCx<'_, impl Module>, ret_place: &CPlace) {
-    if ret_place.layout.is_zst() {
-        fx.bcx.ins().return_(&[]);
-    } else {
-        let cval = ret_place.to_cvalue(fx);
-        match ret_place.layout.backend_repr {
-            BackendRepr::Scalar(_) => {
-                let val = cval.load_scalar(fx);
-                fx.bcx.ins().return_(&[val]);
-            }
-            BackendRepr::ScalarPair(_, _) => {
-                let (a, b) = cval.load_scalar_pair(fx);
-                fx.bcx.ins().return_(&[a, b]);
-            }
-            _ => {
-                // Memory-repr return: value already written to sret pointer
-                fx.bcx.ins().return_(&[]);
-            }
-        }
-    }
+    let ret_abi = fx.fn_abi.ret.clone();
+    abi::returning::codegen_return(fx, ret_place, &ret_abi);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +140,7 @@ pub(crate) struct FunctionCx<'a, M: Module> {
     pub(crate) bcx: FunctionBuilder<'a>,
     pub(crate) module: &'a mut M,
     pub(crate) isa: &'a dyn TargetIsa,
+    pub(crate) fn_abi: abi::FnAbi,
     pub(crate) pointer_type: Type,
     pub(crate) dl: &'a TargetDataLayout,
     pub(crate) mir: MirSource<'a>,
@@ -3093,25 +3034,22 @@ fn build_fn_ptr_sig_from_ty(
     env: &StoredParamEnvAndCrate,
     fn_ptr_ty: hir_ty::next_solver::Ty<'_>,
 ) -> Option<Signature> {
-    let TyKind::FnPtr(sig_tys, _header) = fn_ptr_ty.kind() else {
+    let TyKind::FnPtr(sig_tys, header) = fn_ptr_ty.kind() else {
         return None;
     };
 
-    let mut sig = Signature::new(isa.default_call_conv());
-    let sig_tys_inner = sig_tys.clone().skip_binder();
+    let fn_abi = abi::fn_abi_for_fn_ptr(
+        isa,
+        db,
+        dl,
+        env,
+        &sig_tys,
+        matches!(header.abi, hir_ty::FnAbi::RustCall),
+        header.c_variadic,
+    )
+    .ok()?;
 
-    let output = sig_tys_inner.output();
-    if !output.is_never() {
-        let ret_layout = db.layout_of_ty(output.store(), env.clone()).ok()?;
-        append_ret_to_sig(&mut sig, dl, &ret_layout);
-    }
-
-    for &param_ty in sig_tys_inner.inputs() {
-        let param_layout = db.layout_of_ty(param_ty.store(), env.clone()).ok()?;
-        append_param_to_sig(&mut sig, dl, &param_layout);
-    }
-
-    Some(sig)
+    Some(fn_abi.sig)
 }
 
 /// Emit a Cranelift Value for a single scalar constant.
@@ -3169,8 +3107,9 @@ fn call_result_unsize_metadata(
 
     match dest_pointee.kind() {
         TyKind::Dynamic(..) => {
-            let dyn_trait_id =
-                dest_pointee.dyn_trait().expect("dyn destination pointer must have principal trait");
+            let dyn_trait_id = dest_pointee
+                .dyn_trait()
+                .expect("dyn destination pointer must have principal trait");
             get_or_create_vtable(fx, src_pointee.store(), dyn_trait_id)
         }
         TyKind::Slice(_) | TyKind::Str => match src_pointee.kind() {
@@ -3180,7 +3119,9 @@ fn call_result_unsize_metadata(
                     as i64;
                 fx.bcx.ins().iconst(fx.pointer_type, len)
             }
-            _ => panic!("unsupported call return unsize to slice/str from {:?}", src_pointee.kind()),
+            _ => {
+                panic!("unsupported call return unsize to slice/str from {:?}", src_pointee.kind())
+            }
         },
         _ => panic!("unsupported call return unsize destination kind: {:?}", dest_pointee.kind()),
     }
@@ -3192,39 +3133,45 @@ fn call_result_unsize_metadata(
 fn prepare_call_result_cvalue(
     fx: &mut FunctionCx<'_, impl Module>,
     call: cranelift_codegen::ir::Inst,
+    ret_abi: &abi::ArgAbi,
     dest: &CPlace,
     source_return_ty: Option<&StoredTy>,
     destination_place: &Place,
 ) -> Option<CValue> {
-    if dest.layout.is_zst() {
-        return None;
-    }
-
     let results = fx.bcx.inst_results(call).to_vec();
-    match dest.layout.backend_repr {
-        BackendRepr::Scalar(_) => {
-            assert_eq!(
-                results.len(),
-                1,
-                "scalar call destination expects 1 return value, got {}",
-                results.len(),
-            );
-            Some(CValue::by_val(results[0], dest.layout.clone()))
+    match ret_abi.mode {
+        PassMode::Ignore | PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => None,
+        PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+            unreachable!("unsized return ABI is unsupported")
         }
-        BackendRepr::ScalarPair(_, _) => match results.as_slice() {
-            [a, b] => Some(CValue::by_val_pair(*a, *b, dest.layout.clone())),
-            [data] => {
-                let Some(source_return_ty) = source_return_ty else {
-                    panic!("scalar-pair call destination expects 2 return values, got {}", results.len(),);
-                };
-                let metadata = call_result_unsize_metadata(fx, source_return_ty, destination_place);
-                Some(CValue::by_val_pair(*data, metadata, dest.layout.clone()))
+        PassMode::Direct(_) => match results.as_slice() {
+            [value] => {
+                if matches!(dest.layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
+                    let Some(source_return_ty) = source_return_ty else {
+                        panic!(
+                            "scalar-pair call destination expects metadata source for direct return"
+                        );
+                    };
+                    let metadata =
+                        call_result_unsize_metadata(fx, source_return_ty, destination_place);
+                    Some(CValue::by_val_pair(*value, metadata, dest.layout.clone()))
+                } else {
+                    Some(CValue::by_val(*value, dest.layout.clone()))
+                }
             }
             _ => {
-                panic!("scalar-pair call destination expects 2 return values, got {}", results.len(),)
+                panic!("direct return ABI expects 1 return value, got {}", results.len())
             }
         },
-        _ => None,
+        PassMode::Pair(_, _) => match results.as_slice() {
+            [a, b] => Some(CValue::by_val_pair(*a, *b, dest.layout.clone())),
+            _ => panic!("pair return ABI expects 2 return values, got {}", results.len()),
+        },
+        PassMode::Cast { ref cast, .. } => {
+            let ret_layout =
+                ret_abi.layout.as_ref().expect("Cast return ABI must carry a layout").clone();
+            Some(abi::pass_mode::from_casted_value(fx, &results, ret_layout, cast))
+        }
     }
 }
 
@@ -3268,26 +3215,6 @@ fn store_call_result_and_jump(
     }
 }
 
-/// Lower one memory-repr call argument to an indirect pointer argument.
-///
-/// Rust-by-value ABI transfers ownership of the backing storage for `Move`
-/// operands, but `Copy`/constant operands must be copied into temporary storage
-/// before passing to avoid aliasing the caller's live place.
-fn lower_indirect_call_arg(
-    fx: &mut FunctionCx<'_, impl Module>,
-    is_owned: bool,
-    cval: CValue,
-) -> Value {
-    let ptr = if is_owned {
-        cval.force_stack(fx)
-    } else {
-        let tmp = CPlace::new_stack_slot(fx, cval.layout.clone());
-        tmp.write_cvalue(fx, cval);
-        tmp.to_ptr()
-    };
-    ptr.get_addr(&mut fx.bcx, fx.pointer_type)
-}
-
 #[derive(Clone)]
 struct CallArgument {
     cval: CValue,
@@ -3321,8 +3248,10 @@ fn lower_call_operands_for_abi(
         panic!("rust-call tuple flattening expected final tuple argument, got {tuple_ty:?}");
     };
 
-    let mut lowered =
-        prefix_operands.iter().map(|operand| codegen_call_argument_operand(fx, operand)).collect::<Vec<_>>();
+    let mut lowered = prefix_operands
+        .iter()
+        .map(|operand| codegen_call_argument_operand(fx, operand))
+        .collect::<Vec<_>>();
 
     let tuple_arg = codegen_call_argument_operand(fx, tuple_operand);
 
@@ -3347,10 +3276,7 @@ fn lower_call_operands_for_abi(
     lowered
 }
 
-fn call_operand_abi_types(
-    fx: &mut FunctionCx<'_, impl Module>,
-    operand: &Operand,
-) -> Vec<Type> {
+fn call_operand_abi_types(fx: &mut FunctionCx<'_, impl Module>, operand: &Operand) -> Vec<Type> {
     let layout = fx
         .db()
         .layout_of_ty(operand_ty(fx.db(), fx.ra_body(), &operand.kind), fx.env().clone())
@@ -3429,26 +3355,114 @@ fn append_lowered_call_args(
     fx: &mut FunctionCx<'_, impl Module>,
     call_args: &mut Vec<Value>,
     lowered_args: &[CallArgument],
+    arg_abis: &[abi::ArgAbi],
+    c_variadic: bool,
 ) {
-    for arg in lowered_args {
-        let cval = arg.cval.clone();
-        if cval.layout.is_zst() {
-            continue;
-        }
-        match cval.layout.backend_repr {
-            BackendRepr::ScalarPair(_, _) => {
-                let (a, b) = cval.load_scalar_pair(fx);
-                call_args.push(a);
-                call_args.push(b);
-            }
-            BackendRepr::Scalar(_) => {
-                call_args.push(cval.load_scalar(fx));
-            }
-            _ => {
-                call_args.push(lower_indirect_call_arg(fx, arg.is_owned, cval));
-            }
+    if c_variadic {
+        assert!(
+            lowered_args.len() >= arg_abis.len(),
+            "c-variadic call has fewer lowered args than fixed ABI args: lowered={} fixed={}",
+            lowered_args.len(),
+            arg_abis.len(),
+        );
+    } else {
+        assert_eq!(
+            lowered_args.len(),
+            arg_abis.len(),
+            "call argument count mismatch after ABI lowering: lowered={} abi={}",
+            lowered_args.len(),
+            arg_abis.len(),
+        );
+    }
+
+    for (arg, arg_abi) in lowered_args.iter().zip(arg_abis) {
+        call_args.extend(abi::pass_mode::adjust_arg_for_abi(
+            fx,
+            arg.cval.clone(),
+            arg_abi,
+            arg.is_owned,
+        ));
+    }
+
+    // Extra c-variadic arguments are lowered without fixed ArgAbi entries and
+    // follow C default argument promotions.
+    if c_variadic {
+        for arg in &lowered_args[arg_abis.len()..] {
+            call_args.push(lower_c_variadic_extra_arg(fx, arg));
         }
     }
+}
+
+fn lower_c_variadic_extra_arg(fx: &mut FunctionCx<'_, impl Module>, arg: &CallArgument) -> Value {
+    let BackendRepr::Scalar(scalar) = arg.cval.layout.backend_repr else {
+        panic!(
+            "unsupported c-variadic extra argument layout: {:?}",
+            arg.cval.layout.backend_repr,
+        );
+    };
+
+    let mut value = arg.cval.clone().load_scalar(fx);
+    let value_ty = fx.bcx.func.dfg.value_type(value);
+    let is_signed_small_int = matches!(scalar.primitive(), Primitive::Int(_, true));
+
+    // C default argument promotions for varargs.
+    value = match value_ty {
+        types::F32 => fx.bcx.ins().fpromote(types::F64, value),
+        types::I8 | types::I16 => {
+            if is_signed_small_int {
+                fx.bcx.ins().sextend(types::I32, value)
+            } else {
+                fx.bcx.ins().uextend(types::I32, value)
+            }
+        }
+        _ => value,
+    };
+
+    value
+}
+
+fn adjust_c_variadic_signature_and_args(
+    fx: &mut FunctionCx<'_, impl Module>,
+    callee_name: &str,
+    sig_ref: cranelift_codegen::ir::SigRef,
+    fixed_param_count: usize,
+    call_args: &mut Vec<Value>,
+) {
+    assert!(
+        call_args.len() >= fixed_param_count,
+        "c-variadic call passed fewer args than fixed params for {callee_name}: fixed={} args={}",
+        fixed_param_count,
+        call_args.len(),
+    );
+
+    let mut sig_params = fx.bcx.func.dfg.signatures[sig_ref].params.clone();
+    if sig_params.len() < call_args.len() {
+        for arg in &call_args[sig_params.len()..] {
+            sig_params.push(AbiParam::new(fx.bcx.func.dfg.value_type(*arg)));
+        }
+    } else if sig_params.len() > call_args.len() {
+        let pad_param_tys: Vec<_> =
+            sig_params[call_args.len()..].iter().map(|param| param.value_type).collect();
+        for param_ty in pad_param_tys {
+            assert!(
+                param_ty.is_int(),
+                "unsupported c-variadic pad type for {callee_name}: {:?}",
+                param_ty,
+            );
+            call_args.push(fx.bcx.ins().iconst(param_ty, 0));
+        }
+    }
+
+    for (arg, param) in call_args.iter().zip(sig_params.iter()) {
+        let arg_ty = fx.bcx.func.dfg.value_type(*arg);
+        assert_eq!(
+            arg_ty, param.value_type,
+            "c-variadic arg type mismatch for {callee_name}: arg={:?} param={:?}",
+            arg_ty, param.value_type
+        );
+    }
+
+    fx.bcx.func.dfg.signatures[sig_ref].params = sig_params;
 }
 
 // ---------------------------------------------------------------------------
@@ -3744,6 +3758,7 @@ fn codegen_call(
                 func,
                 &sig_tys,
                 matches!(header.abi, hir_ty::FnAbi::RustCall),
+                header.c_variadic,
                 args,
                 destination,
                 target,
@@ -3792,6 +3807,7 @@ fn codegen_fn_ptr_call(
     func_operand: &Operand,
     sig_tys: &rustc_type_ir::Binder<DbInterner, rustc_type_ir::FnSigTys<DbInterner>>,
     is_rust_call_abi: bool,
+    c_variadic: bool,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -3800,73 +3816,31 @@ fn codegen_fn_ptr_call(
     let fn_ptr_cval = codegen_operand(fx, &func_operand.kind);
     let fn_ptr = fn_ptr_cval.load_scalar(fx);
 
-    // Build signature from FnPtr type info
     let sig_tys_inner = sig_tys.clone().skip_binder();
-    let mut sig = Signature::new(fx.isa.default_call_conv());
+    let source_return_ty = {
+        let output = sig_tys_inner.output();
+        (!output.is_never()).then(|| output.store())
+    };
+    let callee_abi = abi::fn_abi_for_fn_ptr(
+        fx.isa,
+        fx.db(),
+        fx.dl,
+        fx.env(),
+        sig_tys,
+        is_rust_call_abi,
+        c_variadic,
+    )
+    .expect("fn pointer ABI");
 
-    // Return type
-    let output = sig_tys_inner.output();
-    let source_return_ty = (!output.is_never()).then(|| output.store());
     let dest = codegen_place(fx, destination);
-    let is_sret_return = if output.is_never() || dest.layout.is_zst() {
-        false
-    } else {
-        match dest.layout.backend_repr {
-            BackendRepr::Scalar(scalar) => {
-                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
-                false
-            }
-            BackendRepr::ScalarPair(a, b) => {
-                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
-                sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
-                false
-            }
-            _ => {
-                sig.params.push(AbiParam::special(fx.pointer_type, ArgumentPurpose::StructReturn));
-                true
-            }
-        }
-    };
-
-    let input_tys: Vec<StoredTy> = sig_tys_inner.inputs().iter().map(|ty| ty.store()).collect();
-    let abi_input_tys = if is_rust_call_abi {
-        if let Some((packed_tuple_ty, prefix_tys)) = input_tys.split_last() {
-            if let TyKind::Tuple(tuple_fields) = packed_tuple_ty.as_ref().kind() {
-                let mut flattened = prefix_tys.to_vec();
-                flattened.extend(tuple_fields.iter().map(|field_ty| field_ty.store()));
-                flattened
-            } else {
-                input_tys
-            }
-        } else {
-            input_tys
-        }
-    } else {
-        input_tys
-    };
-
-    // Parameter types in signature
-    for param_ty in abi_input_tys {
-        let param_layout =
-            fx.db().layout_of_ty(param_ty, fx.env().clone()).expect("fn ptr param layout");
-        match param_layout.backend_repr {
-            BackendRepr::Scalar(scalar) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
-            }
-            BackendRepr::ScalarPair(a, b) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
-            }
-            _ if param_layout.is_zst() => {}
-            _ => {
-                sig.params.push(AbiParam::new(fx.pointer_type));
-            }
-        }
-    }
+    let is_sret_return = matches!(
+        callee_abi.ret.mode,
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+    );
 
     let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &sig);
-    let sig_ref = fx.bcx.import_signature(sig);
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
+    let sig_ref = fx.bcx.import_signature(callee_abi.sig.clone());
 
     // Build argument values
     let mut call_args: Vec<Value> = Vec::new();
@@ -3881,25 +3855,35 @@ fn codegen_fn_ptr_call(
     };
 
     let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
-    append_lowered_call_args(fx, &mut call_args, &lowered_args);
+    append_lowered_call_args(
+        fx,
+        &mut call_args,
+        &lowered_args,
+        &callee_abi.args,
+        callee_abi.c_variadic,
+    );
+
+    if callee_abi.c_variadic {
+        adjust_c_variadic_signature_and_args(
+            fx,
+            "fn_ptr_call",
+            sig_ref,
+            callee_abi.sig.params.len(),
+            &mut call_args,
+        );
+    }
 
     // Emit indirect call
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
     let call_result = prepare_call_result_cvalue(
         fx,
         call,
+        &callee_abi.ret,
         &dest,
         source_return_ty.as_ref(),
         destination,
     );
-    store_call_result_and_jump(
-        fx,
-        sret_slot,
-        dest,
-        call_result,
-        destination,
-        target,
-    );
+    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
 }
 
 /// Call a closure body directly.
@@ -3922,7 +3906,8 @@ fn codegen_closure_call(
         .monomorphized_mir_body_for_closure(closure_id, closure_subst.clone(), fx.env().clone())
         .expect("closure MIR");
     let closure_ret_ty = closure_body.locals[hir_ty::mir::return_slot()].ty.clone();
-    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
+    let callee_abi =
+        abi::fn_abi_for_body(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure ABI");
 
     // Generate mangled name
     let closure_name = symbol_mangling::mangle_closure(
@@ -3933,23 +3918,24 @@ fn codegen_closure_call(
     );
 
     // Declare in module (Import linkage — defined elsewhere in same module)
-    let callee_id =
-        fx.module.declare_function(&closure_name, Linkage::Import, &sig).expect("declare closure");
+    let callee_id = fx
+        .module
+        .declare_function(&closure_name, Linkage::Import, &callee_abi.sig)
+        .expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
     let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &sig);
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
     let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
 
     assert!(!lowered_args.is_empty(), "closure call is missing receiver argument");
 
     // Destination
     let dest = codegen_place(fx, destination);
-    let is_sret_return = !dest.layout.is_zst()
-        && !matches!(
-            dest.layout.backend_repr,
-            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-        );
+    let is_sret_return = matches!(
+        callee_abi.ret.mode,
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+    );
 
     // Build argument values
     let mut call_args: Vec<Value> = Vec::new();
@@ -3963,25 +3949,19 @@ fn codegen_closure_call(
         None
     };
 
-    append_lowered_call_args(fx, &mut call_args, &lowered_args);
+    append_lowered_call_args(fx, &mut call_args, &lowered_args, &callee_abi.args, false);
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
     let call_result = prepare_call_result_cvalue(
         fx,
         call,
+        &callee_abi.ret,
         &dest,
         Some(&closure_ret_ty),
         destination,
     );
-    store_call_result_and_jump(
-        fx,
-        sret_slot,
-        dest,
-        call_result,
-        destination,
-        target,
-    );
+    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
 }
 
 fn method_output_ty(
@@ -5464,6 +5444,7 @@ fn codegen_direct_call(
                                 &args[0],
                                 &sig_tys,
                                 matches!(header.abi, hir_ty::FnAbi::RustCall),
+                                header.c_variadic,
                                 args.get(1..).unwrap_or(&[]),
                                 destination,
                                 target,
@@ -5530,40 +5511,47 @@ fn codegen_direct_call(
             (callee_func_id, generic_args.store())
         };
 
-    let is_rust_call_abi = fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let is_rust_call_abi =
+        fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args.as_ref());
     // Check if this is an extern function (no MIR available)
     let is_extern =
         matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
-    let is_c_variadic = is_extern && fx.db().function_signature(callee_func_id).is_varargs();
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
 
     let interner = DbInterner::new_no_crate(fx.db());
     let empty_args = GenericArgs::empty(interner);
-    let (callee_sig, callee_name) = if is_extern {
+    let (callee_abi, callee_name) = if is_extern {
         // Extern functions: build signature from type info, use raw symbol name
-        let sig =
-            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
-                .expect("extern fn sig");
+        let fn_abi = abi::fn_abi_for_fn_item_from_ty(
+            fx.isa,
+            fx.db(),
+            fx.dl,
+            fx.env(),
+            callee_func_id,
+            empty_args,
+        )
+        .expect("extern fn ABI");
         let name = extern_fn_symbol_name(fx.db(), callee_func_id);
-        (sig, name)
+        (fn_abi, name)
     } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
         callee_func_id.into(),
         generic_args.clone(),
         fx.env().clone(),
     ) {
         // Prefer r-a MIR whenever available, including cross-crate bodies.
-        let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
+        let fn_abi = abi::fn_abi_for_body(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+            .expect("callee ABI");
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
             generic_args.as_ref(),
             fx.ext_crate_disambiguators(),
         );
-        (sig, name)
+        (fn_abi, name)
     } else if is_cross_crate {
         // Fall back to symbol-only cross-crate calls when MIR lowering is unavailable.
-        let sig = build_fn_sig_from_ty(
+        let fn_abi = abi::fn_abi_for_fn_item_from_ty(
             fx.isa,
             fx.db(),
             fx.dl,
@@ -5571,14 +5559,14 @@ fn codegen_direct_call(
             callee_func_id,
             generic_args.as_ref(),
         )
-        .expect("cross-crate fn sig");
+        .expect("cross-crate fn ABI");
         let name = symbol_mangling::mangle_function(
             fx.db(),
             callee_func_id,
             generic_args.as_ref(),
             fx.ext_crate_disambiguators(),
         );
-        (sig, name)
+        (fn_abi, name)
     } else {
         panic!("failed to get local callee MIR for {:?}", callee_func_id);
     };
@@ -5586,20 +5574,19 @@ fn codegen_direct_call(
     // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
     let callee_id = fx
         .module
-        .declare_function(&callee_name, Linkage::Import, &callee_sig)
+        .declare_function(&callee_name, Linkage::Import, &callee_abi.sig)
         .expect("declare callee");
 
     // Import into current function to get a FuncRef
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
-    let fixed_param_count = callee_sig.params.len();
+    let fixed_param_count = callee_abi.sig.params.len();
 
     // Determine destination layout to check for sret return
     let dest = codegen_place(fx, destination);
-    let is_sret_return = !dest.layout.is_zst()
-        && !matches!(
-            dest.layout.backend_repr,
-            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-        );
+    let is_sret_return = matches!(
+        callee_abi.ret.mode,
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+    );
 
     // Build argument values (skip ZST args that have no Cranelift representation)
     let mut call_args: Vec<Value> = Vec::new();
@@ -5615,55 +5602,31 @@ fn codegen_direct_call(
     };
 
     let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_sig);
+        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &callee_abi.sig);
     let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
-    append_lowered_call_args(fx, &mut call_args, &lowered_args);
+    append_lowered_call_args(
+        fx,
+        &mut call_args,
+        &lowered_args,
+        &callee_abi.args,
+        callee_abi.c_variadic,
+    );
 
-    if is_c_variadic {
-        assert!(
-            call_args.len() >= fixed_param_count,
-            "c-variadic call passed fewer args than fixed params for {callee_name}: fixed={} args={} callee={:?}",
-            fixed_param_count,
-            call_args.len(),
-            callee_func_id,
-        );
-
+    if callee_abi.c_variadic {
         let sig_ref = fx.bcx.func.dfg.ext_funcs[callee_ref].signature;
-        let mut sig_params = fx.bcx.func.dfg.signatures[sig_ref].params.clone();
-
-        if sig_params.len() < call_args.len() {
-            for arg in &call_args[sig_params.len()..] {
-                sig_params.push(AbiParam::new(fx.bcx.func.dfg.value_type(*arg)));
-            }
-        } else if sig_params.len() > call_args.len() {
-            let pad_param_tys: Vec<_> =
-                sig_params[call_args.len()..].iter().map(|param| param.value_type).collect();
-            for param_ty in pad_param_tys {
-                assert!(
-                    param_ty.is_int(),
-                    "unsupported c-variadic pad type for {callee_name}: {:?}",
-                    param_ty,
-                );
-                call_args.push(fx.bcx.ins().iconst(param_ty, 0));
-            }
-        }
-
-        for (arg, param) in call_args.iter().zip(sig_params.iter()) {
-            let arg_ty = fx.bcx.func.dfg.value_type(*arg);
-            assert_eq!(
-                arg_ty, param.value_type,
-                "c-variadic arg type mismatch for {callee_name}: arg={:?} param={:?} callee={:?}",
-                arg_ty, param.value_type, callee_func_id
-            );
-        }
-
-        fx.bcx.func.dfg.signatures[sig_ref].params = sig_params;
+        adjust_c_variadic_signature_and_args(
+            fx,
+            &callee_name,
+            sig_ref,
+            fixed_param_count,
+            &mut call_args,
+        );
     } else {
         assert_eq!(
             call_args.len(),
-            callee_sig.params.len(),
+            callee_abi.sig.params.len(),
             "direct call ABI mismatch for {callee_name}: params={} args={} callee={:?} generic_args={:?}",
-            callee_sig.params.len(),
+            callee_abi.sig.params.len(),
             call_args.len(),
             callee_func_id,
             generic_args,
@@ -5672,16 +5635,15 @@ fn codegen_direct_call(
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
-    let call_result =
-        prepare_call_result_cvalue(fx, call, &dest, source_return_ty.as_ref(), destination);
-    store_call_result_and_jump(
+    let call_result = prepare_call_result_cvalue(
         fx,
-        sret_slot,
-        dest,
-        call_result,
+        call,
+        &callee_abi.ret,
+        &dest,
+        source_return_ty.as_ref(),
         destination,
-        target,
     );
+    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -5719,9 +5681,10 @@ fn codegen_virtual_call(
 
     let vtable_offset = (3 + method_idx) * ptr_size as usize;
 
-    let is_rust_call_abi = fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
+    let is_rust_call_abi =
+        fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args);
-    let mut expected_abi_sig = build_fn_sig_from_ty(
+    let expected_abi = abi::fn_abi_for_fn_item_from_ty(
         fx.isa,
         fx.db(),
         fx.dl,
@@ -5729,19 +5692,38 @@ fn codegen_virtual_call(
         callee_func_id,
         generic_args,
     )
-    .expect("virtual method ABI signature");
-    if let Some(receiver_param) = expected_abi_sig
+    .expect("virtual method ABI");
+    let mut expected_abi_sig = expected_abi.sig.clone();
+    let receiver_mode = expected_abi
+        .args
+        .first()
+        .map(|arg| arg.mode.clone())
+        .expect("virtual call ABI unexpectedly has no receiver argument");
+    if let Some(receiver_param_idx) = expected_abi_sig
         .params
-        .iter_mut()
-        .find(|param| param.purpose != ArgumentPurpose::StructReturn)
+        .iter()
+        .position(|param| param.purpose != ArgumentPurpose::StructReturn)
     {
         // Vtable methods take `self` as a thin data pointer.
-        receiver_param.value_type = fx.pointer_type;
+        expected_abi_sig.params[receiver_param_idx].value_type = fx.pointer_type;
+
+        // If the receiver ABI was wide (pair/unsized indirect), drop metadata lane.
+        if matches!(
+            receiver_mode,
+            PassMode::Pair(_, _)
+                | PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ }
+        ) {
+            expected_abi_sig.params.remove(receiver_param_idx + 1);
+        }
     }
-    let flatten_rust_call_args =
-        is_rust_call_abi && should_flatten_rust_call_args_for_signature(fx, args, &expected_abi_sig);
+    let flatten_rust_call_args = is_rust_call_abi
+        && should_flatten_rust_call_args_for_signature(fx, args, &expected_abi_sig);
     let lowered_args = lower_call_operands_for_abi(fx, args, flatten_rust_call_args);
     let self_arg = lowered_args.first().expect("virtual call requires receiver argument");
+    assert!(
+        !expected_abi.args.is_empty(),
+        "virtual call ABI unexpectedly has no receiver argument",
+    );
 
     // Get self arg (&dyn Trait = ScalarPair(data_ptr, vtable_ptr))
     let self_cval = self_arg.cval.clone();
@@ -5751,36 +5733,11 @@ fn codegen_virtual_call(
     let fn_ptr =
         fx.bcx.ins().load(fx.pointer_type, vtable_memflags(), vtable_ptr, vtable_offset as i32);
 
-    // Build the indirect call signature:
-    // - self param is a thin pointer (data_ptr)
-    // - other params from the remaining args
-    // - return type from destination layout
-    let mut sig = Signature::new(fx.isa.default_call_conv());
-
-    // Return type
     let dest = codegen_place(fx, destination);
-    let is_sret_return = !dest.layout.is_zst()
-        && !matches!(
-            dest.layout.backend_repr,
-            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-        );
-    match dest.layout.backend_repr {
-        BackendRepr::Scalar(scalar) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
-        }
-        BackendRepr::ScalarPair(a, b) => {
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
-            sig.returns.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
-        }
-        _ if dest.layout.is_zst() => {}
-        _ => {
-            // Memory-repr return: sret pointer as first param
-            sig.params.push(AbiParam::special(fx.pointer_type, ArgumentPurpose::StructReturn));
-        }
-    }
-
-    // Self param: thin pointer
-    sig.params.push(AbiParam::new(fx.pointer_type));
+    let is_sret_return = matches!(
+        expected_abi.ret.mode,
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+    );
 
     // Build call args
     let mut call_args: Vec<Value> = Vec::new();
@@ -5799,43 +5756,35 @@ fn codegen_virtual_call(
     call_args.push(data_ptr);
 
     // Remaining args (after self)
-    for arg in lowered_args.iter().skip(1) {
-        let cval = arg.cval.clone();
-        if cval.layout.is_zst() {
-            continue;
-        }
-        match cval.layout.backend_repr {
-            BackendRepr::Scalar(scalar) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &scalar)));
-                call_args.push(cval.load_scalar(fx));
-            }
-            BackendRepr::ScalarPair(a, b) => {
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &a)));
-                sig.params.push(AbiParam::new(scalar_to_clif_type(fx.dl, &b)));
-                let (va, vb) = cval.load_scalar_pair(fx);
-                call_args.push(va);
-                call_args.push(vb);
-            }
-            _ => {
-                sig.params.push(AbiParam::new(fx.pointer_type));
-                call_args.push(lower_indirect_call_arg(fx, arg.is_owned, cval));
-            }
-        }
-    }
+    append_lowered_call_args(
+        fx,
+        &mut call_args,
+        &lowered_args[1..],
+        &expected_abi.args[1..],
+        false,
+    );
+
+    assert_eq!(
+        call_args.len(),
+        expected_abi_sig.params.len(),
+        "virtual call ABI mismatch: params={} args={} callee={:?}",
+        expected_abi_sig.params.len(),
+        call_args.len(),
+        callee_func_id,
+    );
 
     // Emit indirect call
-    let sig_ref = fx.bcx.import_signature(sig);
+    let sig_ref = fx.bcx.import_signature(expected_abi_sig);
     let call = fx.bcx.ins().call_indirect(sig_ref, fn_ptr, &call_args);
-    let call_result =
-        prepare_call_result_cvalue(fx, call, &dest, source_return_ty.as_ref(), destination);
-    store_call_result_and_jump(
+    let call_result = prepare_call_result_cvalue(
         fx,
-        sret_slot,
-        dest,
-        call_result,
+        call,
+        &expected_abi.ret,
+        &dest,
+        source_return_ty.as_ref(),
         destination,
-        target,
     );
+    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
 }
 
 fn codegen_intrinsic_call(
@@ -6136,8 +6085,8 @@ fn codegen_intrinsic_call(
             let is_cross_crate = runtime_func_id.krate(fx.db()) != fx.local_crate();
             let interner = DbInterner::new_no_crate(fx.db());
             let empty_args = GenericArgs::empty(interner);
-            let (callee_sig, callee_name) = if is_extern {
-                let sig = build_fn_sig_from_ty(
+            let (callee_abi, callee_name) = if is_extern {
+                let fn_abi = abi::fn_abi_for_fn_item_from_ty(
                     fx.isa,
                     fx.db(),
                     fx.dl,
@@ -6145,25 +6094,25 @@ fn codegen_intrinsic_call(
                     runtime_func_id,
                     empty_args,
                 )
-                .expect("const_eval_select extern fn sig");
+                .expect("const_eval_select extern fn ABI");
                 let name = extern_fn_symbol_name(fx.db(), runtime_func_id);
-                (sig, name)
+                (fn_abi, name)
             } else if let Ok(callee_body) = fx.db().monomorphized_mir_body(
                 runtime_func_id.into(),
                 runtime_generic_args.store(),
                 fx.env().clone(),
             ) {
-                let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
-                    .expect("callee sig");
+                let fn_abi = abi::fn_abi_for_body(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+                    .expect("callee ABI");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     runtime_func_id,
                     runtime_generic_args,
                     fx.ext_crate_disambiguators(),
                 );
-                (sig, name)
+                (fn_abi, name)
             } else if is_cross_crate {
-                let sig = build_fn_sig_from_ty(
+                let fn_abi = abi::fn_abi_for_fn_item_from_ty(
                     fx.isa,
                     fx.db(),
                     fx.dl,
@@ -6171,14 +6120,14 @@ fn codegen_intrinsic_call(
                     runtime_func_id,
                     runtime_generic_args,
                 )
-                .expect("const_eval_select cross-crate fn sig");
+                .expect("const_eval_select cross-crate fn ABI");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     runtime_func_id,
                     runtime_generic_args,
                     fx.ext_crate_disambiguators(),
                 );
-                (sig, name)
+                (fn_abi, name)
             } else {
                 panic!(
                     "failed to get const_eval_select runtime callee MIR for {runtime_func_id:?}"
@@ -6187,16 +6136,15 @@ fn codegen_intrinsic_call(
 
             let callee_id = fx
                 .module
-                .declare_function(&callee_name, Linkage::Import, &callee_sig)
+                .declare_function(&callee_name, Linkage::Import, &callee_abi.sig)
                 .expect("declare const_eval_select runtime callee");
             let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
             let dest = codegen_place(fx, destination);
-            let is_sret_return = !dest.layout.is_zst()
-                && !matches!(
-                    dest.layout.backend_repr,
-                    BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-                );
+            let is_sret_return = matches!(
+                callee_abi.ret.mode,
+                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+            );
 
             let mut call_args = Vec::new();
             let sret_slot = if is_sret_return {
@@ -6208,28 +6156,20 @@ fn codegen_intrinsic_call(
                 None
             };
 
-            for arg in runtime_args {
-                if arg.layout.is_zst() {
-                    continue;
-                }
-                match arg.layout.backend_repr {
-                    BackendRepr::ScalarPair(_, _) => {
-                        let (a, b) = arg.load_scalar_pair(fx);
-                        call_args.push(a);
-                        call_args.push(b);
-                    }
-                    BackendRepr::Scalar(_) => {
-                        call_args.push(arg.load_scalar(fx));
-                    }
-                    _ => {
-                        let ptr = arg.force_stack(fx);
-                        call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
-                    }
-                }
+            assert_eq!(
+                runtime_args.len(),
+                callee_abi.args.len(),
+                "const_eval_select runtime arg ABI mismatch: args={} abi={}",
+                runtime_args.len(),
+                callee_abi.args.len(),
+            );
+            for (arg, arg_abi) in runtime_args.into_iter().zip(callee_abi.args.iter()) {
+                call_args.extend(abi::pass_mode::adjust_arg_for_abi(fx, arg, arg_abi, false));
             }
 
             let call = fx.bcx.ins().call(callee_ref, &call_args);
-            let call_result = prepare_call_result_cvalue(fx, call, &dest, None, destination);
+            let call_result =
+                prepare_call_result_cvalue(fx, call, &callee_abi.ret, &dest, None, destination);
             store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
             return true;
         }
@@ -6875,25 +6815,8 @@ pub fn build_fn_sig(
     env: &StoredParamEnvAndCrate,
     body: &MirBody,
 ) -> Result<Signature, String> {
-    let mut sig = Signature::new(isa.default_call_conv());
-
-    // Return type
-    let ret_local = &body.locals[hir_ty::mir::return_slot()];
-    let ret_layout = db
-        .layout_of_ty(ret_local.ty.clone(), env.clone())
-        .map_err(|e| format!("return type layout error: {:?}", e))?;
-    append_ret_to_sig(&mut sig, dl, &ret_layout);
-
-    // Parameter types
-    for &param_local in &body.param_locals {
-        let param = &body.locals[param_local];
-        let param_layout = db
-            .layout_of_ty(param.ty.clone(), env.clone())
-            .map_err(|e| format!("param layout error: {:?}", e))?;
-        append_param_to_sig(&mut sig, dl, &param_layout);
-    }
-
-    Ok(sig)
+    let fn_abi = abi::fn_abi_for_body(isa, db, dl, env, body)?;
+    Ok(fn_abi.sig)
 }
 
 /// Build a Cranelift signature from a function's type information (via `callable_item_signature`)
@@ -6909,33 +6832,8 @@ fn build_fn_sig_from_ty(
     func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
 ) -> Result<Signature, String> {
-    let mut sig = Signature::new(isa.default_call_conv());
-
-    let interner = DbInterner::new_no_crate(db);
-    let fn_sig = if generic_args.is_empty() {
-        db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
-    } else {
-        db.callable_item_signature(func_id.into()).instantiate(interner, generic_args).skip_binder()
-    };
-
-    // Return type — skip if `!` (never) or ZST
-    let output = *fn_sig.inputs_and_output.as_slice().split_last().unwrap().0;
-    if !output.is_never() {
-        let ret_layout = db
-            .layout_of_ty(output.store(), env.clone())
-            .map_err(|e| format!("return type layout error: {:?}", e))?;
-        append_ret_to_sig(&mut sig, dl, &ret_layout);
-    }
-
-    // Parameter types
-    for &param_ty in fn_sig.inputs_and_output.inputs() {
-        let param_layout = db
-            .layout_of_ty(param_ty.store(), env.clone())
-            .map_err(|e| format!("param layout error: {:?}", e))?;
-        append_param_to_sig(&mut sig, dl, &param_layout);
-    }
-
-    Ok(sig)
+    let fn_abi = abi::fn_abi_for_fn_item_from_ty(isa, db, dl, env, func_id, generic_args)?;
+    Ok(fn_abi.sig)
 }
 
 /// Scan a MIR body and return the set of locals whose address is taken
@@ -6971,7 +6869,8 @@ pub fn compile_fn(
     ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> Result<FuncId, String> {
     let pointer_type = pointer_ty(dl);
-    let sig = build_fn_sig(isa, db, dl, env, body)?;
+    let fn_abi = abi::fn_abi_for_body(isa, db, dl, env, body)?;
+    let sig = fn_abi.sig.clone();
 
     // Declare function in module
     let func_id = module
@@ -7071,16 +6970,11 @@ pub fn compile_fn(
             local_map.push(place);
         }
 
-        // Detect sret (indirect return): Memory-repr return type
-        let ret_local = &body.locals[hir_ty::mir::return_slot()];
-        let ret_layout = db
-            .layout_of_ty(ret_local.ty.clone(), env.clone())
-            .map_err(|e| format!("return type layout error: {:?}", e))?;
-        let is_sret = !ret_layout.is_zst()
-            && !matches!(
-                ret_layout.backend_repr,
-                BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-            );
+        // Detect sret (indirect return) from ABI mode.
+        let is_sret = matches!(
+            fn_abi.ret.mode,
+            PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+        );
 
         // Wire function parameters to their locals
         let block_params: Vec<Value> = bcx.block_params(entry_block).to_vec();
@@ -7091,51 +6985,61 @@ pub fn compile_fn(
             let sret_ptr = block_params[param_idx];
             param_idx += 1;
             let ret_idx = hir_ty::mir::return_slot().into_raw().into_u32() as usize;
+            let ret_layout =
+                fn_abi.ret.layout.as_ref().expect("sret return ABI missing return layout").clone();
             local_map[ret_idx] = CPlace::for_ptr(pointer::Pointer::new(sret_ptr), ret_layout);
         }
 
-        for &param_local in &body.param_locals {
+        assert_eq!(
+            body.param_locals.len(),
+            fn_abi.args.len(),
+            "function ABI arg count mismatch for {fn_name}",
+        );
+        for (&param_local, param_abi) in body.param_locals.iter().zip(fn_abi.args.iter()) {
             let param_idx_local = param_local.into_raw().into_u32() as usize;
             let place = &local_map[param_idx_local];
-            if place.layout.is_zst() {
-                continue;
-            }
-            match place.layout.backend_repr {
-                BackendRepr::Scalar(_) => {
+            match param_abi.mode {
+                PassMode::Ignore => {}
+                PassMode::Direct(_) => {
+                    let param_val = block_params[param_idx];
+                    param_idx += 1;
                     if place.is_register() {
-                        place.def_var(0, block_params[param_idx], &mut bcx);
+                        place.def_var(0, param_val, &mut bcx);
                     } else {
-                        // Address-taken scalar: store param into stack slot
+                        // Address-taken scalar: store parameter into stack slot.
                         let mut flags = MemFlags::new();
                         flags.set_notrap();
-                        place.to_ptr().store(&mut bcx, block_params[param_idx], flags);
+                        place.to_ptr().store(&mut bcx, param_val, flags);
                     }
-                    param_idx += 1;
                 }
-                BackendRepr::ScalarPair(_, _) => {
+                PassMode::Pair(_, _) => {
+                    let val0 = block_params[param_idx];
+                    let val1 = block_params[param_idx + 1];
+                    param_idx += 2;
                     if place.is_register() {
-                        place.def_var(0, block_params[param_idx], &mut bcx);
-                        place.def_var(1, block_params[param_idx + 1], &mut bcx);
+                        place.def_var(0, val0, &mut bcx);
+                        place.def_var(1, val1, &mut bcx);
                     } else {
                         // Address-taken scalar pair: store both parts into stack slot
                         let mut flags = MemFlags::new();
                         flags.set_notrap();
                         let ptr = place.to_ptr();
-                        ptr.store(&mut bcx, block_params[param_idx], flags);
+                        ptr.store(&mut bcx, val0, flags);
                         let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr
                         else {
                             unreachable!()
                         };
                         let b_off = value_and_place::scalar_pair_b_offset(dl, *a, *b);
-                        ptr.offset_i64(&mut bcx, pointer_type, b_off).store(
-                            &mut bcx,
-                            block_params[param_idx + 1],
-                            flags,
-                        );
+                        ptr.offset_i64(&mut bcx, pointer_type, b_off).store(&mut bcx, val1, flags);
                     }
-                    param_idx += 2;
                 }
-                _ => {
+                PassMode::Cast { .. } => {
+                    panic!("PassMode::Cast params are not supported in function prelude yet");
+                }
+                PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+                    panic!("unsized by-value params are not supported yet");
+                }
+                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
                     // Memory-repr param: block param is a pointer to caller-owned data.
                     // Materialize the parameter into the callee local place so
                     // subsequent local mutations don't alias caller storage.
@@ -7148,6 +7052,13 @@ pub fn compile_fn(
                 }
             }
         }
+        assert_eq!(
+            param_idx,
+            block_params.len(),
+            "function parameter ABI consumed {} block params, expected {} for {fn_name}",
+            param_idx,
+            block_params.len(),
+        );
 
         // Create drop flags for locals that have drop glue.
         // r-a's MIR lacks drop elaboration, so Drop terminators fire even
@@ -7179,6 +7090,7 @@ pub fn compile_fn(
             bcx,
             module,
             isa,
+            fn_abi: fn_abi.clone(),
             pointer_type,
             dl,
             mir: MirSource::Ra {

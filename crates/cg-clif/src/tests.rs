@@ -1217,6 +1217,31 @@ fn main() -> ! {
     assert_eq!(code, 42);
 }
 
+#[test]
+fn compile_and_run_c_variadic_direct_call() {
+    let code = compile_and_run_legacy(
+        r#"
+extern "C" {
+    fn exit(code: i32) -> !;
+    fn snprintf(dst: *mut i8, n: usize, fmt: *const i8, ...) -> i32;
+}
+
+fn main() -> ! {
+    let mut buf = [0_u8; 16];
+    let v: i16 = 42;
+    let buf_ptr = (&mut buf as *mut [u8; 16]) as *mut u8;
+    let fmt = b"%d\0" as *const u8 as *const i8;
+    let len = unsafe {
+        snprintf(buf_ptr as *mut i8, 16usize, fmt, v)
+    };
+    unsafe { exit(len) }
+}
+"#,
+        "c_variadic_direct_call",
+    );
+    assert_eq!(code, 2);
+}
+
 // ---------------------------------------------------------------------------
 // Struct / enum / ADT tests
 // ---------------------------------------------------------------------------
