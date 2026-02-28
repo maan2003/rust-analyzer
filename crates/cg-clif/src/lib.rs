@@ -16,7 +16,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleError};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use either::Either;
 use hir_def::attrs::AttrFlags;
@@ -2773,8 +2773,22 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
             match const_eval_result {
                 Ok(konst) => {
                     let const_value = resolve_const_value(db, konst);
+                    let const_bytes = const_value.value.inner();
+                    let const_memory = const_bytes.memory.clone();
+                    let const_memory_map = const_bytes.memory_map.clone();
+                    let ptr_size = fx.dl.pointer_size().bytes_usize();
+                    let const_allocs =
+                        create_const_data_reloc_allocs(fx.module, &const_memory_map, ptr_size);
+
                     let mut data_desc = DataDescription::new();
-                    data_desc.define(const_value.value.inner().memory.clone());
+                    data_desc.define(const_memory.clone());
+                    patch_data_with_alloc_relocs(
+                        fx.module,
+                        &mut data_desc,
+                        &const_memory,
+                        ptr_size,
+                        &const_allocs,
+                    );
 
                     let pointee_layout = db
                         .layout_of_ty(static_pointee_ty(db, static_id).store(), fx.env().clone())
@@ -3010,32 +3024,135 @@ struct ConstDataAlloc {
     gv: cranelift_codegen::ir::GlobalValue,
 }
 
+#[derive(Clone, Copy)]
+struct ConstDataRelocAlloc {
+    base: usize,
+    len: usize,
+    data_id: DataId,
+}
+
+fn collect_memory_map_allocs(memory_map: &hir_ty::MemoryMap<'_>) -> Vec<(usize, Box<[u8]>)> {
+    use hir_ty::MemoryMap;
+
+    match memory_map.clone() {
+        MemoryMap::Empty => Vec::new(),
+        MemoryMap::Simple(data) => vec![(0, data)],
+        MemoryMap::Complex(cm) => cm
+            .memory_iter()
+            .map(|(addr, data)| (*addr, data.to_vec().into_boxed_slice()))
+            .collect(),
+    }
+}
+
+fn const_data_alloc_align(base: usize) -> u64 {
+    if base == 0 {
+        64
+    } else {
+        (base - (base & (base - 1))).min(64) as u64
+    }
+}
+
+fn const_data_addr_to_reloc(
+    addr: usize,
+    allocs: &[ConstDataRelocAlloc],
+) -> Option<(DataId, i64)> {
+    allocs.iter().find_map(|alloc| {
+        let end = alloc.base.checked_add(alloc.len)?;
+        if addr < alloc.base || addr > end {
+            return None;
+        }
+        let addend = i64::try_from(addr - alloc.base).ok()?;
+        Some((alloc.data_id, addend))
+    })
+}
+
+fn patch_data_with_alloc_relocs(
+    module: &mut impl Module,
+    data_desc: &mut DataDescription,
+    bytes: &[u8],
+    ptr_size: usize,
+    allocs: &[ConstDataRelocAlloc],
+) {
+    if ptr_size == 0 || bytes.len() < ptr_size || allocs.is_empty() {
+        return;
+    }
+
+    for offset in (0..=bytes.len() - ptr_size).step_by(ptr_size) {
+        let raw_addr = match ptr_size {
+            8 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes[offset..offset + 8]);
+                u64::from_le_bytes(buf) as usize
+            }
+            4 => {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&bytes[offset..offset + 4]);
+                u32::from_le_bytes(buf) as usize
+            }
+            _ => unreachable!("unsupported pointer size"),
+        };
+
+        if raw_addr == 0 {
+            continue;
+        }
+
+        let Some((target_data, addend)) = const_data_addr_to_reloc(raw_addr, allocs) else {
+            continue;
+        };
+
+        let code_offset = u32::try_from(offset).expect("const data relocation offset too large");
+        let target_gv = module.declare_data_in_data(target_data, data_desc);
+        data_desc.write_data_addr(code_offset, target_gv, addend);
+    }
+}
+
+fn create_const_data_reloc_allocs(
+    module: &mut impl Module,
+    memory_map: &hir_ty::MemoryMap<'_>,
+    ptr_size: usize,
+) -> Vec<ConstDataRelocAlloc> {
+    let pending = collect_memory_map_allocs(memory_map)
+        .into_iter()
+        .map(|(base, bytes)| {
+            let data_id = module
+                .declare_anonymous_data(false, false)
+                .expect("declare const alloc data");
+            (base, bytes, data_id)
+        })
+        .collect::<Vec<_>>();
+
+    let allocs = pending
+        .iter()
+        .map(|(base, bytes, data_id)| ConstDataRelocAlloc {
+            base: *base,
+            len: bytes.len(),
+            data_id: *data_id,
+        })
+        .collect::<Vec<_>>();
+
+    for (base, bytes, data_id) in pending {
+        let mut data_desc = DataDescription::new();
+        data_desc.define(bytes.clone());
+        data_desc.set_align(const_data_alloc_align(base));
+        patch_data_with_alloc_relocs(module, &mut data_desc, &bytes, ptr_size, &allocs);
+        module.define_data(data_id, &data_desc).expect("define const alloc data");
+    }
+
+    allocs
+}
+
 fn create_const_data_sections(
     fx: &mut FunctionCx<'_, impl Module>,
     memory_map: &hir_ty::MemoryMap<'_>,
 ) -> Vec<ConstDataAlloc> {
-    use hir_ty::MemoryMap;
     let mut allocs = Vec::new();
-    match memory_map {
-        MemoryMap::Empty => {}
-        MemoryMap::Simple(data) => {
-            let mut data_desc = DataDescription::new();
-            data_desc.define(data.to_vec().into_boxed_slice());
-            let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
-            fx.module.define_data(data_id, &data_desc).unwrap();
-            let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-            allocs.push(ConstDataAlloc { base: 0, len: data.len(), gv });
-        }
-        MemoryMap::Complex(cm) => {
-            for (addr, data) in cm.memory_iter() {
-                let mut data_desc = DataDescription::new();
-                data_desc.define(data.to_vec().into_boxed_slice());
-                let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
-                fx.module.define_data(data_id, &data_desc).unwrap();
-                let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-                allocs.push(ConstDataAlloc { base: *addr, len: data.len(), gv });
-            }
-        }
+    for (base, data) in collect_memory_map_allocs(memory_map) {
+        let mut data_desc = DataDescription::new();
+        data_desc.define(data.clone());
+        let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
+        fx.module.define_data(data_id, &data_desc).unwrap();
+        let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+        allocs.push(ConstDataAlloc { base, len: data.len(), gv });
     }
     allocs
 }
