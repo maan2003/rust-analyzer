@@ -3179,7 +3179,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails in std::slice::revswap / core::mem::swap path"]
 fn std_jit_vec_sort_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3195,7 +3194,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "regression probe: vec! ownership/drop path"]
 fn std_jit_vec_macro_drop_probe() {
     let result: i32 = jit_run_with_std(
         r#"

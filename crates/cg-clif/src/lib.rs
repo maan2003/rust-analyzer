@@ -326,24 +326,41 @@ fn static_operand_ty(db: &dyn HirDatabase, static_id: StaticId) -> StoredTy {
     .store()
 }
 
-fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
+#[derive(Clone, Copy)]
+enum PlaceTyResolveMode {
+    Strict,
+    Conservative,
+}
+
+fn place_ty_resolve(
+    db: &dyn HirDatabase,
+    body: &MirBody,
+    place: &Place,
+    mode: PlaceTyResolveMode,
+) -> Option<StoredTy> {
     let mut ty = body.locals[place.local].ty.clone();
     let local_crate = body.owner.krate(db);
     let projections = place.projection.lookup(&body.projection_store);
     for proj in projections {
         ty = match proj {
             ProjectionElem::Field(field) => field_type(db, &ty, field),
-            ProjectionElem::Deref => {
-                ty.as_ref().builtin_deref(true).expect("deref on non-pointer").store()
-            }
+            ProjectionElem::Deref => match ty.as_ref().builtin_deref(true) {
+                Some(deref_ty) => deref_ty.store(),
+                None => match mode {
+                    PlaceTyResolveMode::Strict => panic!("deref on non-pointer"),
+                    PlaceTyResolveMode::Conservative => return None,
+                },
+            },
             ProjectionElem::Downcast(_) => ty, // Downcast doesn't change the Rust type
             ProjectionElem::ClosureField(idx) => closure_field_type(db, &ty, *idx),
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                match ty.as_ref().kind() {
-                    TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
-                    _ => panic!("Index on non-array/slice type"),
-                }
-            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => match ty.as_ref().kind()
+            {
+                TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
+                _ => match mode {
+                    PlaceTyResolveMode::Strict => panic!("Index on non-array/slice type"),
+                    PlaceTyResolveMode::Conservative => return None,
+                },
+            },
             ProjectionElem::Subslice { from, to } => match ty.as_ref().kind() {
                 TyKind::Array(elem, len) => {
                     let new_len =
@@ -354,12 +371,35 @@ fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
                         .store()
                 }
                 TyKind::Slice(_) | TyKind::Str => ty,
-                _ => panic!("Subslice projection on non-array/slice/str type"),
+                _ => match mode {
+                    PlaceTyResolveMode::Strict => {
+                        panic!("Subslice projection on non-array/slice/str type")
+                    }
+                    PlaceTyResolveMode::Conservative => return None,
+                },
             },
             ProjectionElem::OpaqueCast(cast_ty) => cast_ty.clone(),
         };
     }
-    ty
+    Some(ty)
+}
+
+fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
+    place_ty_resolve(db, body, place, PlaceTyResolveMode::Strict)
+        .expect("strict place_ty resolution unexpectedly failed")
+}
+
+/// Conservative variant of `place_ty` used for drop-flag ownership checks.
+///
+/// Returns `None` when a projection chain can't be resolved structurally
+/// (e.g. overloaded indexing), so callers can conservatively treat the
+/// operand as ownership-consuming instead of panicking.
+fn place_ty_for_ownership(
+    db: &dyn HirDatabase,
+    body: &MirBody,
+    place: &Place,
+) -> Option<StoredTy> {
+    place_ty_resolve(db, body, place, PlaceTyResolveMode::Conservative)
 }
 
 /// Walk to the structural unsized tail of a type.
@@ -1671,15 +1711,18 @@ fn type_is_copy_for_codegen(fx: &FunctionCx<'_, impl Module>, ty: &StoredTy) -> 
     hir_ty::traits::implements_trait_unique(ty.as_ref(), fx.db(), fx.env().as_ref(), copy_trait)
 }
 
-fn copy_operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, place: &Place) -> bool {
-    let ty = place_ty(fx.db(), fx.ra_body(), place);
+fn place_operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, place: &Place) -> bool {
+    let Some(ty) = place_ty_for_ownership(fx.db(), fx.ra_body(), place) else {
+        return true;
+    };
     !type_is_copy_for_codegen(fx, &ty)
 }
 
 fn operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, kind: &OperandKind) -> bool {
     match kind {
-        OperandKind::Move(_) => true,
-        OperandKind::Copy(place) => copy_operand_consumes_ownership(fx, place),
+        OperandKind::Move(place) | OperandKind::Copy(place) => {
+            place_operand_consumes_ownership(fx, place)
+        }
         OperandKind::Constant { .. } | OperandKind::Static(_) => false,
     }
 }
@@ -2998,17 +3041,22 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
             // r-a MIR can occasionally encode a by-value use of a non-`Copy`
             // place as `OperandKind::Copy`. Treat this as ownership transfer,
             // matching `Move` semantics for our per-local drop flags.
-            if copy_operand_consumes_ownership(fx, place) {
+            if place_operand_consumes_ownership(fx, place) {
                 fx.clear_drop_flag(place.local);
             }
             val
         }
         OperandKind::Move(place) => {
             let val = codegen_place(fx, place).to_cvalue(fx);
-            // Clear drop flag on any move from this local. Our drop flags are
-            // tracked per-local (not per-field), so projected moves must also
-            // make the local non-droppable to avoid dropping moved-out fields.
-            fx.clear_drop_flag(place.local);
+            // Apply the same type-based ownership rule as `OperandKind::Copy`.
+            // This keeps drop-flag updates and ABI lowering consistent for
+            // `Move` operands of Copy projections.
+            if place_operand_consumes_ownership(fx, place) {
+                // Drop flags are tracked per-local (not per-field), so projected
+                // moves of non-Copy fields conservatively make the whole local
+                // non-droppable to avoid use-after-move drops.
+                fx.clear_drop_flag(place.local);
+            }
             val
         }
         OperandKind::Static(static_id) => codegen_static_operand(fx, *static_id),
