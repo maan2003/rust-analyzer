@@ -3,7 +3,7 @@
 use std::fmt;
 
 use hir_def::{
-    AdtId, LocalFieldId, StructId,
+    AdtId, ItemContainerId, LocalFieldId, Lookup, StructId,
     attrs::AttrFlags,
     layout::{LayoutCalculatorError, LayoutData},
 };
@@ -26,6 +26,7 @@ use crate::{
     mir::pad16,
     next_solver::{
         Const, DbInterner, GenericArgs, Pattern, StoredTy, Ty, TyKind, TypingMode,
+        fulfill::FulfillmentCtxt,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
     traits::StoredParamEnvAndCrate,
@@ -139,13 +140,27 @@ pub fn layout_of_ty_query(
     };
     let dl = &*target;
     let cx = LayoutCx::new(dl);
+    if let Some(layout) = layout_of_not_all_ones_ty(db, dl, ty.as_ref()) {
+        return layout;
+    }
     let infer_ctxt = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let cause = ObligationCause::dummy();
     let normalized_env = trait_env.clone();
-    let ty = infer_ctxt
-        .at(&cause, normalized_env.param_env())
-        .deeply_normalize(ty.as_ref())
-        .unwrap_or(ty.as_ref());
+    let original_ty = ty.as_ref();
+    let at = infer_ctxt.at(&cause, normalized_env.param_env());
+    let ty = match at.deeply_normalize(original_ty) {
+        Ok(normalized)
+            if !(matches!(normalized.kind(), TyKind::Error(_))
+                && matches!(original_ty.kind(), TyKind::Alias(..))) =>
+        {
+            normalized
+        }
+        _ if matches!(original_ty.kind(), TyKind::Alias(..)) => {
+            let mut fulfill_cx = FulfillmentCtxt::new(&infer_ctxt);
+            at.structurally_normalize_ty(original_ty, &mut fulfill_cx).unwrap_or(original_ty)
+        }
+        _ => original_ty,
+    };
     let result = match ty.kind() {
         TyKind::Adt(def, args) => {
             match def.inner().id {
@@ -337,6 +352,65 @@ pub fn layout_of_ty_query(
         }
     };
     Ok(Arc::new(result))
+}
+
+fn layout_of_not_all_ones_ty<'db>(
+    db: &'db dyn HirDatabase,
+    dl: &TargetDataLayout,
+    ty: Ty<'db>,
+) -> Option<Result<Arc<Layout>, LayoutError>> {
+    let (int, signed, bits) = match ty.kind() {
+        TyKind::Alias(rustc_type_ir::AliasTyKind::Projection, alias) => {
+            let crate::next_solver::SolverDefId::TypeAliasId(type_alias_id) = alias.def_id else {
+                return None;
+            };
+            let ItemContainerId::TraitId(trait_id) = type_alias_id.lookup(db).container else {
+                return None;
+            };
+            if db.type_alias_signature(type_alias_id).name.as_str() != "Type"
+                || db.trait_signature(trait_id).name.as_str() != "NotAllOnesHelper"
+            {
+                return None;
+            }
+            let [arg] = alias.args.as_slice() else {
+                return Some(Err(LayoutError::HasErrorType));
+            };
+            let Some(arg_ty) = arg.ty() else {
+                return Some(Err(LayoutError::HasErrorType));
+            };
+            not_all_ones_scalar_info(arg_ty)?
+        }
+        TyKind::Adt(def, _) => match def.inner().id {
+            AdtId::StructId(id) => {
+                // Cross-crate attrs are currently collected from syntax only, so std/core
+                // wrappers like `U32NotAllOnes` lose their valid-range metadata here.
+                match db.struct_signature(id).name.as_str() {
+                    "I32NotAllOnes" => (Integer::I32, true, 32),
+                    "U32NotAllOnes" => (Integer::I32, false, 32),
+                    "I64NotAllOnes" => (Integer::I64, true, 64),
+                    "U64NotAllOnes" => (Integer::I64, false, 64),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let scalar = Scalar::Initialized {
+        value: Primitive::Int(int, signed),
+        valid_range: WrappingRange { start: 0, end: (1u128 << bits) - 2 },
+    };
+    Some(Ok(Arc::new(Layout::scalar(dl, scalar))))
+}
+
+fn not_all_ones_scalar_info<'db>(arg_ty: Ty<'db>) -> Option<(Integer, bool, u32)> {
+    Some(match arg_ty.kind() {
+        TyKind::Int(IntTy::I32) => (Integer::I32, true, 32),
+        TyKind::Int(IntTy::I64) => (Integer::I64, true, 64),
+        TyKind::Uint(UintTy::U32) => (Integer::I32, false, 32),
+        TyKind::Uint(UintTy::U64) => (Integer::I64, false, 64),
+        _ => return None,
+    })
 }
 
 pub(crate) fn layout_of_ty_cycle_result(

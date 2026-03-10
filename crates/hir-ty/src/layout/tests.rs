@@ -2,6 +2,7 @@ use base_db::target::TargetData;
 use either::Either;
 use hir_def::{HasModule, db::DefDatabase};
 use project_model::{Sysroot, toolchain_info::QueryConfig};
+use rustc_abi::{BackendRepr, Scalar, WrappingRange};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::GenericArgs as _;
 use syntax::ToSmolStr;
@@ -175,6 +176,19 @@ fn check_size_and_align_expr(
 fn check_fail(#[rust_analyzer::rust_fixture] ra_fixture: &str, e: LayoutError) {
     let r = eval_goal(ra_fixture, "");
     assert_eq!(r, Err(e));
+}
+
+#[track_caller]
+fn check_scalar_valid_range(
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    start: u128,
+    end: u128,
+) {
+    let layout = eval_goal(ra_fixture, "").unwrap();
+    let BackendRepr::Scalar(Scalar::Initialized { valid_range, .. }) = layout.backend_repr else {
+        panic!("expected scalar layout, got {:?}", layout.backend_repr);
+    };
+    assert_eq!(valid_range, WrappingRange { start, end });
 }
 
 macro_rules! size_and_align {
@@ -374,6 +388,29 @@ struct Goal(Foo<S>);
         "",
         8,
         8,
+    );
+}
+
+#[test]
+fn projection_alias_not_all_ones_valid_range() {
+    check_scalar_valid_range(
+        r#"
+        trait NotAllOnesHelper {
+            type Type;
+        }
+
+        #[repr(transparent)]
+        #[rustc_layout_scalar_valid_range_end(4294967294)]
+        struct U32NotAllOnes(u32);
+
+        impl NotAllOnesHelper for u32 {
+            type Type = U32NotAllOnes;
+        }
+
+        type Goal = <u32 as NotAllOnesHelper>::Type;
+        "#,
+        0,
+        u32::MAX as u128 - 1,
     );
 }
 

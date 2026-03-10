@@ -29,6 +29,7 @@ use hir_def::{
 use hir_ty::PointerCast;
 use hir_ty::consteval::{try_const_usize, usize_const};
 use hir_ty::db::HirDatabase;
+use hir_ty::display::{DisplayTarget, HirDisplay};
 use hir_ty::method_resolution::TraitImpls;
 use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
@@ -7619,7 +7620,16 @@ pub fn compile_fn(
         for (local_id, local) in body.locals.iter() {
             let local_layout = db
                 .layout_of_ty(local.ty.clone(), env.clone())
-                .map_err(|e| format!("local layout error: {:?}", e))?;
+                .map_err(|e| {
+                    let display_target = DisplayTarget::from_crate(db, body.owner.krate(db));
+                    format!(
+                        "local layout error for _{}: ty=`{}` err={:?}\n{}",
+                        u32::from(local_id.into_raw()),
+                        local.ty.as_ref().display(db, display_target),
+                        e,
+                        body.pretty_print(db, display_target),
+                    )
+                })?;
 
             // Force stack allocation for locals whose address is taken,
             // since writing through the pointer must update the actual local.
