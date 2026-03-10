@@ -200,6 +200,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: Meta) -> ControlFlow<Infal
                     "rustc_paren_sugar" => attr_flags.insert(AttrFlags::RUSTC_PAREN_SUGAR),
                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
+                    "rustc_nonnull_optimization_guaranteed" => {
+                        attr_flags.insert(AttrFlags::RUSTC_NONNULL_OPTIMIZATION_GUARANTEED)
+                    }
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
@@ -308,6 +311,7 @@ bitflags::bitflags! {
         const RUSTC_COINDUCTIVE = 1 << 43;
         const RUSTC_FORCE_INLINE = 1 << 44;
         const IS_POINTEE = 1 << 45;
+        const RUSTC_NONNULL_OPTIMIZATION_GUARANTEED = 1 << 50;
 
         const MACRO_STYLE_BRACES = 1 << 46;
         const MACRO_STYLE_BRACKETS = 1 << 47;

@@ -3,7 +3,7 @@
 //! Adapted from cg_clif's `value_and_place.rs`. CValue is a read-only value
 //! with its layout; CPlace is a mutable location with its layout.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value};
+use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value};
 use cranelift_frontend::Variable;
 use cranelift_module::Module;
 use rustc_abi::{BackendRepr, Scalar, Size, TargetDataLayout};
@@ -22,6 +22,18 @@ use hir_ty::layout::Layout;
 pub(crate) fn scalar_pair_b_offset(dl: &TargetDataLayout, a: Scalar, b: Scalar) -> i64 {
     let b_offset = a.size(dl).align_to(b.align(dl).abi);
     i64::try_from(b_offset.bytes()).unwrap()
+}
+
+fn backend_repr_to_clif_type(dl: &TargetDataLayout, repr: &BackendRepr) -> Type {
+    match repr {
+        BackendRepr::Scalar(scalar) => scalar_to_clif_type(dl, scalar),
+        BackendRepr::SimdVector { element, count } => {
+            let lane = scalar_to_clif_type(dl, element);
+            lane.by((*count).try_into().expect("SIMD lane count does not fit u32"))
+                .expect("unsupported SIMD lane shape")
+        }
+        _ => panic!("backend repr is not a single clif value: {repr:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,15 +76,12 @@ impl CValue {
         CValue::by_ref(Pointer::dangling(layout.align.abi), layout)
     }
 
-    /// Load a single scalar value. Panics if the layout is not `Scalar`.
+    /// Load a single value represented in one SSA value (`Scalar`/`SimdVector`).
     pub(crate) fn load_scalar(&self, fx: &mut FunctionCx<'_, impl Module>) -> Value {
         match self.inner {
             CValueInner::ByVal(val) => val,
             CValueInner::ByRef(ptr) => {
-                let BackendRepr::Scalar(scalar) = self.layout.backend_repr else {
-                    panic!("load_scalar on non-Scalar layout: {:?}", self.layout.backend_repr);
-                };
-                let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
+                let clif_ty = backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
                 let mut flags = MemFlags::new();
                 flags.set_notrap();
                 ptr.load(&mut fx.bcx, clif_ty, flags)
@@ -280,10 +289,7 @@ impl CPlace {
 
         match self.inner {
             CPlaceInner::Var(var) => {
-                let dst_ty = match self.layout.backend_repr {
-                    BackendRepr::Scalar(s) => scalar_to_clif_type(fx.dl, &s),
-                    _ => panic!("Var place with non-Scalar layout"),
-                };
+                let dst_ty = backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
                 let val = match from.inner {
                     CValueInner::ByVal(val) => {
                         let src_ty = fx.bcx.func.dfg.value_type(val);
@@ -340,8 +346,8 @@ impl CPlace {
                     CValueInner::ByRef(from_ptr) => {
                         // Delegate to scalar/pair load if possible, else memcpy
                         match self.layout.backend_repr {
-                            BackendRepr::Scalar(scalar) => {
-                                let clif_ty = scalar_to_clif_type(fx.dl, &scalar);
+                            BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => {
+                                let clif_ty = backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
                                 let val = from_ptr.load(&mut fx.bcx, clif_ty, flags);
                                 ptr.store(&mut fx.bcx, val, flags);
                             }

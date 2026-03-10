@@ -93,6 +93,33 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
     }
 }
 
+fn scalar_or_simd_backend_repr_to_clif_type(dl: &TargetDataLayout, repr: &BackendRepr) -> Type {
+    match repr {
+        BackendRepr::Scalar(scalar) => scalar_to_clif_type(dl, scalar),
+        BackendRepr::SimdVector { element, count } => {
+            let lane = scalar_to_clif_type(dl, element);
+            lane.by((*count).try_into().expect("SIMD lane count does not fit u32"))
+                .expect("unsupported SIMD lane shape")
+        }
+        _ => panic!("backend repr does not fit in a single clif value: {repr:?}"),
+    }
+}
+
+fn bool_to_zero_or_max_uint(fx: &mut FunctionCx<'_, impl Module>, dst_ty: Type, val: Value) -> Value {
+    let int_ty = match dst_ty {
+        types::F16 => types::I16,
+        types::F32 => types::I32,
+        types::F64 => types::I64,
+        types::F128 => types::I128,
+        ty => ty,
+    };
+    let mut res = fx.bcx.ins().bmask(int_ty, val);
+    if dst_ty.is_float() {
+        res = fx.bcx.ins().bitcast(dst_ty, MemFlags::new(), res);
+    }
+    res
+}
+
 fn iconst_from_bits(bcx: &mut FunctionBuilder<'_>, ty: Type, bits: u128) -> Value {
     if ty == types::I128 {
         let lsb = bcx.ins().iconst(types::I64, bits as u64 as i64);
@@ -338,6 +365,14 @@ fn place_ty_resolve(
     place: &Place,
     mode: PlaceTyResolveMode,
 ) -> Option<StoredTy> {
+    let indexable_elem_ty = |ty: &StoredTy| match ty.as_ref().kind() {
+        TyKind::Array(elem, _) | TyKind::Slice(elem) => Some(elem.store()),
+        _ => ty.as_ref().builtin_deref(true).and_then(|deref_ty| match deref_ty.kind() {
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => Some(elem.store()),
+            _ => None,
+        }),
+    };
+
     let mut ty = body.locals[place.local].ty.clone();
     let local_crate = body.owner.krate(db);
     let projections = place.projection.lookup(&body.projection_store);
@@ -353,14 +388,15 @@ fn place_ty_resolve(
             },
             ProjectionElem::Downcast(_) => ty, // Downcast doesn't change the Rust type
             ProjectionElem::ClosureField(idx) => closure_field_type(db, &ty, *idx),
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => match ty.as_ref().kind()
-            {
-                TyKind::Array(elem, _) | TyKind::Slice(elem) => elem.store(),
-                _ => match mode {
-                    PlaceTyResolveMode::Strict => panic!("Index on non-array/slice type"),
-                    PlaceTyResolveMode::Conservative => return None,
-                },
-            },
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                match indexable_elem_ty(&ty) {
+                    Some(elem_ty) => elem_ty,
+                    None => match mode {
+                        PlaceTyResolveMode::Strict => panic!("Index on non-array/slice type"),
+                        PlaceTyResolveMode::Conservative => return None,
+                    },
+                }
+            }
             ProjectionElem::Subslice { from, to } => match ty.as_ref().kind() {
                 TyKind::Array(elem, len) => {
                     let new_len =
@@ -6841,6 +6877,16 @@ fn codegen_intrinsic_call(
             }
             return true;
         }
+        "write_box_via_move" => {
+            assert_eq!(args.len(), 2, "write_box_via_move expects 2 args");
+
+            let boxed_ptr = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let value = codegen_operand(fx, &args[1].kind);
+            let dst = CPlace::for_ptr(pointer::Pointer::new(boxed_ptr), value.layout.clone());
+            dst.write_cvalue(fx, value);
+
+            Some(boxed_ptr)
+        }
         "box_new" => {
             assert_eq!(args.len(), 1, "box_new expects 1 arg");
 
@@ -7035,6 +7081,108 @@ fn codegen_intrinsic_call(
             let a = codegen_operand(fx, &args[0].kind).load_scalar(fx);
             let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().imul(a, b))
+        }
+        "simd_bitmask" => {
+            assert_eq!(args.len(), 1, "simd_bitmask intrinsic expects 1 arg");
+            let simd_val = codegen_operand(fx, &args[0].kind);
+            let (lane_scalar, lane_count) = match simd_val.layout.backend_repr {
+                BackendRepr::SimdVector { element, count } => (element, count),
+                _ => panic!("simd_bitmask expects SIMD vector operand"),
+            };
+            assert!(lane_count < 128, "simd_bitmask lane_count {lane_count} exceeds 127");
+            let lane_ty = scalar_to_clif_type(fx.dl, &lane_scalar);
+            let lane_size = lane_ty.bytes() as i64;
+
+            let dest = codegen_place(fx, destination);
+            let BackendRepr::Scalar(dest_scalar) = dest.layout.backend_repr else {
+                panic!("simd_bitmask destination must be scalar")
+            };
+            let dest_ty = scalar_to_clif_type(fx.dl, &dest_scalar);
+
+            let simd_ptr = simd_val.force_stack(fx);
+            let mut flags = MemFlags::new();
+            flags.set_notrap();
+
+            let zero = fx.bcx.ins().iconst(dest_ty, 0);
+            let mut result = zero;
+            for lane_idx in 0..lane_count {
+                let lane = simd_ptr
+                    .offset_i64(&mut fx.bcx, fx.pointer_type, lane_idx as i64 * lane_size)
+                    .load(&mut fx.bcx, lane_ty, flags);
+                let is_set = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lane, 0);
+                let bit = iconst_from_bits(&mut fx.bcx, dest_ty, 1u128 << lane_idx);
+                let lane_bit = fx.bcx.ins().select(is_set, bit, zero);
+                result = fx.bcx.ins().bor(result, lane_bit);
+            }
+            Some(result)
+        }
+        "simd_eq" | "simd_ne" | "simd_lt" | "simd_le" | "simd_gt" | "simd_ge" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+            let lhs = codegen_operand(fx, &args[0].kind);
+            let rhs = codegen_operand(fx, &args[1].kind);
+            let lhs_val = lhs.load_scalar(fx);
+            let rhs_val = rhs.load_scalar(fx);
+
+            let cmp = match lhs.layout.backend_repr {
+                BackendRepr::SimdVector { element, .. } => match element.primitive() {
+                    Primitive::Int(_, signed) => {
+                        let cc = match (name, signed) {
+                            ("simd_eq", _) => IntCC::Equal,
+                            ("simd_ne", _) => IntCC::NotEqual,
+                            ("simd_lt", false) => IntCC::UnsignedLessThan,
+                            ("simd_lt", true) => IntCC::SignedLessThan,
+                            ("simd_le", false) => IntCC::UnsignedLessThanOrEqual,
+                            ("simd_le", true) => IntCC::SignedLessThanOrEqual,
+                            ("simd_gt", false) => IntCC::UnsignedGreaterThan,
+                            ("simd_gt", true) => IntCC::SignedGreaterThan,
+                            ("simd_ge", false) => IntCC::UnsignedGreaterThanOrEqual,
+                            ("simd_ge", true) => IntCC::SignedGreaterThanOrEqual,
+                            _ => unreachable!(),
+                        };
+                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                    }
+                    Primitive::Float(_) => {
+                        let cc = match name {
+                            "simd_eq" => FloatCC::Equal,
+                            "simd_ne" => FloatCC::NotEqual,
+                            "simd_lt" => FloatCC::LessThan,
+                            "simd_le" => FloatCC::LessThanOrEqual,
+                            "simd_gt" => FloatCC::GreaterThan,
+                            "simd_ge" => FloatCC::GreaterThanOrEqual,
+                            _ => unreachable!(),
+                        };
+                        fx.bcx.ins().fcmp(cc, lhs_val, rhs_val)
+                    }
+                    Primitive::Pointer(_) => {
+                        let cc = match name {
+                            "simd_eq" => IntCC::Equal,
+                            "simd_ne" => IntCC::NotEqual,
+                            _ => panic!("{name} is unsupported for pointer SIMD lanes"),
+                        };
+                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                    }
+                },
+                _ => panic!("{name} expects SIMD vector operands"),
+            };
+
+            let dest = codegen_place(fx, destination);
+            let dest_ty = scalar_or_simd_backend_repr_to_clif_type(fx.dl, &dest.layout.backend_repr);
+            if fx.bcx.func.dfg.value_type(cmp) == dest_ty {
+                Some(cmp)
+            } else {
+                Some(bool_to_zero_or_max_uint(fx, dest_ty, cmp))
+            }
+        }
+        "simd_and" | "simd_or" | "simd_xor" => {
+            assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
+            let lhs = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let rhs = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+            Some(match name {
+                "simd_and" => fx.bcx.ins().band(lhs, rhs),
+                "simd_or" => fx.bcx.ins().bor(lhs, rhs),
+                "simd_xor" => fx.bcx.ins().bxor(lhs, rhs),
+                _ => unreachable!(),
+            })
         }
         "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");

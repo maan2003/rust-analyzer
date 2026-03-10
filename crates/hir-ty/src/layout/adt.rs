@@ -111,6 +111,15 @@ pub(crate) fn layout_of_adt_cycle_result(
 
 fn layout_scalar_valid_range(db: &dyn HirDatabase, def: AdtId) -> (Bound<u128>, Bound<u128>) {
     let range = AttrFlags::rustc_layout_scalar_valid_range(db, def);
+    if range.start.is_none()
+        && range.end.is_none()
+        && AttrFlags::query(db, def.into())
+            .contains(AttrFlags::RUSTC_NONNULL_OPTIMIZATION_GUARANTEED)
+    {
+        // `#[rustc_nonnull_optimization_guaranteed]` means value 0 is invalid, which is
+        // equivalent to a wrapping scalar valid range starting at 1.
+        return (Bound::Included(1), Bound::Unbounded);
+    }
     let get = |value| match value {
         Some(it) => Bound::Included(it),
         None => Bound::Unbounded,

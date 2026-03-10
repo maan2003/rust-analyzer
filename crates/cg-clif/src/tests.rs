@@ -2115,38 +2115,38 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         }
         .store();
 
+        let dl = get_target_data_layout(&db, entry_func_id);
+
+        let should_codegen_cross_crate = |func_id: hir_def::FunctionId,
+                                          generic_args: &hir_ty::next_solver::StoredGenericArgs| {
+            let generic_args = generic_args.as_ref();
+            let is_cross_crate = func_id.krate(&db) != local_crate;
+            if !is_cross_crate {
+                return true;
+            }
+
+            if !generic_args.as_ref().is_empty() {
+                return true;
+            }
+
+            let fn_name = crate::symbol_mangling::mangle_function(
+                &db,
+                func_id,
+                generic_args,
+                &disambiguators,
+            );
+
+            !libstd_exports_symbol(libstd_handle, &fn_name)
+        };
+
         let (reachable_fns, reachable_closures, drop_types) =
             crate::collect_reachable_fns_with_body_filter(
                 &db,
                 &env,
                 entry_func_id,
                 local_crate,
-                |func_id, generic_args| {
-                    let is_cross_crate = func_id.krate(&db) != local_crate;
-                    if !is_cross_crate {
-                        return true;
-                    }
-
-                    let is_generic_instance = !generic_args.as_ref().is_empty();
-                    if is_generic_instance {
-                        return true;
-                    }
-
-                    let fn_name = crate::symbol_mangling::mangle_function(
-                        &db,
-                        func_id,
-                        generic_args.as_ref(),
-                        &disambiguators,
-                    );
-
-                    // If the symbol is exported from libstd, keep it imported and
-                    // avoid traversing its MIR body to prevent pulling in private
-                    // std internals that aren't needed for JIT compilation.
-                    !libstd_exports_symbol(libstd_handle, &fn_name)
-                },
+                |func_id, generic_args| should_codegen_cross_crate(func_id, generic_args),
             );
-
-        let dl = get_target_data_layout(&db, entry_func_id);
         let trace_enabled = std::env::var_os("CG_CLIF_STD_JIT_TRACE").is_some();
         let mut compiled_fn_symbols = std::collections::HashSet::new();
         let mut compiled_closure_symbols = std::collections::HashSet::new();
@@ -2164,7 +2164,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             );
             let exported_in_libstd =
                 is_cross_crate && libstd_exports_symbol(libstd_handle, &fn_name);
-            let should_compile_cross_crate = is_generic_instance || !exported_in_libstd;
+            let should_compile_cross_crate = should_codegen_cross_crate(*func_id, generic_args);
 
             if trace_enabled {
                 eprintln!(
