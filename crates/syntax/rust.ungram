@@ -620,6 +620,7 @@ Type =
 | MacroType
 | NeverType
 | ParenType
+| PatternType
 | PathType
 | PtrType
 | RefType
@@ -634,6 +635,27 @@ NeverType =
 
 MacroType =
   MacroCall
+
+PatternType =
+  ty:Type 'is' pat:PatternTypePat
+
+PatternTypePat =
+  PatternTypeConstPat
+| PatternTypeNotNullPat
+| PatternTypeOrPat
+| PatternTypeRangePat
+
+PatternTypeConstPat =
+  expr:Expr
+
+PatternTypeNotNullPat =
+  '!' 'null'
+
+PatternTypeOrPat =
+  pats:(PatternTypePat ('|' PatternTypePat)*)
+
+PatternTypeRangePat =
+  start:Expr? op:('..' | '..=') end:Expr?
 
 PathType =
   Path

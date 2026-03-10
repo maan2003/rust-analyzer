@@ -1287,6 +1287,11 @@ impl Printer<'_> {
                 self.print_type_ref(*elem);
                 w!(self, "]");
             }
+            TypeRef::Pat(pat) => {
+                self.print_type_ref(pat.ty);
+                w!(self, " is ");
+                self.print_pattern_type_ref(&pat.pat);
+            }
             TypeRef::Fn(fn_) => {
                 let ((_, return_type), args) =
                     fn_.params.split_last().expect("TypeRef::Fn is missing return type");
@@ -1322,6 +1327,30 @@ impl Printer<'_> {
             TypeRef::DynTrait(bounds) => {
                 w!(self, "dyn ");
                 self.print_type_bounds(bounds);
+            }
+        }
+    }
+
+    fn print_pattern_type_ref(&mut self, pat: &crate::type_ref::PatternRef) {
+        match pat {
+            crate::type_ref::PatternRef::Const(c) => self.print_expr(c.expr),
+            crate::type_ref::PatternRef::NotNull => w!(self, "!null"),
+            crate::type_ref::PatternRef::Or(pats) => {
+                for (i, pat) in pats.iter().enumerate() {
+                    if i != 0 {
+                        w!(self, " | ");
+                    }
+                    self.print_pattern_type_ref(pat);
+                }
+            }
+            crate::type_ref::PatternRef::Range(range) => {
+                if let Some(start) = range.start {
+                    self.print_expr(start.expr);
+                }
+                w!(self, "{}", if range.end_inclusive { "..=" } else { ".." });
+                if let Some(end) = range.end {
+                    self.print_expr(end.expr);
+                }
             }
         }
     }

@@ -257,6 +257,32 @@ fn type_() {
     );
     check(
         TopEntryPoint::Type,
+        "usize is 0 ..= HALF_USIZE",
+        expect![[r#"
+            PATTERN_TYPE
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "usize"
+              WHITESPACE " "
+              IS_KW "is"
+              WHITESPACE " "
+              PATTERN_TYPE_RANGE_PAT
+                LITERAL
+                  INT_NUMBER "0"
+                WHITESPACE " "
+                DOT2EQ "..="
+                WHITESPACE " "
+                PATH_EXPR
+                  PATH
+                    PATH_SEGMENT
+                      NAME_REF
+                        IDENT "HALF_USIZE"
+        "#]],
+    );
+    check(
+        TopEntryPoint::Type,
         "() () ()",
         expect![[r#"
             ERROR

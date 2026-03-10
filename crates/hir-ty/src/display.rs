@@ -2214,6 +2214,11 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 inner.hir_fmt(f, store)?;
                 write!(f, "]")?;
             }
+            TypeRef::Pat(pat) => {
+                pat.ty.hir_fmt(f, store)?;
+                write!(f, " is ")?;
+                write_pattern_type_ref(f, store, &pat.pat)?;
+            }
             TypeRef::Fn(fn_) => {
                 if fn_.is_unsafe {
                     write!(f, "unsafe ")?;
@@ -2262,6 +2267,35 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
         }
         Ok(())
     }
+}
+
+fn write_pattern_type_ref(
+    f: &mut HirFormatter<'_, '_>,
+    store: &ExpressionStore,
+    pat: &hir_def::type_ref::PatternRef,
+) -> Result {
+    match pat {
+        hir_def::type_ref::PatternRef::Const(c) => c.hir_fmt(f, store)?,
+        hir_def::type_ref::PatternRef::NotNull => write!(f, "!null")?,
+        hir_def::type_ref::PatternRef::Or(pats) => {
+            for (i, pat) in pats.iter().enumerate() {
+                if i != 0 {
+                    write!(f, " | ")?;
+                }
+                write_pattern_type_ref(f, store, pat)?;
+            }
+        }
+        hir_def::type_ref::PatternRef::Range(range) => {
+            if let Some(start) = range.start {
+                start.hir_fmt(f, store)?;
+            }
+            write!(f, "{}", if range.end_inclusive { "..=" } else { ".." })?;
+            if let Some(end) = range.end {
+                end.hir_fmt(f, store)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<'db> HirDisplayWithExpressionStore<'db> for ConstRef {

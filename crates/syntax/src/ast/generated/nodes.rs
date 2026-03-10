@@ -1259,6 +1259,44 @@ impl PathType {
     #[inline]
     pub fn path(&self) -> Option<Path> { support::child(&self.syntax) }
 }
+pub struct PatternType {
+    pub(crate) syntax: SyntaxNode,
+}
+impl PatternType {
+    #[inline]
+    pub fn pat(&self) -> Option<PatternTypePat> { support::child(&self.syntax) }
+    #[inline]
+    pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
+    #[inline]
+    pub fn is_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![is]) }
+}
+pub struct PatternTypeConstPat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl PatternTypeConstPat {
+    #[inline]
+    pub fn expr(&self) -> Option<Expr> { support::child(&self.syntax) }
+}
+pub struct PatternTypeNotNullPat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl PatternTypeNotNullPat {
+    #[inline]
+    pub fn excl_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![!]) }
+    #[inline]
+    pub fn null_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![null]) }
+}
+pub struct PatternTypeOrPat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl PatternTypeOrPat {
+    #[inline]
+    pub fn pats(&self) -> AstChildren<PatternTypePat> { support::children(&self.syntax) }
+}
+pub struct PatternTypeRangePat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl PatternTypeRangePat {}
 pub struct PrefixExpr {
     pub(crate) syntax: SyntaxNode,
 }
@@ -2139,6 +2177,14 @@ pub enum Pat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PatternTypePat {
+    PatternTypeConstPat(PatternTypeConstPat),
+    PatternTypeNotNullPat(PatternTypeNotNullPat),
+    PatternTypeOrPat(PatternTypeOrPat),
+    PatternTypeRangePat(PatternTypeRangePat),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Stmt {
     ExprStmt(ExprStmt),
     Item(Item),
@@ -2157,6 +2203,7 @@ pub enum Type {
     NeverType(NeverType),
     ParenType(ParenType),
     PathType(PathType),
+    PatternType(PatternType),
     PtrType(PtrType),
     RefType(RefType),
     SliceType(SliceType),
@@ -5405,6 +5452,166 @@ impl fmt::Debug for PathType {
         f.debug_struct("PathType").field("syntax", &self.syntax).finish()
     }
 }
+impl AstNode for PatternType {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        PATTERN_TYPE
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == PATTERN_TYPE }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for PatternType {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for PatternType {}
+impl PartialEq for PatternType {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for PatternType {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for PatternType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatternType").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for PatternTypeConstPat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        PATTERN_TYPE_CONST_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == PATTERN_TYPE_CONST_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for PatternTypeConstPat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for PatternTypeConstPat {}
+impl PartialEq for PatternTypeConstPat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for PatternTypeConstPat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for PatternTypeConstPat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatternTypeConstPat").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for PatternTypeNotNullPat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        PATTERN_TYPE_NOT_NULL_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == PATTERN_TYPE_NOT_NULL_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for PatternTypeNotNullPat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for PatternTypeNotNullPat {}
+impl PartialEq for PatternTypeNotNullPat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for PatternTypeNotNullPat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for PatternTypeNotNullPat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatternTypeNotNullPat").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for PatternTypeOrPat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        PATTERN_TYPE_OR_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == PATTERN_TYPE_OR_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for PatternTypeOrPat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for PatternTypeOrPat {}
+impl PartialEq for PatternTypeOrPat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for PatternTypeOrPat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for PatternTypeOrPat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatternTypeOrPat").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for PatternTypeRangePat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        PATTERN_TYPE_RANGE_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == PATTERN_TYPE_RANGE_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for PatternTypeRangePat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for PatternTypeRangePat {}
+impl PartialEq for PatternTypeRangePat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for PatternTypeRangePat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for PatternTypeRangePat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatternTypeRangePat").field("syntax", &self.syntax).finish()
+    }
+}
 impl AstNode for PrefixExpr {
     #[inline]
     fn kind() -> SyntaxKind
@@ -8102,6 +8309,66 @@ impl AstNode for Pat {
         }
     }
 }
+impl From<PatternTypeConstPat> for PatternTypePat {
+    #[inline]
+    fn from(node: PatternTypeConstPat) -> PatternTypePat {
+        PatternTypePat::PatternTypeConstPat(node)
+    }
+}
+impl From<PatternTypeNotNullPat> for PatternTypePat {
+    #[inline]
+    fn from(node: PatternTypeNotNullPat) -> PatternTypePat {
+        PatternTypePat::PatternTypeNotNullPat(node)
+    }
+}
+impl From<PatternTypeOrPat> for PatternTypePat {
+    #[inline]
+    fn from(node: PatternTypeOrPat) -> PatternTypePat { PatternTypePat::PatternTypeOrPat(node) }
+}
+impl From<PatternTypeRangePat> for PatternTypePat {
+    #[inline]
+    fn from(node: PatternTypeRangePat) -> PatternTypePat {
+        PatternTypePat::PatternTypeRangePat(node)
+    }
+}
+impl AstNode for PatternTypePat {
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool {
+        matches!(
+            kind,
+            PATTERN_TYPE_CONST_PAT
+                | PATTERN_TYPE_NOT_NULL_PAT
+                | PATTERN_TYPE_OR_PAT
+                | PATTERN_TYPE_RANGE_PAT
+        )
+    }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        let res = match syntax.kind() {
+            PATTERN_TYPE_CONST_PAT => {
+                PatternTypePat::PatternTypeConstPat(PatternTypeConstPat { syntax })
+            }
+            PATTERN_TYPE_NOT_NULL_PAT => {
+                PatternTypePat::PatternTypeNotNullPat(PatternTypeNotNullPat { syntax })
+            }
+            PATTERN_TYPE_OR_PAT => PatternTypePat::PatternTypeOrPat(PatternTypeOrPat { syntax }),
+            PATTERN_TYPE_RANGE_PAT => {
+                PatternTypePat::PatternTypeRangePat(PatternTypeRangePat { syntax })
+            }
+            _ => return None,
+        };
+        Some(res)
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            PatternTypePat::PatternTypeConstPat(it) => &it.syntax,
+            PatternTypePat::PatternTypeNotNullPat(it) => &it.syntax,
+            PatternTypePat::PatternTypeOrPat(it) => &it.syntax,
+            PatternTypePat::PatternTypeRangePat(it) => &it.syntax,
+        }
+    }
+}
 impl From<ExprStmt> for Stmt {
     #[inline]
     fn from(node: ExprStmt) -> Stmt { Stmt::ExprStmt(node) }
@@ -8154,6 +8421,10 @@ impl From<PathType> for Type {
     #[inline]
     fn from(node: PathType) -> Type { Type::PathType(node) }
 }
+impl From<PatternType> for Type {
+    #[inline]
+    fn from(node: PatternType) -> Type { Type::PatternType(node) }
+}
 impl From<PtrType> for Type {
     #[inline]
     fn from(node: PtrType) -> Type { Type::PtrType(node) }
@@ -8185,6 +8456,7 @@ impl AstNode for Type {
                 | NEVER_TYPE
                 | PAREN_TYPE
                 | PATH_TYPE
+                | PATTERN_TYPE
                 | PTR_TYPE
                 | REF_TYPE
                 | SLICE_TYPE
@@ -8204,6 +8476,7 @@ impl AstNode for Type {
             NEVER_TYPE => Type::NeverType(NeverType { syntax }),
             PAREN_TYPE => Type::ParenType(ParenType { syntax }),
             PATH_TYPE => Type::PathType(PathType { syntax }),
+            PATTERN_TYPE => Type::PatternType(PatternType { syntax }),
             PTR_TYPE => Type::PtrType(PtrType { syntax }),
             REF_TYPE => Type::RefType(RefType { syntax }),
             SLICE_TYPE => Type::SliceType(SliceType { syntax }),
@@ -8225,6 +8498,7 @@ impl AstNode for Type {
             Type::NeverType(it) => &it.syntax,
             Type::ParenType(it) => &it.syntax,
             Type::PathType(it) => &it.syntax,
+            Type::PatternType(it) => &it.syntax,
             Type::PtrType(it) => &it.syntax,
             Type::RefType(it) => &it.syntax,
             Type::SliceType(it) => &it.syntax,
@@ -9369,6 +9643,11 @@ impl std::fmt::Display for Pat {
         std::fmt::Display::fmt(self.syntax(), f)
     }
 }
+impl std::fmt::Display for PatternTypePat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
 impl std::fmt::Display for Stmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
@@ -9875,6 +10154,31 @@ impl std::fmt::Display for PathSegment {
     }
 }
 impl std::fmt::Display for PathType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for PatternType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for PatternTypeConstPat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for PatternTypeNotNullPat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for PatternTypeOrPat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for PatternTypeRangePat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

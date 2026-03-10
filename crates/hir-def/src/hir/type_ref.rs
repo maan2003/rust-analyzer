@@ -118,6 +118,27 @@ pub struct ArrayType {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct PatternTypeRef {
+    pub ty: TypeRefId,
+    pub pat: PatternRef,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum PatternRef {
+    Const(ConstRef),
+    NotNull,
+    Or(Box<[PatternRef]>),
+    Range(RangePatternRef),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RangePatternRef {
+    pub start: Option<ConstRef>,
+    pub end: Option<ConstRef>,
+    pub end_inclusive: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RefType {
     pub ty: TypeRefId,
     pub lifetime: Option<LifetimeRefId>,
@@ -137,6 +158,7 @@ pub enum TypeRef {
     Reference(Box<RefType>),
     Array(ArrayType),
     Slice(TypeRefId),
+    Pat(Box<PatternTypeRef>),
     /// A fn pointer. Last element of the vector is the return type.
     Fn(Box<FnType>),
     ImplTrait(ThinVec<TypeBound>),
@@ -210,6 +232,7 @@ impl TypeRef {
                 TypeRef::RawPtr(type_ref, _) | TypeRef::Slice(type_ref) => go(*type_ref, f, map),
                 TypeRef::Reference(it) => go(it.ty, f, map),
                 TypeRef::Array(it) => go(it.ty, f, map),
+                TypeRef::Pat(it) => go(it.ty, f, map),
                 TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
                     for bound in bounds {
                         match bound {

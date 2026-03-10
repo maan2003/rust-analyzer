@@ -28,7 +28,8 @@ use hir_def::{
     resolver::{HasResolver, LifetimeNs, Resolver, TypeNs, ValueNs},
     signatures::{FunctionSignature, TraitFlags, TypeAliasFlags},
     type_ref::{
-        ConstRef, FnType, LifetimeRefId, PathId, TraitBoundModifier, TraitRef as HirTraitRef,
+        ConstRef, FnType, LifetimeRefId, PathId, PatternRef as HirPatternRef,
+        RangePatternRef as HirRangePatternRef, TraitBoundModifier, TraitRef as HirTraitRef,
         TypeBound, TypeRef, TypeRefId,
     },
 };
@@ -40,7 +41,7 @@ use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundVarIndexKind, ConstKind, DebruijnIndex, ExistentialPredicate,
     ExistentialProjection, ExistentialTraitRef, FnSig, Interner, OutlivesPredicate, TermKind,
-    TyKind::{self}, UintTy,
+    TyKind::{self}, IntTy, UintTy,
     fast_reject::{TreatParams, simplify_type},
     TypeFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
     inherent::{Clause as _, GenericArgs as _, IntoKind as _, Region as _, Ty as _},
@@ -58,11 +59,11 @@ use crate::{
     MemoryMap, ParamEnvAndCrate,
     next_solver::{
         AliasTy, Binder, BoundExistentialPredicates, Clause, ClauseKind, Clauses, Const,
-        DbInterner, EarlyBinder, EarlyParamRegion, ErrorGuaranteed, FxIndexMap, GenericArg,
-        GenericArgs, ParamConst, ParamEnv, PolyFnSig, Predicate, Region, SolverDefId,
-        StoredClauses, StoredEarlyBinder, StoredGenericArg, StoredGenericArgs, StoredPolyFnSig,
-        StoredTy, TraitPredicate, TraitRef, Ty, Tys, UnevaluatedConst, abi::Safety,
-        util::BottomUpFolder,
+        ConstBytes, DbInterner, EarlyBinder, EarlyParamRegion, ErrorGuaranteed, FxIndexMap,
+        GenericArg, GenericArgs, ParamConst, ParamEnv, PatList, Pattern, PatternKind, PolyFnSig,
+        Predicate, Region, SolverDefId, StoredClauses, StoredEarlyBinder, StoredGenericArg,
+        StoredGenericArgs, StoredPolyFnSig, StoredTy, TraitPredicate, TraitRef, Ty, Tys,
+        UnevaluatedConst, ValueConst, abi::Safety, util::BottomUpFolder,
     },
 };
 
@@ -346,7 +347,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 (*v >= 0).then_some(*v as u128)
             }
             hir_def::hir::Expr::Path(path) => {
-                let c = self.path_to_const(path)?;
+                let c = self.lower_path_as_const(path, Ty::new_usize(self.interner));
                 crate::consteval::try_const_usize(self.db, c)
             }
             hir_def::hir::Expr::Call { callee, args } => {
@@ -637,6 +638,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 let const_len = self.lower_const(array.len, Ty::new_usize(interner));
                 Ty::new_array_with_const_len(interner, inner_ty, const_len)
             }
+            TypeRef::Pat(pat) => {
+                let inner_ty = self.lower_ty(pat.ty);
+                match self.lower_pattern_ref(&pat.pat, inner_ty) {
+                    Some(pat) => Ty::new_pat(interner, inner_ty, pat),
+                    None => Ty::new_error(interner, ErrorGuaranteed),
+                }
+            }
             &TypeRef::Slice(inner) => {
                 let inner_ty = self.lower_ty(inner);
                 Ty::new_slice(interner, inner_ty)
@@ -709,6 +717,131 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             TypeRef::Error => Ty::new_error(self.interner, ErrorGuaranteed),
         };
         (ty, res)
+    }
+
+    fn lower_pattern_ref(
+        &mut self,
+        pat: &HirPatternRef,
+        base_ty: Ty<'db>,
+    ) -> Option<Pattern<'db>> {
+        Some(match pat {
+            HirPatternRef::Const(c) => {
+                let c = self.lower_const(*c, base_ty);
+                Pattern::new(self.interner, PatternKind::Range { start: c, end: c })
+            }
+            HirPatternRef::NotNull => Pattern::new(self.interner, PatternKind::NotNull),
+            HirPatternRef::Or(pats) => {
+                let pats = PatList::new_from_iter(
+                    self.interner,
+                    pats.iter().map(|it| self.lower_pattern_ref(it, base_ty)).collect::<Option<Vec<_>>>()?,
+                );
+                Pattern::new(self.interner, PatternKind::Or(pats))
+            }
+            HirPatternRef::Range(HirRangePatternRef { start, end, end_inclusive }) => {
+                let start = match *start {
+                    Some(start) => self.lower_const(start, base_ty),
+                    None => self.const_from_bits(base_ty, self.scalar_min_bits(base_ty)?),
+                };
+                let has_end = end.is_some();
+                let mut end = match *end {
+                    Some(end) => self.lower_const(end, base_ty),
+                    None => self.const_from_bits(base_ty, self.scalar_max_bits(base_ty)?),
+                };
+                if has_end && !end_inclusive {
+                    end = self.decrement_const(base_ty, end)?;
+                }
+                Pattern::new(self.interner, PatternKind::Range { start, end })
+            }
+        })
+    }
+
+    fn scalar_min_bits(&self, ty: Ty<'db>) -> Option<u128> {
+        Some(match ty.kind() {
+            TyKind::Int(IntTy::I8) => i8::MIN as u8 as u128,
+            TyKind::Int(IntTy::I16) => i16::MIN as u16 as u128,
+            TyKind::Int(IntTy::I32) => i32::MIN as u32 as u128,
+            TyKind::Int(IntTy::I64) => i64::MIN as u64 as u128,
+            TyKind::Int(IntTy::I128) => i128::MIN as u128,
+            TyKind::Int(IntTy::Isize) => isize::MIN as usize as u128,
+            TyKind::Uint(_) | TyKind::Char => 0,
+            _ => return None,
+        })
+    }
+
+    fn scalar_max_bits(&self, ty: Ty<'db>) -> Option<u128> {
+        Some(match ty.kind() {
+            TyKind::Int(IntTy::I8) => i8::MAX as u8 as u128,
+            TyKind::Int(IntTy::I16) => i16::MAX as u16 as u128,
+            TyKind::Int(IntTy::I32) => i32::MAX as u32 as u128,
+            TyKind::Int(IntTy::I64) => i64::MAX as u64 as u128,
+            TyKind::Int(IntTy::I128) => i128::MAX as u128,
+            TyKind::Int(IntTy::Isize) => isize::MAX as usize as u128,
+            TyKind::Uint(UintTy::U8) => u8::MAX as u128,
+            TyKind::Uint(UintTy::U16) => u16::MAX as u128,
+            TyKind::Uint(UintTy::U32) => u32::MAX as u128,
+            TyKind::Uint(UintTy::U64) => u64::MAX as u128,
+            TyKind::Uint(UintTy::U128) => u128::MAX,
+            TyKind::Uint(UintTy::Usize) => usize::MAX as u128,
+            TyKind::Char => char::MAX as u32 as u128,
+            _ => return None,
+        })
+    }
+
+    fn scalar_size_bytes(&self, ty: Ty<'db>) -> Option<usize> {
+        Some(match ty.kind() {
+            TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => 1,
+            TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => 2,
+            TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) | TyKind::Char => 4,
+            TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => 8,
+            TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => 16,
+            TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => {
+                std::mem::size_of::<usize>()
+            }
+            _ => return None,
+        })
+    }
+
+    fn const_from_bits(&self, ty: Ty<'db>, bits: u128) -> Const<'db> {
+        let size = self.scalar_size_bytes(ty).expect("pattern ranges only use scalar base types");
+        let memory = bits.to_le_bytes()[..size].to_vec().into_boxed_slice();
+        Const::new(
+            self.interner,
+            rustc_type_ir::ConstKind::Value(ValueConst::new(
+                ty,
+                ConstBytes { memory, memory_map: MemoryMap::default() },
+            )),
+        )
+    }
+
+    fn const_to_bits(&self, c: Const<'db>) -> Option<u128> {
+        match c.kind() {
+            rustc_type_ir::ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
+                hir_def::GeneralConstId::ConstId(id) => {
+                    self.const_to_bits(self.db.const_eval(id, unevaluated_const.args, None).ok()?)
+                }
+                hir_def::GeneralConstId::StaticId(id) => {
+                    self.const_to_bits(self.db.const_eval_static(id).ok()?)
+                }
+            },
+            rustc_type_ir::ConstKind::Value(val) => {
+                Some(u128::from_le_bytes(crate::mir::pad16(&val.value.inner().memory, false)))
+            }
+            rustc_type_ir::ConstKind::Param(_)
+            | rustc_type_ir::ConstKind::Infer(_)
+            | rustc_type_ir::ConstKind::Bound(_, _)
+            | rustc_type_ir::ConstKind::Placeholder(_)
+            | rustc_type_ir::ConstKind::Error(_)
+            | rustc_type_ir::ConstKind::Expr(_) => None,
+        }
+    }
+
+    fn decrement_const(&self, ty: Ty<'db>, c: Const<'db>) -> Option<Const<'db>> {
+        let bits = self.const_to_bits(c)?;
+        let min = self.scalar_min_bits(ty)?;
+        if bits == min {
+            return None;
+        }
+        Some(self.const_from_bits(ty, bits.wrapping_sub(1)))
     }
 
     fn lower_fn_ptr(&mut self, fn_: &FnType) -> Ty<'db> {

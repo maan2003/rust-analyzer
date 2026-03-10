@@ -8,11 +8,12 @@ use hir_def::{
     layout::{LayoutCalculatorError, LayoutData},
 };
 use rustc_abi::{
-    AddressSpace, Float, Integer, LayoutCalculator, Primitive, ReprOptions, Scalar, StructKind,
-    TargetDataLayout, WrappingRange,
+    AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, Niche, Primitive, ReprOptions,
+    Scalar, StructKind, TargetDataLayout, WrappingRange,
 };
 use rustc_index::IndexVec;
 use rustc_type_ir::{
+    ConstKind,
     FloatTy, IntTy, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
@@ -22,8 +23,9 @@ use crate::{
     InferenceResult, ParamEnvAndCrate,
     consteval::try_const_usize,
     db::HirDatabase,
+    mir::pad16,
     next_solver::{
-        DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
+        Const, DbInterner, GenericArgs, Pattern, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
     traits::StoredParamEnvAndCrate,
@@ -139,8 +141,9 @@ pub fn layout_of_ty_query(
     let cx = LayoutCx::new(dl);
     let infer_ctxt = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let cause = ObligationCause::dummy();
+    let normalized_env = trait_env.clone();
     let ty = infer_ctxt
-        .at(&cause, trait_env.param_env())
+        .at(&cause, normalized_env.param_env())
         .deeply_normalize(ty.as_ref())
         .unwrap_or(ty.as_ref());
     let result = match ty.kind() {
@@ -321,9 +324,8 @@ pub fn layout_of_ty_query(
             return Err(LayoutError::NotImplemented);
         }
 
-        TyKind::Pat(_, _) | TyKind::UnsafeBinder(_) => {
-            return Err(LayoutError::NotImplemented);
-        }
+        TyKind::Pat(ty, pat) => return layout_of_pattern_ty(db, dl, trait_env, ty, pat),
+        TyKind::UnsafeBinder(_) => return Err(LayoutError::NotImplemented),
 
         TyKind::Error(_) => return Err(LayoutError::HasErrorType),
         TyKind::Placeholder(_)
@@ -371,6 +373,64 @@ fn struct_tail_erasing_lifetimes<'a>(db: &'a dyn HirDatabase, pointee: Ty<'a>) -
             }
         }
         _ => pointee,
+    }
+}
+
+fn layout_of_pattern_ty<'db>(
+    db: &'db dyn HirDatabase,
+    dl: &TargetDataLayout,
+    trait_env: StoredParamEnvAndCrate,
+    ty: Ty<'db>,
+    pat: Pattern<'db>,
+) -> Result<Arc<Layout>, LayoutError> {
+    let mut layout = (*db.layout_of_ty(ty.store(), trait_env)?).clone();
+    match pat.kind() {
+        rustc_type_ir::PatternKind::NotNull => {
+            let BackendRepr::Scalar(mut scalar) = layout.backend_repr else {
+                return Err(LayoutError::NotImplemented);
+            };
+            let Scalar::Initialized { value: Primitive::Pointer(_), valid_range } = &mut scalar else {
+                return Err(LayoutError::NotImplemented);
+            };
+            valid_range.start = 1;
+            layout.backend_repr = BackendRepr::Scalar(scalar);
+            layout.largest_niche = Niche::from_scalar(dl, rustc_abi::Size::ZERO, scalar);
+        }
+        rustc_type_ir::PatternKind::Range { start, end } => {
+            let BackendRepr::Scalar(Scalar::Initialized { value, .. }) = layout.backend_repr else {
+                return Err(LayoutError::NotImplemented);
+            };
+            let start = const_to_bits(db, start)?;
+            let end = const_to_bits(db, end)?;
+            let scalar = Scalar::Initialized {
+                value,
+                valid_range: WrappingRange { start, end },
+            };
+            layout.backend_repr = BackendRepr::Scalar(scalar);
+            layout.largest_niche = Niche::from_scalar(dl, rustc_abi::Size::ZERO, scalar);
+        }
+        rustc_type_ir::PatternKind::Or(_) => return Err(LayoutError::NotImplemented),
+    }
+    Ok(Arc::new(layout))
+}
+
+fn const_to_bits<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Result<u128, LayoutError> {
+    match c.kind() {
+        ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
+            hir_def::GeneralConstId::ConstId(id) => {
+                const_to_bits(db, db.const_eval(id, unevaluated_const.args, None).map_err(|_| LayoutError::HasErrorConst)?)
+            }
+            hir_def::GeneralConstId::StaticId(id) => {
+                const_to_bits(db, db.const_eval_static(id).map_err(|_| LayoutError::HasErrorConst)?)
+            }
+        },
+        ConstKind::Value(val) => Ok(u128::from_le_bytes(pad16(&val.value.inner().memory, false))),
+        ConstKind::Param(_)
+        | ConstKind::Infer(_)
+        | ConstKind::Bound(_, _)
+        | ConstKind::Placeholder(_)
+        | ConstKind::Error(_)
+        | ConstKind::Expr(_) => Err(LayoutError::HasErrorConst),
     }
 }
 

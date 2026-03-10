@@ -223,32 +223,9 @@ fn pattern_type_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // Best-effort fallback for rustc's built-in `pattern_type!`: erase the
-    // range pattern and keep only the underlying base type tokens.
-    let mut iter = tt.iter();
     let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
-    let mut saw_ty = false;
-
-    while let Some(next) = iter.peek() {
-        if matches!(next, tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.sym.as_str() == "is") {
-            if saw_ty {
-                return ExpandResult::ok(builder.build());
-            }
-            return ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                ExpandError::other(span, "expected base type before `is`"),
-            );
-        }
-
-        let Some(token_tree) = iter.next_as_view() else { break };
-        saw_ty = true;
-        builder.extend_with_tt(token_tree);
-    }
-
-    ExpandResult::new(
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-        ExpandError::other(span, "expected `pattern_type!(<ty> is <pattern>)`"),
-    )
+    builder.extend_with_tt(tt.token_trees());
+    ExpandResult::ok(builder.build())
 }
 
 fn assert_expand(

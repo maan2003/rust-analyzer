@@ -34,6 +34,11 @@ fn expr_no_struct(p: &mut Parser<'_>) {
     expr_bp(p, None, r, 1);
 }
 
+pub(super) fn expr_no_range(p: &mut Parser<'_>) {
+    let r = Restrictions { forbid_structs: false, prefer_stmt: false };
+    expr_bp(p, None, r, 3);
+}
+
 /// Parses the expression in `let pattern = expression`.
 /// It needs to be parsed with lower precedence than `&&`, so that
 /// `if let true = true && false` is parsed as `if (let true = true) && (true)`

@@ -1430,6 +1430,9 @@ fn coerce_pointee_expand(
             ast::Type::ParenType(ty) => {
                 ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
             }
+            ast::Type::PatternType(ty) => {
+                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
+            }
             ast::Type::PathType(ty) => ty.path().is_some_and(|path| {
                 if path.as_single_name_ref().is_some_and(|name| name.text() == param_name) {
                     ted::replace(

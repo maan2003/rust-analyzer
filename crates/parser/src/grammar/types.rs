@@ -41,6 +41,7 @@ pub(super) fn type_no_bounds(p: &mut Parser<'_>) {
 }
 
 fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
+    let m = p.start();
     match p.current() {
         T!['('] => paren_or_tuple_type(p),
         T![!] => never_type(p),
@@ -62,6 +63,14 @@ fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
         _ => {
             p.err_recover("expected type", TYPE_RECOVERY_SET);
         }
+    }
+
+    if p.at_contextual_kw(T![is]) {
+        p.bump_remap(T![is]);
+        pattern_type_pat(p);
+        m.complete(p, PATTERN_TYPE);
+    } else {
+        m.abandon(p);
     }
 }
 
@@ -407,4 +416,65 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
     // Finally precede everything with DYN_TRAIT_TYPE
     m.precede(p).complete(p, DYN_TRAIT_TYPE)
+}
+
+const PATTERN_TYPE_PAT_RECOVERY_SET: TokenSet = TYPE_RECOVERY_SET.union(TokenSet::new(&[T![|]]));
+
+fn pattern_type_pat(p: &mut Parser<'_>) {
+    let m = p.start();
+    pattern_type_pat_single(p);
+
+    if !p.at(T![|]) {
+        m.abandon(p);
+        return;
+    }
+
+    while p.eat(T![|]) {
+        pattern_type_pat_single(p);
+    }
+
+    m.complete(p, PATTERN_TYPE_OR_PAT);
+}
+
+fn pattern_type_pat_single(p: &mut Parser<'_>) {
+    if p.at(T![!]) && p.nth_at_contextual_kw(1, T![null]) {
+        let m = p.start();
+        p.bump(T![!]);
+        p.bump_remap(T![null]);
+        m.complete(p, PATTERN_TYPE_NOT_NULL_PAT);
+        return;
+    }
+
+    let m = p.start();
+    let has_start = if p.at(T![..=]) || p.at(T![..]) {
+        false
+    } else {
+        expressions::expr_no_range(p);
+        true
+    };
+
+    if p.at(T![..=]) {
+        p.bump(T![..=]);
+        if !matches!(
+            p.current(),
+            T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF
+        ) {
+            expressions::expr_no_range(p);
+        }
+        m.complete(p, PATTERN_TYPE_RANGE_PAT);
+    } else if p.at(T![..]) {
+        p.bump(T![..]);
+        if !matches!(
+            p.current(),
+            T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF
+        ) {
+            expressions::expr_no_range(p);
+        }
+        m.complete(p, PATTERN_TYPE_RANGE_PAT);
+    } else if has_start {
+        m.complete(p, PATTERN_TYPE_CONST_PAT);
+    } else {
+        m.abandon(p);
+        p.err_recover("expected pattern type pattern", PATTERN_TYPE_PAT_RECOVERY_SET);
+    }
 }

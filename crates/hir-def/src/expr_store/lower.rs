@@ -54,8 +54,9 @@ use crate::{
     lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
     type_ref::{
-        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
-        RefType, TraitBoundModifier, TraitRef, TypeBound, TypeRef, TypeRefId, UseArgRef,
+        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId,
+        PatternRef, PatternTypeRef, RangePatternRef, Rawness, RefType, TraitBoundModifier,
+        TraitRef, TypeBound, TypeRef, TypeRefId, UseArgRef,
     },
 };
 
@@ -629,6 +630,13 @@ impl<'db> ExprCollector<'db> {
             ast::Type::SliceType(inner) => {
                 TypeRef::Slice(self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn))
             }
+            ast::Type::PatternType(inner) => match self.lower_pattern_type_ref_opt(inner.pat()) {
+                Some(pat) => TypeRef::Pat(Box::new(PatternTypeRef {
+                    ty: self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn),
+                    pat,
+                })),
+                None => TypeRef::Error,
+            },
             ast::Type::RefType(inner) => {
                 let inner_ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 let lifetime = inner.lifetime().map(|lt| self.lower_lifetime_ref(lt));
@@ -713,6 +721,44 @@ impl<'db> ExprCollector<'db> {
             },
         };
         self.alloc_type_ref(ty, AstPtr::new(&node))
+    }
+
+    fn lower_pattern_type_ref_opt(
+        &mut self,
+        node: Option<ast::PatternTypePat>,
+    ) -> Option<PatternRef> {
+        let node = node?;
+        Some(match node {
+            ast::PatternTypePat::PatternTypeConstPat(it) => {
+                PatternRef::Const(ConstRef { expr: self.collect_expr_opt(it.expr()) })
+            }
+            ast::PatternTypePat::PatternTypeNotNullPat(_) => PatternRef::NotNull,
+            ast::PatternTypePat::PatternTypeOrPat(it) => PatternRef::Or(
+                it.pats()
+                    .filter_map(|it| self.lower_pattern_type_ref_opt(Some(it)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            ast::PatternTypePat::PatternTypeRangePat(it) => {
+                let mut exprs = it.syntax().children().filter_map(ast::Expr::cast).collect::<Vec<_>>();
+                let starts_with_range = it.syntax().first_token().is_some_and(|it| {
+                    matches!(it.kind(), syntax::SyntaxKind::DOT2 | syntax::SyntaxKind::DOT2EQ)
+                });
+                let (start, end) = if starts_with_range {
+                    (None, exprs.pop())
+                } else {
+                    let mut exprs = exprs.into_iter();
+                    (exprs.next(), exprs.next())
+                };
+                PatternRef::Range(RangePatternRef {
+                    start: start.map(|it| ConstRef { expr: self.collect_expr(it) }),
+                    end: end.map(|it| ConstRef { expr: self.collect_expr(it) }),
+                    end_inclusive: it.syntax().children_with_tokens().any(|it| {
+                        matches!(it.kind(), syntax::SyntaxKind::DOT2EQ)
+                    }),
+                })
+            }
+        })
     }
 
     pub(crate) fn lower_type_ref_disallow_impl_trait(&mut self, node: ast::Type) -> TypeRefId {

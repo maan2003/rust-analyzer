@@ -124,6 +124,7 @@ pub enum SyntaxKind {
     GLOBAL_ASM_KW,
     INLATEOUT_KW,
     INOUT_KW,
+    IS_KW,
     LABEL_KW,
     LATEOUT_KW,
     MACRO_RULES_KW,
@@ -132,6 +133,7 @@ pub enum SyntaxKind {
     NOMEM_KW,
     NORETURN_KW,
     NOSTACK_KW,
+    NULL_KW,
     OFFSET_OF_KW,
     OPTIONS_KW,
     OUT_KW,
@@ -257,6 +259,11 @@ pub enum SyntaxKind {
     PATH_PAT,
     PATH_SEGMENT,
     PATH_TYPE,
+    PATTERN_TYPE,
+    PATTERN_TYPE_CONST_PAT,
+    PATTERN_TYPE_NOT_NULL_PAT,
+    PATTERN_TYPE_OR_PAT,
+    PATTERN_TYPE_RANGE_PAT,
     PREFIX_EXPR,
     PTR_TYPE,
     RANGE_EXPR,
@@ -431,6 +438,11 @@ impl SyntaxKind {
             | PATH_PAT
             | PATH_SEGMENT
             | PATH_TYPE
+            | PATTERN_TYPE
+            | PATTERN_TYPE_CONST_PAT
+            | PATTERN_TYPE_NOT_NULL_PAT
+            | PATTERN_TYPE_OR_PAT
+            | PATTERN_TYPE_RANGE_PAT
             | PREFIX_EXPR
             | PTR_TYPE
             | RANGE_EXPR
@@ -608,6 +620,7 @@ impl SyntaxKind {
             GLOBAL_ASM_KW => "global_asm",
             INLATEOUT_KW => "inlateout",
             INOUT_KW => "inout",
+            IS_KW => "is",
             LABEL_KW => "label",
             LATEOUT_KW => "lateout",
             MACRO_RULES_KW => "macro_rules",
@@ -616,6 +629,7 @@ impl SyntaxKind {
             NOMEM_KW => "nomem",
             NORETURN_KW => "noreturn",
             NOSTACK_KW => "nostack",
+            NULL_KW => "null",
             OFFSET_OF_KW => "offset_of",
             OPTIONS_KW => "options",
             OUT_KW => "out",
@@ -711,6 +725,7 @@ impl SyntaxKind {
             GLOBAL_ASM_KW => true,
             INLATEOUT_KW => true,
             INOUT_KW => true,
+            IS_KW => true,
             LABEL_KW => true,
             LATEOUT_KW => true,
             MACRO_RULES_KW => true,
@@ -719,6 +734,7 @@ impl SyntaxKind {
             NOMEM_KW => true,
             NORETURN_KW => true,
             NOSTACK_KW => true,
+            NULL_KW => true,
             OFFSET_OF_KW => true,
             OPTIONS_KW => true,
             OUT_KW => true,
@@ -802,6 +818,7 @@ impl SyntaxKind {
             GLOBAL_ASM_KW => true,
             INLATEOUT_KW => true,
             INOUT_KW => true,
+            IS_KW => true,
             LABEL_KW => true,
             LATEOUT_KW => true,
             MACRO_RULES_KW => true,
@@ -810,6 +827,7 @@ impl SyntaxKind {
             NOMEM_KW => true,
             NORETURN_KW => true,
             NOSTACK_KW => true,
+            NULL_KW => true,
             OFFSET_OF_KW => true,
             OPTIONS_KW => true,
             OUT_KW => true,
@@ -956,6 +974,7 @@ impl SyntaxKind {
             "global_asm" => GLOBAL_ASM_KW,
             "inlateout" => INLATEOUT_KW,
             "inout" => INOUT_KW,
+            "is" => IS_KW,
             "label" => LABEL_KW,
             "lateout" => LATEOUT_KW,
             "macro_rules" => MACRO_RULES_KW,
@@ -964,6 +983,7 @@ impl SyntaxKind {
             "nomem" => NOMEM_KW,
             "noreturn" => NORETURN_KW,
             "nostack" => NOSTACK_KW,
+            "null" => NULL_KW,
             "offset_of" => OFFSET_OF_KW,
             "options" => OPTIONS_KW,
             "out" => OUT_KW,
@@ -1128,6 +1148,7 @@ macro_rules ! T_ {
     [global_asm] => { $ crate :: SyntaxKind :: GLOBAL_ASM_KW };
     [inlateout] => { $ crate :: SyntaxKind :: INLATEOUT_KW };
     [inout] => { $ crate :: SyntaxKind :: INOUT_KW };
+    [is] => { $ crate :: SyntaxKind :: IS_KW };
     [label] => { $ crate :: SyntaxKind :: LABEL_KW };
     [lateout] => { $ crate :: SyntaxKind :: LATEOUT_KW };
     [macro_rules] => { $ crate :: SyntaxKind :: MACRO_RULES_KW };
@@ -1136,6 +1157,7 @@ macro_rules ! T_ {
     [nomem] => { $ crate :: SyntaxKind :: NOMEM_KW };
     [noreturn] => { $ crate :: SyntaxKind :: NORETURN_KW };
     [nostack] => { $ crate :: SyntaxKind :: NOSTACK_KW };
+    [null] => { $ crate :: SyntaxKind :: NULL_KW };
     [offset_of] => { $ crate :: SyntaxKind :: OFFSET_OF_KW };
     [options] => { $ crate :: SyntaxKind :: OPTIONS_KW };
     [out] => { $ crate :: SyntaxKind :: OUT_KW };
