@@ -69,10 +69,9 @@ can be hardcoded initially.
 ### Linking
 
 - Use `cranelift-object` to emit `.o` files
-- Shell out to `rustc` as linker driver (handles library search paths,
-  native deps, platform quirks)
-- Entry point glue: emit symbol that `std::rt::lang_start` calls
-  (linker entry → `lang_start` in std → user `main`)
+- Shell out to `cc` and link against `libstd-*.so` from the host toolchain
+- Entry point glue: emit a C-ABI `main` wrapper that calls the user's Rust
+  `main` directly
 
 ### Mono-item collection
 
@@ -83,8 +82,8 @@ is needed for anything larger.
 **Milestone: `fn main() {}` compiles and runs.**
 
 Follow-up: `fn main() { println!("hello"); }` — this pulls in a huge
-transitive closure through std and will likely be the point where we need
-either ra-mir-export or a way to link against pre-compiled std objects.
+transitive closure through std and is the point where cross-crate MIR
+lowering, symbol resolution, and monomorphization breadth start to matter.
 
 ## Phase 3: Codegen breadth
 
@@ -110,33 +109,16 @@ needed to compile progressively more complex programs.
 - **Skip borrow checking.** Doesn't affect codegen. Run rustc in background
   for diagnostics.
 
-## Phase 4: ra-mir-export (dependency MIR)
+## Phase 4: ra-mir-export metadata
 
-**Deferred until we actually need it.** Build the converter when codegen is
-mature enough that the bottleneck is missing MIR for std/dependencies, not
-missing codegen capabilities.
-
-Build a **nightly-only** rustc driver that compiles a crate (with
-`-Z always-encode-mir`), reads MIR via rustc queries, and translates to
-r-a's MIR format.
-
-### Serialization format
-
-The format must capture:
-- Monomorphized MIR bodies
-- Full type information sufficient to compute layouts on the r-a side
-- Static/const initializer bodies
-- Mangled symbol names matching rustc's output
+`ra-mir-export` is currently a narrow metadata extractor, not a MIR exporter.
+It emits crate metadata (`StableCrateId`s) used for symbol disambiguation when
+calling into rustc-compiled sysroot code.
 
 ### Scope
 
-Run the converter on std + the dependency tree, cache the output.
-
-### Alternative: link against rustc-compiled objects directly
-
-For many cases, we don't need the MIR at all — we just need the symbol to
-exist in a `.rlib`/`.so`. Only functions we want to re-compile from source
-need their MIR. This may let us defer the converter even further.
+Keep `.mirdata` limited to the metadata needed for symbol resolution unless a
+real codegen bottleneck proves that a broader export path is necessary.
 
 ## Phase 5: Fill r-a's MIR gaps
 
@@ -201,7 +183,7 @@ process. The rac compilation path reuses that infrastructure.
 ## Open Questions
 
 - Can we link against rustc-compiled `.rlib` objects without the full
-  ra-mir-export converter? (Just need symbol resolution, not MIR.)
+  `ra-mir-export` metadata path? (Just need symbol resolution, not MIR.)
 - How to populate `TargetSpec` correctly — parse rustc's target JSON?
   Hardcode common targets? Query `rustc --print target-spec-json`?
 - `is_transparent` in `TyAbiInterface` — the trait provides no `cx`.

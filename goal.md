@@ -63,17 +63,9 @@ Cranelift.
 
 ### Dependency Handling: ra-mir-export
 
-r-a's MIR lowering doesn't cover all Rust constructs (async/await, inline asm,
-etc.), and dependencies may use any of them. To handle this:
-
-A companion **nightly** rustc driver (`ra-mir-export`) compiles dependencies
-with `-Z always-encode-mir`, reads the resulting MIR via rustc queries, and
-translates it to r-a's MIR format. This serves as:
-
-- **Fallback** for constructs r-a can't lower
-- **Pre-compilation** for the dependency tree (run once, cache)
-- **Gradual migration path** — start with the converter for everything, move
-  more to r-a's native lowering over time
+`ra-mir-export` does not export MIR bodies. It emits only crate metadata
+(`StableCrateId`s) used for symbol disambiguation when `cg-clif` links against
+or calls into rustc-compiled sysroot code.
 
 ## Why This Works
 
@@ -111,4 +103,3 @@ Once AOT compilation works, the same codegen can power a JIT mode:
 - Hot reload on save, sub-10ms edit-to-running-code
 
 This is a separate phase. Get AOT right first.
-

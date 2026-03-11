@@ -24,7 +24,7 @@ Aligned r-a's MIR data structures with rustc so cg_clif can translate them:
 projection, `SetDiscriminant` statement. Removed dead stubs (`NullaryOp`,
 old `BinaryOp(Infallible)`). Later: removed `DropAndReplace`, added
 `CastKind::Transmute`, `AggregateKind::RawPtr`, renamed provenance casts,
-`ThreadLocalRef(StaticId)`. See `MIR_STATUS.md` for full alignment status.
+`ThreadLocalRef(StaticId)`.
 
 ---
 
@@ -51,8 +51,6 @@ Full scalar codegen working:
 - Scalar locals as Cranelift variables, ZST locals, scalar params/returns.
 - `SwitchInt` multi-way branching, direct function calls (call chains,
   calls combined with branches), `Drop` (see M11f for full drop glue).
-
-See `crates/cg-clif/NOTES.md` for known bugs and upstream divergences.
 
 ---
 
@@ -123,8 +121,8 @@ Proves: symbols will resolve at link time.
 
 Compiled `fn main() {}` → `.o` → linked against std → runs as executable.
 Added `emit_entry_point()` (C-ABI `main` wrapper that calls user's Rust main
-and returns 0, skipping `lang_start`), `link.rs` (shells out to `cc` with all
-sysroot rlibs from `rustc --print target-libdir`), and `compile_executable()`
+and returns 0, skipping `lang_start`), `link.rs` (shells out to `cc` and links
+against `libstd-*.so` from `rustc --print target-libdir`), and `compile_executable()`
 orchestrating the full pipeline. Integration test `compile_and_run_empty_main`
 verifies the binary exits with code 0.
 
@@ -173,8 +171,8 @@ fn main() -> ! {
 }
 ```
 
-Calls `std::process::exit` through v0-mangled symbol resolved from the
-real std rlib at link time. Required:
+Calls `std::process::exit` through a v0-mangled symbol resolved against the
+host sysroot. Required:
 
 - **Crate disambiguator extraction** (`link.rs`): loads `StableCrateId`
   values from `.mirdata` files produced by `ra-mir-export`, a rustc
@@ -184,20 +182,13 @@ real std rlib at link time. Required:
   `func_id.krate(db) != local_crate`; cross-crate calls use type-based
   signatures (`build_fn_sig_from_ty`) and v0 mangled names with real
   disambiguators. `collect_reachable_fns` skips external functions.
-- **Allocator shim** (`lib.rs`): emits `__rust_alloc`, `__rust_dealloc`,
-  `__rust_realloc`, `__rust_alloc_zeroed`, and
-  `__rust_no_alloc_shim_is_unstable_v2` as wrappers around libc
-  malloc/free/realloc/calloc. Uses `__rustc` crate disambiguator
-  extracted from std's symbol table. Will be removed when switching to
-  `rustc` as linker driver.
-- **Linker hardening**: `--start-group`/`--end-group` for circular rlib
-  deps, `--gc-sections` to trim unused std code, filter out `rustc-dev`
-  symlinks (NixOS).
+- **Dynamic sysroot linking** (`link.rs`): links against `libstd-*.so` from
+  the host toolchain instead of enumerating sysroot rlibs manually.
 - **ScalarPair support** in `build_fn_sig_from_ty` for functions that
   take/return pairs (slices, wide pointers).
 
-Proves: v0 mangling produces symbols that match real rlibs, cross-crate
-function detection works, type-based signatures are correct.
+Proves: v0 mangling produces symbols that resolve against the host sysroot,
+cross-crate function detection works, and type-based signatures are correct.
 
 ### M8: Structs and enums ✅
 
