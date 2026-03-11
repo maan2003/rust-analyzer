@@ -2760,7 +2760,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "investigation probe: iterator collect path"]
 fn std_jit_iter_repeat_take_collect_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -2939,7 +2938,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: unresolved HasErrorType in fs create-dir path"]
 fn std_jit_fs_create_dir_metadata_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3181,7 +3179,6 @@ fn foo() -> i32 {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "currently fails: monomorphization errors in core::fmt::Arguments::estimated_capacity"]
 fn std_jit_format_macro_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3211,7 +3208,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: format! with named arguments crashes in std JIT"]
 fn std_jit_format_named_args_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3227,7 +3223,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: write! macro formatting path crashes in std JIT"]
 fn std_jit_write_macro_probe() {
     let result: i32 = jit_run_with_std(
         r#"
