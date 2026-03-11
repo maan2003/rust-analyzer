@@ -347,7 +347,8 @@ impl CPlace {
                         // Delegate to scalar/pair load if possible, else memcpy
                         match self.layout.backend_repr {
                             BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => {
-                                let clif_ty = backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
+                                let clif_ty =
+                                    backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
                                 let val = from_ptr.load(&mut fx.bcx, clif_ty, flags);
                                 ptr.store(&mut fx.bcx, val, flags);
                             }
@@ -397,25 +398,21 @@ impl CPlace {
     ///
     /// `field_idx` is the field index in the layout's `FieldsShape`.
     /// `field_layout` is the layout of the field being projected to.
-    pub(crate) fn place_field(
+    pub(crate) fn place_field_with_bcx(
         &self,
-        fx: &mut FunctionCx<'_, impl Module>,
+        bcx: &mut cranelift_frontend::FunctionBuilder<'_>,
+        pointer_type: Type,
         field_idx: usize,
         field_layout: Arc<Layout>,
     ) -> CPlace {
         match self.inner {
             CPlaceInner::VarPair(var1, var2) => {
-                // Special case: if the field itself is ScalarPair (newtype wrapper),
-                // it encompasses the whole pair (e.g. Box<[u8]>.field(0) → Unique<[u8]>).
                 if matches!(field_layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
                     return CPlace {
                         inner: CPlaceInner::VarPair(var1, var2),
                         layout: field_layout,
                     };
                 }
-                // ScalarPair: select first or second scalar based on field offset.
-                // Typically field 0 → var1, field 1 → var2, but unions may have
-                // field_idx > 1 still at offset 0.
                 let offset = self.layout.fields.offset(field_idx);
                 if offset == Size::ZERO {
                     CPlace { inner: CPlaceInner::Var(var1), layout: field_layout }
@@ -424,7 +421,6 @@ impl CPlace {
                 }
             }
             CPlaceInner::Var(var) => {
-                // Scalar place: field must be at offset 0 (struct field 0, or union field N).
                 debug_assert_eq!(
                     self.layout.fields.offset(field_idx),
                     Size::ZERO,
@@ -434,20 +430,25 @@ impl CPlace {
             }
             CPlaceInner::Addr(ptr, extra) => {
                 let offset = self.layout.fields.offset(field_idx);
-                let field_ptr = ptr.offset_i64(
-                    &mut fx.bcx,
-                    fx.pointer_type,
-                    i64::try_from(offset.bytes()).unwrap(),
-                );
-                // Preserve metadata for unsized fields (e.g., [T] in ByteStr([u8]))
-                if matches!(field_layout.backend_repr, BackendRepr::Memory { sized: false }) {
-                    if let Some(extra) = extra {
-                        return CPlace::for_ptr_with_extra(field_ptr, extra, field_layout);
-                    }
+                let field_ptr =
+                    ptr.offset_i64(bcx, pointer_type, i64::try_from(offset.bytes()).unwrap());
+                if matches!(field_layout.backend_repr, BackendRepr::Memory { sized: false })
+                    && let Some(extra) = extra
+                {
+                    return CPlace::for_ptr_with_extra(field_ptr, extra, field_layout);
                 }
                 CPlace::for_ptr(field_ptr, field_layout)
             }
         }
+    }
+
+    pub(crate) fn place_field(
+        &self,
+        fx: &mut FunctionCx<'_, impl Module>,
+        field_idx: usize,
+        field_layout: Arc<Layout>,
+    ) -> CPlace {
+        self.place_field_with_bcx(&mut fx.bcx, fx.pointer_type, field_idx, field_layout)
     }
 
     /// Project directly to lane `0`/`1` of a ScalarPair place.

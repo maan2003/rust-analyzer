@@ -1,9 +1,9 @@
 //! PassMode-specific lowering helpers.
 
+use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::ir::{
     AbiParam, ArgumentPurpose, MemFlags, StackSlotData, StackSlotKind, Value, types,
 };
-use cranelift_codegen::ir::InstBuilder;
 use cranelift_module::Module;
 use rac_abi::callconv::{ArgAttributes, ArgExtension, CastTarget, PassMode, Reg, RegKind};
 use rustc_abi::{BackendRepr, Size, TargetDataLayout};
@@ -37,7 +37,7 @@ fn apply_attrs_to_abi_param(param: AbiParam, attrs: ArgAttributes) -> AbiParam {
     }
 }
 
-fn cast_target_to_abi_params(cast: &CastTarget) -> Vec<(Size, AbiParam)> {
+pub(crate) fn cast_target_to_abi_params(cast: &CastTarget) -> Vec<(Size, AbiParam)> {
     if let Some(offset_from_start) = cast.rest_offset {
         assert!(cast.prefix[1..].iter().all(|p| p.is_none()));
         assert_eq!(cast.rest.unit.size, cast.rest.total);
@@ -220,7 +220,8 @@ pub(crate) fn from_casted_value(
 ) -> CValue {
     let abi_params = cast_target_to_abi_params(cast);
     let abi_param_size: u32 = abi_params.iter().map(|(_, param)| param.value_type.bytes()).sum();
-    let layout_size = u32::try_from(layout.size.bytes()).expect("cast layout size does not fit in u32");
+    let layout_size =
+        u32::try_from(layout.size.bytes()).expect("cast layout size does not fit in u32");
     let slot_size = abi_param_size.max(layout_size);
     let place = if slot_size == 0 {
         CPlace::for_ptr(crate::pointer::Pointer::dangling(layout.align.abi), layout.clone())
@@ -258,8 +259,22 @@ pub(crate) fn adjust_arg_for_abi(
 ) -> Vec<Value> {
     match arg_abi.mode {
         PassMode::Ignore => Vec::new(),
-        PassMode::Direct(_) => vec![arg.load_scalar(fx)],
+        PassMode::Direct(_) => {
+            let abi_layout = arg_abi.layout.as_ref().expect("Direct ABI without layout").clone();
+            let arg = if matches!(arg.layout.backend_repr, BackendRepr::Scalar(_)) {
+                arg
+            } else {
+                CValue::by_ref(arg.force_stack(fx), abi_layout)
+            };
+            vec![arg.load_scalar(fx)]
+        }
         PassMode::Pair(_, _) => {
+            let abi_layout = arg_abi.layout.as_ref().expect("Pair ABI without layout").clone();
+            let arg = if matches!(arg.layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
+                arg
+            } else {
+                CValue::by_ref(arg.force_stack(fx), abi_layout)
+            };
             let (a, b) = arg.load_scalar_pair(fx);
             vec![a, b]
         }

@@ -272,6 +272,32 @@ fn find_fn(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Functi
     panic!("function `{name}` not found")
 }
 
+fn find_const(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::ConstId {
+    let module_id = module_for_file(db, file_id.file_id(db));
+    let def_map = module_id.def_map(db);
+    let scope = &def_map[module_id].scope;
+
+    if let Some(konst) = scope.declarations().find_map(|x| match x {
+        hir_def::ModuleDefId::ConstId(x) => {
+            if db
+                .const_signature(x)
+                .name
+                .as_ref()
+                .is_some_and(|it| it.display(db, Edition::CURRENT).to_string() == name)
+            {
+                Some(x)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }) {
+        return konst;
+    }
+
+    panic!("const `{name}` not found")
+}
+
 fn get_mir_and_env(
     db: &TestDB,
     func_id: hir_def::FunctionId,
@@ -398,8 +424,7 @@ fn jit_run<R: Copy>(src: &str, fn_names: &[&str], entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
-        jit_builder
-            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
+        jit_builder.symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
@@ -1761,8 +1786,7 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
-        jit_builder
-            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
+        jit_builder.symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
@@ -1827,9 +1851,11 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             if !compiled_closure_symbols.insert(closure_name.clone()) {
                 continue;
             }
-            let body = match db
-                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-            {
+            let body = match db.monomorphized_mir_body_for_closure(
+                *closure_id,
+                closure_subst.clone(),
+                env.clone(),
+            ) {
                 Ok(body) => body,
                 Err(hir_ty::mir::MirLowerError::UnresolvedName(_)) => continue,
                 Err(e) => panic!("closure MIR error for {closure_name}: {e:?}"),
@@ -1942,10 +1968,7 @@ fn walk_rs_files(
 }
 
 fn discover_rustc_sysroot_src_override() -> Option<vfs::AbsPathBuf> {
-    let output = std::process::Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .ok()?;
+    let output = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2094,8 +2117,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         jit_builder.symbol("__rust_dealloc", jit_rust_dealloc as *const u8);
         jit_builder.symbol("__rust_realloc", jit_rust_realloc as *const u8);
         jit_builder.symbol("__rust_alloc_zeroed", jit_rust_alloc_zeroed as *const u8);
-        jit_builder
-            .symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
+        jit_builder.symbol("__rust_alloc_error_handler", jit_rust_alloc_error_handler as *const u8);
         jit_builder.symbol(
             "__rust_no_alloc_shim_is_unstable_v2",
             jit_rust_no_alloc_shim_is_unstable_v2 as *const u8,
@@ -2117,27 +2139,28 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
 
         let dl = get_target_data_layout(&db, entry_func_id);
 
-        let should_codegen_cross_crate = |func_id: hir_def::FunctionId,
-                                          generic_args: &hir_ty::next_solver::StoredGenericArgs| {
-            let generic_args = generic_args.as_ref();
-            let is_cross_crate = func_id.krate(&db) != local_crate;
-            if !is_cross_crate {
-                return true;
-            }
+        let should_codegen_cross_crate =
+            |func_id: hir_def::FunctionId,
+             generic_args: &hir_ty::next_solver::StoredGenericArgs| {
+                let generic_args = generic_args.as_ref();
+                let is_cross_crate = func_id.krate(&db) != local_crate;
+                if !is_cross_crate {
+                    return true;
+                }
 
-            if !generic_args.as_ref().is_empty() {
-                return true;
-            }
+                if !generic_args.as_ref().is_empty() {
+                    return true;
+                }
 
-            let fn_name = crate::symbol_mangling::mangle_function(
-                &db,
-                func_id,
-                generic_args,
-                &disambiguators,
-            );
+                let fn_name = crate::symbol_mangling::mangle_function(
+                    &db,
+                    func_id,
+                    generic_args,
+                    &disambiguators,
+                );
 
-            !libstd_exports_symbol(libstd_handle, &fn_name)
-        };
+                !libstd_exports_symbol(libstd_handle, &fn_name)
+            };
 
         let (reachable_fns, reachable_closures, drop_types) =
             crate::collect_reachable_fns_with_body_filter(
@@ -2229,9 +2252,11 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 }
                 continue;
             }
-            let body = match db
-                .monomorphized_mir_body_for_closure(*closure_id, closure_subst.clone(), env.clone())
-            {
+            let body = match db.monomorphized_mir_body_for_closure(
+                *closure_id,
+                closure_subst.clone(),
+                env.clone(),
+            ) {
                 Ok(body) => body,
                 Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
                     if trace_enabled {
@@ -3542,6 +3567,53 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn const_eval_raw_ptr_preserves_backing_allocation() {
+    let (db, file_ids) = TestDB::with_many_files(
+        r#"
+//- /main.rs
+#[repr(align(16))]
+struct Align16;
+
+#[repr(C)]
+struct AlignedTags {
+    _align: Align16,
+    tags: [i8; 16],
+}
+
+const ALIGNED_TAGS: AlignedTags = AlignedTags { _align: Align16, tags: [-1_i8; 16] };
+
+const RAW_PTR: *const i8 = &ALIGNED_TAGS.tags as *const [i8; 16] as *const i8;
+"#,
+    );
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let const_id = find_const(&db, file_id, "RAW_PTR");
+        let interner = DbInterner::new_no_crate(&db);
+        let value = db
+            .const_eval(const_id, GenericArgs::empty(interner), None)
+            .expect("const eval RAW_PTR");
+        let resolved = crate::resolve_const_value(&db, value);
+        let bytes = resolved.value.inner();
+        let ptr_size = std::mem::size_of::<usize>();
+        let raw = usize::from_le_bytes(bytes.memory[..ptr_size].try_into().unwrap());
+        let allocs = match &bytes.memory_map {
+            hir_ty::MemoryMap::Empty => Vec::new(),
+            hir_ty::MemoryMap::Simple(data) => vec![(0, data.len())],
+            hir_ty::MemoryMap::Complex(cm) => {
+                cm.memory_iter().map(|(base, data)| (*base, data.len())).collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(allocs.len(), 1, "unexpected alloc shape: raw={raw:#x}, allocs={allocs:?}");
+        assert_eq!(allocs[0].1, 16, "unexpected alloc size: raw={raw:#x}, allocs={allocs:?}");
+        assert!(
+            raw >= allocs[0].0 && raw < allocs[0].0 + allocs[0].1,
+            "pointer not inside preserved alloc: raw={raw:#x}, allocs={allocs:?}"
+        );
+    });
 }
 
 #[test]

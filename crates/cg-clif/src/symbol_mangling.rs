@@ -48,9 +48,8 @@ pub fn mangle_function(
     let fn_name = db.function_signature(func_id).name.as_str().to_owned();
     let fn_disambiguator = m.function_disambiguator(func_id, container, &fn_name);
 
-    let has_non_lifetime_args = generic_args
-        .iter()
-        .any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
+    let has_non_lifetime_args =
+        generic_args.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
     if !has_non_lifetime_args {
         // No generic args — simple path.
@@ -137,9 +136,8 @@ pub fn mangle_closure(
 
     // Mirror function symbol behavior: encode non-lifetime args so multiple
     // monomorphized instances of the same closure id don't collide.
-    let has_non_lifetime_args = generic_args
-        .iter()
-        .any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
+    let has_non_lifetime_args =
+        generic_args.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
 
     if !has_non_lifetime_args {
         return out;

@@ -171,7 +171,9 @@ pub struct Evaluator<'db> {
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: Arc<TargetDataLayout>,
     stack: Vec<u8>,
+    stack_allocations: Vec<(usize, usize)>,
     heap: Vec<u8>,
+    heap_allocations: Vec<(usize, usize)>,
     code_stack: Vec<StackFrame>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
@@ -652,7 +654,9 @@ impl<'db> Evaluator<'db> {
         Ok(Evaluator {
             target_data_layout,
             stack: vec![0],
+            stack_allocations: vec![(0, 1)],
             heap: vec![0],
+            heap_allocations: vec![(0, 1)],
             code_stack: vec![],
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
@@ -1151,6 +1155,7 @@ impl<'db> Evaluator<'db> {
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
                 locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
+                self.stack_allocations.push((my_ptr, size));
             }
             stack_ptr - self.stack.len()
         };
@@ -2242,7 +2247,38 @@ impl<'db> Evaluator<'db> {
         }
         let pos = self.heap.len();
         self.heap.extend(std::iter::repeat_n(0, size));
+        self.heap_allocations.push((pos, size));
         Ok(Address::Heap(pos))
+    }
+
+    fn heap_allocation_containing(&self, addr: Address) -> Option<(usize, &[u8])> {
+        let Heap(pos) = addr else {
+            return None;
+        };
+        self.heap_allocations.iter().rev().find_map(|&(base, size)| {
+            let end = base.checked_add(size)?;
+            if pos < base || pos >= end {
+                return None;
+            }
+            Some((base + HEAP_OFFSET, &self.heap[base..end]))
+        })
+    }
+
+    fn stack_allocation_containing(&self, addr: Address) -> Option<(usize, &[u8])> {
+        let Stack(pos) = addr else {
+            return None;
+        };
+        self.stack_allocations.iter().rev().find_map(|&(base, size)| {
+            let end = base.checked_add(size)?;
+            if pos < base || pos >= end {
+                return None;
+            }
+            Some((base + STACK_OFFSET, &self.stack[base..end]))
+        })
+    }
+
+    fn allocation_containing(&self, addr: Address) -> Option<(usize, &[u8])> {
+        self.stack_allocation_containing(addr).or_else(|| self.heap_allocation_containing(addr))
     }
 
     fn detect_fn_trait(&self, def: FunctionId) -> Option<FnTrait> {
@@ -2287,13 +2323,18 @@ impl<'db> Evaluator<'db> {
                             }
 
                             let addr = Address::from_usize(addr_usize);
-                            match this.read_memory(addr, size) {
-                                Ok(memory) => mm.insert(addr_usize, memory.into()),
-                                // Raw pointers are allowed to dangle, so only preserve
-                                // relocation/provenance when the pointee is actually backed
-                                // by our interpreter memory.
-                                Err(_) if is_raw_ptr => {}
-                                Err(e) => return Err(e),
+                            match this.allocation_containing(addr) {
+                                Some((base_addr, memory)) => {
+                                    mm.insert(base_addr, memory.to_vec().into_boxed_slice())
+                                }
+                                None => match this.read_memory(addr, size) {
+                                    Ok(memory) => mm.insert(addr_usize, memory.into()),
+                                    // Raw pointers are allowed to dangle, so only preserve
+                                    // relocation/provenance when the pointee is actually backed
+                                    // by our interpreter memory.
+                                    Err(_) if is_raw_ptr => {}
+                                    Err(e) => return Err(e),
+                                },
                             }
                         }
                         None => {

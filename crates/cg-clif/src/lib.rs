@@ -32,8 +32,8 @@ use hir_ty::db::HirDatabase;
 use hir_ty::display::{DisplayTarget, HirDisplay};
 use hir_ty::method_resolution::TraitImpls;
 use hir_ty::mir::{
-    BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, Place, ProjectionElem,
-    Rvalue, StatementKind, TerminatorKind, UnOp,
+    BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind, Place,
+    ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use hir_ty::next_solver::{
     Const, ConstKind, DbInterner, GenericArgs, IntoKind, StoredGenericArgs, StoredTy, TyKind,
@@ -94,19 +94,11 @@ fn pointer_ty(dl: &TargetDataLayout) -> Type {
     }
 }
 
-fn scalar_or_simd_backend_repr_to_clif_type(dl: &TargetDataLayout, repr: &BackendRepr) -> Type {
-    match repr {
-        BackendRepr::Scalar(scalar) => scalar_to_clif_type(dl, scalar),
-        BackendRepr::SimdVector { element, count } => {
-            let lane = scalar_to_clif_type(dl, element);
-            lane.by((*count).try_into().expect("SIMD lane count does not fit u32"))
-                .expect("unsupported SIMD lane shape")
-        }
-        _ => panic!("backend repr does not fit in a single clif value: {repr:?}"),
-    }
-}
-
-fn bool_to_zero_or_max_uint(fx: &mut FunctionCx<'_, impl Module>, dst_ty: Type, val: Value) -> Value {
+fn bool_to_zero_or_max_uint(
+    fx: &mut FunctionCx<'_, impl Module>,
+    dst_ty: Type,
+    val: Value,
+) -> Value {
     let int_ty = match dst_ty {
         types::F16 => types::I16,
         types::F32 => types::I32,
@@ -131,15 +123,34 @@ fn iconst_from_bits(bcx: &mut FunctionBuilder<'_>, ty: Type, bits: u128) -> Valu
     }
 }
 
+fn build_simd_value_from_lane_values(
+    fx: &mut FunctionCx<'_, impl Module>,
+    layout: LayoutArc,
+    lane_ty: Type,
+    lane_values: impl IntoIterator<Item = Value>,
+) -> Value {
+    let tmp = CPlace::new_stack_slot(fx, layout);
+    let ptr = tmp.to_ptr();
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+
+    for (idx, lane) in lane_values.into_iter().enumerate() {
+        ptr.offset_i64(&mut fx.bcx, fx.pointer_type, idx as i64 * lane_ty.bytes() as i64).store(
+            &mut fx.bcx,
+            lane,
+            flags,
+        );
+    }
+
+    tmp.to_cvalue(fx).load_scalar(fx)
+}
+
 fn int_min_max_values(bcx: &mut FunctionBuilder<'_>, ty: Type, signed: bool) -> (Value, Value) {
     assert!(ty.is_int(), "expected integer type, got {ty:?}");
     let bits = ty.bits();
     if signed {
         let sign_bit = 1u128 << (bits - 1);
-        (
-            iconst_from_bits(bcx, ty, sign_bit),
-            iconst_from_bits(bcx, ty, sign_bit - 1),
-        )
+        (iconst_from_bits(bcx, ty, sign_bit), iconst_from_bits(bcx, ty, sign_bit - 1))
     } else {
         let max = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
         (iconst_from_bits(bcx, ty, 0), iconst_from_bits(bcx, ty, max))
@@ -196,6 +207,8 @@ pub(crate) struct FunctionCx<'a, M: Module> {
     /// Only present for locals that have drop glue. Checked in codegen_drop
     /// to skip drops on moved-out locals (r-a's MIR lacks drop elaboration).
     pub(crate) drop_flags: HashMap<u32, Variable>,
+    /// Hidden `#[track_caller]` argument forwarded to nested tracked calls.
+    pub(crate) caller_location: Option<Value>,
 }
 
 impl<'a, M: Module> FunctionCx<'a, M> {
@@ -254,6 +267,107 @@ impl<'a, M: Module> FunctionCx<'a, M> {
             self.bcx.def_var(var, zero);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Caller location
+// ---------------------------------------------------------------------------
+
+fn mir_span_file_path_line_col(
+    db: &dyn HirDatabase,
+    body: &MirBody,
+    span: MirSpan,
+) -> Option<(String, u32, u32)> {
+    let source_map = db.body_with_source_map(body.owner).1;
+    let node = match span {
+        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?.map(|it| it.syntax_node_ptr()),
+        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?.map(|it| it.syntax_node_ptr()),
+        MirSpan::BindingId(binding) => source_map
+            .patterns_for_binding(binding)
+            .iter()
+            .find_map(|pat| source_map.pat_syntax(*pat).ok())
+            .map(|it| it.map(|node| node.syntax_node_ptr()))?,
+        MirSpan::SelfParam => source_map.self_param_syntax()?.map(|it| it.syntax_node_ptr()),
+        MirSpan::Unknown => return None,
+    };
+
+    let file_id = node.file_id.original_file(db).file_id(db);
+    let source_root = db.source_root(db.file_source_root(file_id).source_root_id(db));
+    let path = source_root
+        .source_root(db)
+        .path_for_file(&file_id)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("<file {:?}>", file_id));
+
+    let text = db.file_text(file_id).text(db);
+    let start =
+        usize::try_from(u32::from(node.value.text_range().start())).expect("offset overflow");
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for &byte in text.as_bytes().get(..start).unwrap_or_default() {
+        if byte == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+
+    Some((path, line, col))
+}
+
+fn write_target_usize(dl: &TargetDataLayout, bytes: &mut [u8], value: usize) {
+    match (dl.endian, bytes.len()) {
+        (rustc_abi::Endian::Little, 8) => bytes.copy_from_slice(&(value as u64).to_le_bytes()),
+        (rustc_abi::Endian::Little, 4) => bytes.copy_from_slice(&(value as u32).to_le_bytes()),
+        (rustc_abi::Endian::Big, 8) => bytes.copy_from_slice(&(value as u64).to_be_bytes()),
+        (rustc_abi::Endian::Big, 4) => bytes.copy_from_slice(&(value as u32).to_be_bytes()),
+        _ => unreachable!("unsupported pointer width"),
+    }
+}
+
+fn write_target_u32(dl: &TargetDataLayout, bytes: &mut [u8], value: u32) {
+    match dl.endian {
+        rustc_abi::Endian::Little => bytes.copy_from_slice(&value.to_le_bytes()),
+        rustc_abi::Endian::Big => bytes.copy_from_slice(&value.to_be_bytes()),
+    }
+}
+
+fn codegen_caller_location_ptr(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan) -> Value {
+    let (path, line, col) = mir_span_file_path_line_col(fx.db(), fx.ra_body(), span)
+        .unwrap_or_else(|| ("<unknown>".to_owned(), 1, 1));
+
+    let file_bytes = path.into_bytes();
+    let file_data_id =
+        fx.module.declare_anonymous_data(false, false).expect("declare caller-location file data");
+    let mut file_data_desc = DataDescription::new();
+    file_data_desc.define(file_bytes.clone().into_boxed_slice());
+    file_data_desc.set_align(1);
+    fx.module.define_data(file_data_id, &file_data_desc).expect("define caller-location file data");
+
+    let ptr_size = fx.dl.pointer_size().bytes_usize();
+    let mut location_bytes = vec![0u8; ptr_size * 2 + 8];
+    write_target_usize(fx.dl, &mut location_bytes[ptr_size..ptr_size * 2], file_bytes.len());
+    write_target_u32(fx.dl, &mut location_bytes[ptr_size * 2..ptr_size * 2 + 4], line);
+    write_target_u32(fx.dl, &mut location_bytes[ptr_size * 2 + 4..ptr_size * 2 + 8], col);
+
+    let location_data_id =
+        fx.module.declare_anonymous_data(false, false).expect("declare caller-location data");
+    let mut location_data_desc = DataDescription::new();
+    let file_gv = fx.module.declare_data_in_data(file_data_id, &mut location_data_desc);
+    location_data_desc.define(location_bytes.into_boxed_slice());
+    location_data_desc.write_data_addr(0, file_gv, 0);
+    location_data_desc.set_align(fx.dl.pointer_align().abi.bytes());
+    fx.module
+        .define_data(location_data_id, &location_data_desc)
+        .expect("define caller-location data");
+
+    let location_gv = fx.module.declare_data_in_func(location_data_id, fx.bcx.func);
+    fx.bcx.ins().symbol_value(fx.pointer_type, location_gv)
+}
+
+fn get_caller_location(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan) -> Value {
+    fx.caller_location.unwrap_or_else(|| codegen_caller_location_ptr(fx, span))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,8 +514,8 @@ fn place_ty_resolve(
             }
             ProjectionElem::Subslice { from, to } => match ty.as_ref().kind() {
                 TyKind::Array(elem, len) => {
-                    let new_len =
-                        try_const_usize(db, len).and_then(|n| n.checked_sub(u128::from(*from + *to)));
+                    let new_len = try_const_usize(db, len)
+                        .and_then(|n| n.checked_sub(u128::from(*from + *to)));
                     let new_len_const = usize_const(db, new_len, local_crate);
                     let interner = DbInterner::new_no_crate(db);
                     hir_ty::next_solver::Ty::new_array_with_const_len(interner, elem, new_len_const)
@@ -431,11 +545,7 @@ fn place_ty(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> StoredTy {
 /// Returns `None` when a projection chain can't be resolved structurally
 /// (e.g. overloaded indexing), so callers can conservatively treat the
 /// operand as ownership-consuming instead of panicking.
-fn place_ty_for_ownership(
-    db: &dyn HirDatabase,
-    body: &MirBody,
-    place: &Place,
-) -> Option<StoredTy> {
+fn place_ty_for_ownership(db: &dyn HirDatabase, body: &MirBody, place: &Place) -> Option<StoredTy> {
     place_ty_resolve(db, body, place, PlaceTyResolveMode::Conservative)
 }
 
@@ -1113,12 +1223,8 @@ fn codegen_unsize_coercion(
         .as_ref()
         .builtin_deref(true)
         .expect("Unsize source must be a pointer/reference type");
-    let metadata = unsize_metadata_for_pointees(
-        fx,
-        source_pointee.store(),
-        target_pointee.store(),
-        from_meta,
-    );
+    let metadata =
+        unsize_metadata_for_pointees(fx, source_pointee.store(), target_pointee.store(), from_meta);
 
     match result_layout.backend_repr {
         BackendRepr::ScalarPair(_, _) => {
@@ -1485,10 +1591,7 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
     for proj in projections {
         match proj {
             ProjectionElem::Field(field) => {
-                let field_idx = match field {
-                    Either::Left(field_id) => field_id.local_id.into_raw().into_u32() as usize,
-                    Either::Right(tuple_field_id) => tuple_field_id.index as usize,
-                };
+                let field_idx = field_index(fx.db(), field);
 
                 // Determine the field type from the current type
                 let field_ty = field_type(fx.db(), &cur_ty, field);
@@ -1808,6 +1911,27 @@ fn field_type(
                 .store()
         }
         _ => todo!("field_type for {:?}", parent_ty.as_ref().kind()),
+    }
+}
+
+fn field_index(
+    db: &dyn HirDatabase,
+    field: &Either<hir_def::FieldId, hir_def::TupleFieldId>,
+) -> usize {
+    match field {
+        Either::Right(tuple_field_id) => tuple_field_id.index as usize,
+        Either::Left(field_id) => field_id
+            .parent
+            .fields(db)
+            .fields()
+            .iter()
+            .position(|(candidate, _)| candidate == field_id.local_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "field {:?} not found in declared order for variant {:?}",
+                    field_id.local_id, field_id.parent,
+                )
+            }),
     }
 }
 
@@ -2858,9 +2982,7 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
             let data_id = fx
                 .module
                 .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
-                .unwrap_or_else(|e| {
-                    panic!("declare imported static `{symbol_name}` failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("declare imported static `{symbol_name}` failed: {e}"));
             let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
             fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
         } else {
@@ -3137,25 +3259,17 @@ fn collect_memory_map_allocs(memory_map: &hir_ty::MemoryMap<'_>) -> Vec<(usize, 
     match memory_map.clone() {
         MemoryMap::Empty => Vec::new(),
         MemoryMap::Simple(data) => vec![(0, data)],
-        MemoryMap::Complex(cm) => cm
-            .memory_iter()
-            .map(|(addr, data)| (*addr, data.to_vec().into_boxed_slice()))
-            .collect(),
+        MemoryMap::Complex(cm) => {
+            cm.memory_iter().map(|(addr, data)| (*addr, data.to_vec().into_boxed_slice())).collect()
+        }
     }
 }
 
 fn const_data_alloc_align(base: usize) -> u64 {
-    if base == 0 {
-        64
-    } else {
-        (base - (base & (base - 1))).min(64) as u64
-    }
+    if base == 0 { 64 } else { (base - (base & (base - 1))).min(64) as u64 }
 }
 
-fn const_data_addr_to_reloc(
-    addr: usize,
-    allocs: &[ConstDataRelocAlloc],
-) -> Option<(DataId, i64)> {
+fn const_data_addr_to_reloc(addr: usize, allocs: &[ConstDataRelocAlloc]) -> Option<(DataId, i64)> {
     allocs.iter().find_map(|alloc| {
         let end = alloc.base.checked_add(alloc.len)?;
         if addr < alloc.base || addr > end {
@@ -3214,9 +3328,8 @@ fn create_const_data_reloc_allocs(
     let pending = collect_memory_map_allocs(memory_map)
         .into_iter()
         .map(|(base, bytes)| {
-            let data_id = module
-                .declare_anonymous_data(false, false)
-                .expect("declare const alloc data");
+            let data_id =
+                module.declare_anonymous_data(false, false).expect("declare const alloc data");
             (base, bytes, data_id)
         })
         .collect::<Vec<_>>();
@@ -3245,16 +3358,14 @@ fn create_const_data_sections(
     fx: &mut FunctionCx<'_, impl Module>,
     memory_map: &hir_ty::MemoryMap<'_>,
 ) -> Vec<ConstDataAlloc> {
-    let mut allocs = Vec::new();
-    for (base, data) in collect_memory_map_allocs(memory_map) {
-        let mut data_desc = DataDescription::new();
-        data_desc.define(data.clone());
-        let data_id = fx.module.declare_anonymous_data(false, false).unwrap();
-        fx.module.define_data(data_id, &data_desc).unwrap();
-        let gv = fx.module.declare_data_in_func(data_id, fx.bcx.func);
-        allocs.push(ConstDataAlloc { base, len: data.len(), gv });
-    }
-    allocs
+    let ptr_size = fx.dl.pointer_size().bytes_usize();
+    create_const_data_reloc_allocs(fx.module, memory_map, ptr_size)
+        .into_iter()
+        .map(|alloc| {
+            let gv = fx.module.declare_data_in_func(alloc.data_id, fx.bcx.func);
+            ConstDataAlloc { base: alloc.base, len: alloc.len, gv }
+        })
+        .collect()
 }
 
 fn const_ptr_from_data_alloc(
@@ -3266,7 +3377,7 @@ fn const_ptr_from_data_alloc(
         let Some(end) = alloc.base.checked_add(alloc.len) else {
             continue;
         };
-        if addr < alloc.base || addr > end {
+        if addr < alloc.base || addr >= end {
             continue;
         }
 
@@ -3622,10 +3733,7 @@ fn codegen_call_argument_operand(
     operand: &Operand,
 ) -> CallArgument {
     let is_owned = operand_consumes_ownership(fx, &operand.kind);
-    CallArgument {
-        cval: codegen_operand(fx, &operand.kind),
-        is_owned,
-    }
+    CallArgument { cval: codegen_operand(fx, &operand.kind), is_owned }
 }
 
 fn lower_call_operands_for_abi(
@@ -3635,69 +3743,47 @@ fn lower_call_operands_for_abi(
     args.iter().map(|arg| codegen_call_argument_operand(fx, arg)).collect()
 }
 
-fn lower_rust_call_tuple_operands_for_abi(
+fn lower_rust_call_operands_for_abi(
     fx: &mut FunctionCx<'_, impl Module>,
     args: &[Operand],
+    arg_abis: &[abi::ArgAbi],
 ) -> Vec<CallArgument> {
-    let (tuple_operand, prefix_operands) =
-        args.split_last().expect("rust-call tuple lowering requires at least one argument");
-
-    let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_operand.kind);
-    let TyKind::Tuple(tuple_fields) = tuple_ty.as_ref().kind() else {
-        panic!("rust-call tuple lowering expected final tuple argument, got {tuple_ty:?}");
+    let Some((tuple_arg, leading_args)) = args.split_last() else {
+        return Vec::new();
     };
 
-    let mut lowered = prefix_operands
-        .iter()
-        .map(|operand| codegen_call_argument_operand(fx, operand))
-        .collect::<Vec<_>>();
+    let tuple_ty = operand_ty(fx.db(), fx.ra_body(), &tuple_arg.kind);
+    let TyKind::Tuple(tuple_field_tys) = tuple_ty.as_ref().kind() else {
+        return lower_call_operands_for_abi(fx, args);
+    };
 
-    let tuple_arg = codegen_call_argument_operand(fx, tuple_operand);
+    let expected_arg_count = leading_args.len() + tuple_field_tys.len();
+    if expected_arg_count != arg_abis.len() {
+        return lower_call_operands_for_abi(fx, args);
+    }
 
+    let mut lowered_args = lower_call_operands_for_abi(fx, leading_args);
+    let tuple_arg = codegen_call_argument_operand(fx, tuple_arg);
     let tuple_layout = tuple_arg.cval.layout.clone();
-    let tuple_ptr = tuple_arg.cval.clone().force_stack(fx);
-    let tuple_place = CPlace::for_ptr(tuple_ptr, tuple_layout);
+    let tuple_ptr = tuple_arg.cval.force_stack(fx);
 
-    lowered.reserve(tuple_fields.as_slice().len());
-    for (idx, field_ty) in tuple_fields.iter().enumerate() {
+    lowered_args.reserve(tuple_field_tys.len());
+    for (field_idx, field_ty) in tuple_field_tys.iter().enumerate() {
         let field_layout = fx
             .db()
             .layout_of_ty(field_ty.store(), fx.env().clone())
             .expect("rust-call tuple field layout");
-        let cval = if field_layout.is_zst() {
+        let field_cval = if field_layout.is_zst() {
             CValue::zst(field_layout)
         } else {
-            tuple_place.place_field(fx, idx, field_layout).to_cvalue(fx)
+            let field_offset = tuple_layout.fields.offset(field_idx).bytes() as i64;
+            let field_ptr = tuple_ptr.offset_i64(&mut fx.bcx, fx.pointer_type, field_offset);
+            CValue::by_ref(field_ptr, field_layout)
         };
-        lowered.push(CallArgument { cval, is_owned: tuple_arg.is_owned });
+        lowered_args.push(CallArgument { cval: field_cval, is_owned: tuple_arg.is_owned });
     }
 
-    lowered
-}
-
-fn lower_rust_call_operands_for_abi(
-    fx: &mut FunctionCx<'_, impl Module>,
-    args: &[Operand],
-    expected_arg_count: usize,
-) -> Vec<CallArgument> {
-    if !matches!(args, [_] | [_, _]) {
-        panic!(
-            "rust-call ABI requires one or two operands (self + tuple), got {}",
-            args.len(),
-        );
-    }
-
-    let lowered = lower_rust_call_tuple_operands_for_abi(fx, args);
-
-    assert_eq!(
-        lowered.len(),
-        expected_arg_count,
-        "rust-call argument count mismatch after tuple lowering: lowered={} expected={} args_len={}",
-        lowered.len(),
-        expected_arg_count,
-        args.len(),
-    );
-    lowered
+    lowered_args
 }
 
 fn lower_call_operands_with_lowering(
@@ -3708,10 +3794,139 @@ fn lower_call_operands_with_lowering(
 ) -> Vec<CallArgument> {
     match operand_lowering {
         CallOperandLowering::Standard => lower_call_operands_for_abi(fx, args),
-        CallOperandLowering::RustCall => {
-            lower_rust_call_operands_for_abi(fx, args, arg_abis.len())
+        CallOperandLowering::RustCall => lower_rust_call_operands_for_abi(fx, args, arg_abis),
+    }
+}
+
+fn call_arg_compatibility_score(arg: &CallArgument, arg_abi: &abi::ArgAbi) -> Option<u32> {
+    let abi_layout = arg_abi.layout.as_ref();
+    let abi_size = abi_layout.map(|layout| layout.size.bytes());
+    let arg_size = arg.cval.layout.size.bytes();
+
+    match arg_abi.mode {
+        PassMode::Ignore => arg.cval.layout.is_zst().then_some(100),
+        PassMode::Direct(_) => {
+            let abi_layout = abi_layout.expect("Direct ABI without layout");
+            (abi_size == Some(arg_size)).then(|| {
+                match (&arg.cval.layout.backend_repr, &abi_layout.backend_repr) {
+                    (BackendRepr::Scalar(_), BackendRepr::Scalar(_)) => 100,
+                    (BackendRepr::Memory { .. }, BackendRepr::Scalar(_)) if arg_size != 0 => 50,
+                    _ => 10,
+                }
+            })
+        }
+        PassMode::Pair(_, _) => {
+            let abi_layout = abi_layout.expect("Pair ABI without layout");
+            (abi_size == Some(arg_size)).then(|| {
+                match (&arg.cval.layout.backend_repr, &abi_layout.backend_repr) {
+                    (BackendRepr::ScalarPair(_, _), BackendRepr::ScalarPair(_, _)) => 100,
+                    (BackendRepr::Memory { .. }, BackendRepr::ScalarPair(_, _))
+                        if arg_size != 0 =>
+                    {
+                        50
+                    }
+                    _ => 10,
+                }
+            })
+        }
+        PassMode::Cast { .. } => abi_size.filter(|&size| size == arg_size).map(|_| {
+            if matches!(arg.cval.layout.backend_repr, BackendRepr::Memory { .. }) { 80 } else { 40 }
+        }),
+        PassMode::Indirect { meta_attrs: None, .. } => (arg_size != 0).then_some(20),
+        PassMode::Indirect { meta_attrs: Some(_), .. } => None,
+    }
+}
+
+fn select_lowered_call_args_for_abi(
+    lowered_args: &[CallArgument],
+    arg_abis: &[abi::ArgAbi],
+) -> Vec<CallArgument> {
+    if lowered_args.len() == arg_abis.len() {
+        return lowered_args.to_vec();
+    }
+
+    assert!(
+        lowered_args.len() >= arg_abis.len(),
+        "call has fewer lowered args than ABI expects: lowered={} abi={}",
+        lowered_args.len(),
+        arg_abis.len(),
+    );
+
+    let raw_len = lowered_args.len();
+    let abi_len = arg_abis.len();
+    let mut best = vec![vec![None; abi_len + 1]; raw_len + 1];
+    best[0][0] = Some(0u32);
+
+    for raw_idx in 0..raw_len {
+        for abi_idx in 0..=abi_len {
+            let Some(score) = best[raw_idx][abi_idx] else { continue };
+
+            let remaining_raw = raw_len - (raw_idx + 1);
+            let remaining_abi = abi_len.saturating_sub(abi_idx);
+            if remaining_raw >= remaining_abi {
+                best[raw_idx + 1][abi_idx] =
+                    Some(best[raw_idx + 1][abi_idx].map_or(score, |old| old.max(score)));
+            }
+
+            if abi_idx < abi_len
+                && let Some(match_score) =
+                    call_arg_compatibility_score(&lowered_args[raw_idx], &arg_abis[abi_idx])
+            {
+                let new_score = score + match_score;
+                best[raw_idx + 1][abi_idx + 1] = Some(
+                    best[raw_idx + 1][abi_idx + 1].map_or(new_score, |old| old.max(new_score)),
+                );
+            }
         }
     }
+
+    assert!(
+        best[raw_len][abi_len].is_some(),
+        "unable to align lowered call args with ABI: lowered_layouts={:?} abi_modes={:?} abi_layouts={:?}",
+        lowered_args
+            .iter()
+            .map(|arg| format!(
+                "{:?}/size={}",
+                arg.cval.layout.backend_repr,
+                arg.cval.layout.size.bytes()
+            ))
+            .collect::<Vec<_>>(),
+        arg_abis.iter().map(|arg| format!("{:?}", arg.mode)).collect::<Vec<_>>(),
+        arg_abis
+            .iter()
+            .map(|arg| {
+                arg.layout
+                    .as_ref()
+                    .map(|layout| format!("{:?}/size={}", layout.backend_repr, layout.size.bytes()))
+                    .unwrap_or_else(|| "<none>".to_owned())
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut selected = Vec::with_capacity(abi_len);
+    let mut raw_idx = raw_len;
+    let mut abi_idx = abi_len;
+    while abi_idx > 0 {
+        let score =
+            best[raw_idx][abi_idx].expect("missing DP score while reconstructing call args");
+
+        if raw_idx > 0
+            && let Some(match_score) =
+                call_arg_compatibility_score(&lowered_args[raw_idx - 1], &arg_abis[abi_idx - 1])
+            && let Some(prev_score) = best[raw_idx - 1][abi_idx - 1]
+            && prev_score + match_score == score
+        {
+            selected.push(lowered_args[raw_idx - 1].clone());
+            raw_idx -= 1;
+            abi_idx -= 1;
+            continue;
+        }
+
+        raw_idx -= 1;
+    }
+
+    selected.reverse();
+    selected
 }
 
 fn append_lowered_call_args(
@@ -3758,10 +3973,7 @@ fn append_lowered_call_args(
 
 fn lower_c_variadic_extra_arg(fx: &mut FunctionCx<'_, impl Module>, arg: &CallArgument) -> Value {
     let BackendRepr::Scalar(scalar) = arg.cval.layout.backend_repr else {
-        panic!(
-            "unsupported c-variadic extra argument layout: {:?}",
-            arg.cval.layout.backend_repr,
-        );
+        panic!("unsupported c-variadic extra argument layout: {:?}", arg.cval.layout.backend_repr,);
     };
 
     let mut value = arg.cval.clone().load_scalar(fx);
@@ -3832,8 +4044,8 @@ fn adjust_c_variadic_signature_and_args(
 // Terminator codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKind) {
-    match term {
+fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &hir_ty::mir::Terminator) {
+    match &term.kind {
         TerminatorKind::Return => {
             let ret_place = fx.local_place(hir_ty::mir::return_slot()).clone();
             codegen_return(fx, &ret_place);
@@ -3858,10 +4070,10 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKin
             switch.emit(&mut fx.bcx, discr_val, otherwise);
         }
         TerminatorKind::Call { func, args, destination, target, .. } => {
-            codegen_call(fx, func, args, destination, target);
+            codegen_call(fx, term.span, func, args, destination, target);
         }
         TerminatorKind::Drop { place, target, .. } => {
-            codegen_drop(fx, place, *target);
+            codegen_drop(fx, term.span, place, *target);
         }
         _ => todo!("terminator: {:?}", term),
     }
@@ -3874,7 +4086,12 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &TerminatorKin
 /// no-op jump to the target block.
 ///
 /// Reference: cg_clif/src/abi/mod.rs `codegen_drop`
-fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: BasicBlockId) {
+fn codegen_drop(
+    fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
+    place: &Place,
+    target: BasicBlockId,
+) {
     let target_block = fx.clif_block(target);
     let body = fx.ra_body();
     let ty = place_ty(fx.db(), body, place);
@@ -3930,11 +4147,21 @@ fn codegen_drop(fx: &mut FunctionCx<'_, impl Module>, place: &Place, target: Bas
         // Needs recursive field drops — use drop_in_place glue
         symbol_mangling::mangle_drop_in_place(fx.db(), ty.as_ref(), fx.ext_crate_disambiguators())
     };
+    let direct_drop_requires_caller_location = direct_drop
+        .filter(|_| !needs_field_drops)
+        .is_some_and(|drop_func_id| abi::function_requires_caller_location(fx.db(), drop_func_id));
+    if direct_drop_requires_caller_location {
+        drop_sig.params.push(AbiParam::new(fx.pointer_type));
+    }
 
     let callee_id =
         fx.module.declare_function(&fn_name, Linkage::Import, &drop_sig).expect("declare drop fn");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
-    fx.bcx.ins().call(callee_ref, &[ptr]);
+    let mut call_args = vec![ptr];
+    if direct_drop_requires_caller_location {
+        call_args.push(get_caller_location(fx, span));
+    }
+    fx.bcx.ins().call(callee_ref, &call_args);
 
     if clear_flag_after_drop {
         fx.clear_drop_flag(place.local);
@@ -4076,6 +4303,7 @@ fn drop_impl_generic_args(
 
 fn codegen_call(
     fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
     func: &Operand,
     args: &[Operand],
     destination: &Place,
@@ -4092,6 +4320,7 @@ fn codegen_call(
                 CallableDefId::FunctionId(callee_func_id) => {
                     codegen_direct_call(
                         fx,
+                        span,
                         callee_func_id,
                         generic_args,
                         CallOperandLowering::Standard,
@@ -4131,6 +4360,7 @@ fn codegen_call(
                 fn_ptr_is_rust_call_abi,
                 CallOperandLowering::from_rust_call_abi(fn_ptr_is_rust_call_abi),
                 header.c_variadic,
+                span,
                 args,
                 destination,
                 target,
@@ -4181,6 +4411,7 @@ fn codegen_fn_ptr_call(
     fn_ptr_is_rust_call_abi: bool,
     operand_lowering: CallOperandLowering,
     c_variadic: bool,
+    _span: MirSpan,
     args: &[Operand],
     destination: &Place,
     target: &Option<BasicBlockId>,
@@ -4296,10 +4527,11 @@ fn codegen_closure_call(
         .expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
-    let lowered_args =
+    let raw_lowered_args =
         lower_call_operands_with_lowering(fx, args, &callee_abi.args, operand_lowering);
+    let lowered_args = select_lowered_call_args_for_abi(&raw_lowered_args, &callee_abi.args);
 
-    assert!(!lowered_args.is_empty(), "closure call is missing receiver argument");
+    assert!(!args.is_empty(), "closure call is missing receiver argument");
 
     // Destination
     let dest = codegen_place(fx, destination);
@@ -4365,7 +4597,11 @@ fn is_abstract_trait_method_instance(
     generic_args: &StoredGenericArgs,
 ) -> bool {
     matches!(
-        fx.db().monomorphized_mir_body(callee_func_id.into(), generic_args.clone(), fx.env().clone()),
+        fx.db().monomorphized_mir_body(
+            callee_func_id.into(),
+            generic_args.clone(),
+            fx.env().clone()
+        ),
         Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _))
     )
 }
@@ -4379,7 +4615,8 @@ fn abstract_clone_copy_self_ty(
         return None;
     };
     let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
-    if Some(trait_id) != lang_items.Clone || !is_abstract_trait_method_instance(fx, callee_func_id, generic_args)
+    if Some(trait_id) != lang_items.Clone
+        || !is_abstract_trait_method_instance(fx, callee_func_id, generic_args)
     {
         return None;
     }
@@ -4400,8 +4637,10 @@ fn codegen_clone_copy_from_receiver_ref(
     let BackendRepr::Scalar(_) = receiver_ref.layout.backend_repr else {
         panic!("Clone::clone lowering expects a thin &Self receiver")
     };
-    let output_layout =
-        fx.db().layout_of_ty(self_ty.clone(), fx.env().clone()).expect("Clone::clone output layout");
+    let output_layout = fx
+        .db()
+        .layout_of_ty(self_ty.clone(), fx.env().clone())
+        .expect("Clone::clone output layout");
     let self_ptr = receiver_ref.load_scalar(fx);
     let src_place = CPlace::for_ptr(pointer::Pointer::new(self_ptr), output_layout);
     src_place.to_cvalue(fx)
@@ -4713,13 +4952,14 @@ fn codegen_direct_call_from_cvalues_into_dest(
         let name = extern_fn_symbol_name(fx.db(), callee_func_id);
         (sig, name)
     } else {
-        match fx
-            .db()
-            .monomorphized_mir_body(callee_func_id.into(), stored_generic_args.clone(), fx.env().clone())
-        {
+        match fx.db().monomorphized_mir_body(
+            callee_func_id.into(),
+            stored_generic_args.clone(),
+            fx.env().clone(),
+        ) {
             Ok(callee_body) => {
-                let sig =
-                    build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body).expect("callee sig");
+                let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+                    .expect("callee sig");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     callee_func_id,
@@ -4734,9 +4974,15 @@ fn codegen_direct_call_from_cvalues_into_dest(
                 )
             }
             Err(_) if is_cross_crate => {
-                let sig =
-                    build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, generic_args)
-                        .expect("cross-crate fn sig");
+                let sig = build_fn_sig_from_ty(
+                    fx.isa,
+                    fx.db(),
+                    fx.dl,
+                    fx.env(),
+                    callee_func_id,
+                    generic_args,
+                )
+                .expect("cross-crate fn sig");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     callee_func_id,
@@ -4789,6 +5035,9 @@ fn codegen_direct_call_from_cvalues_into_dest(
                 call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
             }
         }
+    }
+    if abi::function_requires_caller_location(fx.db(), callee_func_id) {
+        call_args.push(get_caller_location(fx, MirSpan::Unknown));
     }
 
     assert_eq!(
@@ -5745,6 +5994,7 @@ fn codegen_builtin_derive_method_call(
 
 fn codegen_direct_call(
     fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
     callee_func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
     call_operand_lowering: CallOperandLowering,
@@ -5882,185 +6132,186 @@ fn codegen_direct_call(
         return;
     }
 
-    if codegen_intrinsic_call(fx, callee_func_id, generic_args, args, destination, target) {
+    if codegen_intrinsic_call(fx, span, callee_func_id, generic_args, args, destination, target) {
         return;
     }
 
-    let (callee_func_id, generic_args) =
-        if let ItemContainerId::TraitId(trait_id) = callee_func_id.loc(fx.db()).container {
-            // Check for virtual dispatch: trait method called on dyn Trait
-            let interner = DbInterner::new_no_crate(fx.db());
-            if hir_ty::method_resolution::is_dyn_method(
-                interner,
-                fx.env().param_env(),
+    let (callee_func_id, generic_args) = if let ItemContainerId::TraitId(trait_id) =
+        callee_func_id.loc(fx.db()).container
+    {
+        // Check for virtual dispatch: trait method called on dyn Trait
+        let interner = DbInterner::new_no_crate(fx.db());
+        if hir_ty::method_resolution::is_dyn_method(
+            interner,
+            fx.env().param_env(),
+            callee_func_id,
+            generic_args,
+        )
+        .is_some()
+        {
+            codegen_virtual_call(
+                fx,
+                span,
                 callee_func_id,
+                trait_id,
                 generic_args,
-            )
-            .is_some()
-            {
-                codegen_virtual_call(
-                    fx,
-                    callee_func_id,
-                    trait_id,
-                    generic_args,
-                    args,
-                    destination,
-                    target,
-                );
-                return;
-            }
+                args,
+                destination,
+                target,
+            );
+            return;
+        }
 
-            let receiver_ty = args
-                .first()
-                .map(|self_arg| operand_ty(fx.db(), fx.ra_body(), &self_arg.kind).as_ref())
-                .or_else(|| (!generic_args.is_empty()).then(|| generic_args.type_at(0)));
+        let receiver_ty = args
+            .first()
+            .map(|self_arg| operand_ty(fx.db(), fx.ra_body(), &self_arg.kind).as_ref())
+            .or_else(|| (!generic_args.is_empty()).then(|| generic_args.type_at(0)));
 
-            let trait_method_sig = fx.db().function_signature(callee_func_id);
-            let trait_method_name = trait_method_sig.name.clone();
-            let trait_method_is_rust_call = trait_method_sig.abi == Some(sym::rust_dash_call);
+        let trait_method_sig = fx.db().function_signature(callee_func_id);
+        let trait_method_name = trait_method_sig.name.clone();
+        let trait_method_is_rust_call = trait_method_sig.abi == Some(sym::rust_dash_call);
 
-            // Fn/FnMut/FnOnce calls are often encoded with receiver information only in the
-            // first MIR argument operand. Deriving callable dispatch from that operand keeps us
-            // off unresolved trait-item imports like `FnOnce::call_once`.
-            if is_fn_trait_method(fx.db(), trait_id, trait_method_name.as_str()) {
-                if let Some(self_ty) = receiver_ty {
-                    match peel_ref_layers(self_ty).kind() {
-                        TyKind::Closure(closure_id, closure_subst) => {
-                            codegen_closure_call(
+        // Fn/FnMut/FnOnce calls are often encoded with receiver information only in the
+        // first MIR argument operand. Deriving callable dispatch from that operand keeps us
+        // off unresolved trait-item imports like `FnOnce::call_once`.
+        if is_fn_trait_method(fx.db(), trait_id, trait_method_name.as_str()) {
+            if let Some(self_ty) = receiver_ty {
+                match peel_ref_layers(self_ty).kind() {
+                    TyKind::Closure(closure_id, closure_subst) => {
+                        codegen_closure_call(
+                            fx,
+                            closure_id.0,
+                            closure_subst.store(),
+                            CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
+                            args,
+                            destination,
+                            target,
+                        );
+                        return;
+                    }
+                    TyKind::FnDef(def, fn_args) => match def.0 {
+                        CallableDefId::FunctionId(fn_id) => {
+                            codegen_direct_call(
                                 fx,
-                                closure_id.0,
-                                closure_subst.store(),
+                                span,
+                                fn_id,
+                                fn_args,
                                 CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
-                                args,
-                                destination,
-                                target,
-                            );
-                            return;
-                        }
-                        TyKind::FnDef(def, fn_args) => match def.0 {
-                            CallableDefId::FunctionId(fn_id) => {
-                                codegen_direct_call(
-                                    fx,
-                                    fn_id,
-                                    fn_args,
-                                    CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
-                                    args.get(1..).unwrap_or(&[]),
-                                    destination,
-                                    target,
-                                );
-                                return;
-                            }
-                            CallableDefId::StructId(struct_id) => {
-                                codegen_adt_constructor_call(
-                                    fx,
-                                    VariantId::StructId(struct_id),
-                                    fn_args,
-                                    args.get(1..).unwrap_or(&[]),
-                                    destination,
-                                    target,
-                                );
-                                return;
-                            }
-                            CallableDefId::EnumVariantId(variant_id) => {
-                                codegen_adt_constructor_call(
-                                    fx,
-                                    VariantId::EnumVariantId(variant_id),
-                                    fn_args,
-                                    args.get(1..).unwrap_or(&[]),
-                                    destination,
-                                    target,
-                                );
-                                return;
-                            }
-                        },
-                        TyKind::FnPtr(sig_tys, header) if !args.is_empty() => {
-                            let fn_ptr_is_rust_call_abi =
-                                matches!(header.abi, hir_ty::FnAbi::RustCall);
-                            let operand_lowering = if trait_method_is_rust_call {
-                                CallOperandLowering::RustCall
-                            } else {
-                                CallOperandLowering::from_rust_call_abi(fn_ptr_is_rust_call_abi)
-                            };
-                            codegen_fn_ptr_call(
-                                fx,
-                                &args[0],
-                                &sig_tys,
-                                fn_ptr_is_rust_call_abi,
-                                operand_lowering,
-                                header.c_variadic,
                                 args.get(1..).unwrap_or(&[]),
                                 destination,
                                 target,
                             );
                             return;
                         }
-                        _ => {}
+                        CallableDefId::StructId(struct_id) => {
+                            codegen_adt_constructor_call(
+                                fx,
+                                VariantId::StructId(struct_id),
+                                fn_args,
+                                args.get(1..).unwrap_or(&[]),
+                                destination,
+                                target,
+                            );
+                            return;
+                        }
+                        CallableDefId::EnumVariantId(variant_id) => {
+                            codegen_adt_constructor_call(
+                                fx,
+                                VariantId::EnumVariantId(variant_id),
+                                fn_args,
+                                args.get(1..).unwrap_or(&[]),
+                                destination,
+                                target,
+                            );
+                            return;
+                        }
+                    },
+                    TyKind::FnPtr(sig_tys, header) if !args.is_empty() => {
+                        let fn_ptr_is_rust_call_abi = matches!(header.abi, hir_ty::FnAbi::RustCall);
+                        let operand_lowering = if trait_method_is_rust_call {
+                            CallOperandLowering::RustCall
+                        } else {
+                            CallOperandLowering::from_rust_call_abi(fn_ptr_is_rust_call_abi)
+                        };
+                        codegen_fn_ptr_call(
+                            fx,
+                            &args[0],
+                            &sig_tys,
+                            fn_ptr_is_rust_call_abi,
+                            operand_lowering,
+                            header.c_variadic,
+                            span,
+                            args.get(1..).unwrap_or(&[]),
+                            destination,
+                            target,
+                        );
+                        return;
                     }
+                    _ => {}
                 }
             }
+        }
 
-            // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often resolve to the
-            // blanket reference impl in `core::ops::function::impls`, but the actual runtime
-            // dispatch must still happen through the inner dyn vtable.
-            if let Some(self_ty) = receiver_ty
-                && let Some(self_pointee) = self_ty.builtin_deref(true)
-                && self_pointee.dyn_trait() == Some(trait_id)
-                && matches!(
-                    fx.db()
-                        .layout_of_ty(self_ty.store(), fx.env().clone())
-                        .expect("self layout for dyn ref dispatch")
-                        .backend_repr,
-                    BackendRepr::ScalarPair(_, _)
-                )
-            {
-                codegen_virtual_call(
+        // Calls like `FnMut::call_mut` on `&mut dyn FnMut(..)` often resolve to the
+        // blanket reference impl in `core::ops::function::impls`, but the actual runtime
+        // dispatch must still happen through the inner dyn vtable.
+        if let Some(self_ty) = receiver_ty
+            && let Some(self_pointee) = self_ty.builtin_deref(true)
+            && self_pointee.dyn_trait() == Some(trait_id)
+            && matches!(
+                fx.db()
+                    .layout_of_ty(self_ty.store(), fx.env().clone())
+                    .expect("self layout for dyn ref dispatch")
+                    .backend_repr,
+                BackendRepr::ScalarPair(_, _)
+            )
+        {
+            codegen_virtual_call(
+                fx,
+                span,
+                callee_func_id,
+                trait_id,
+                generic_args,
+                args,
+                destination,
+                target,
+            );
+            return;
+        }
+
+        // Static trait dispatch: resolve to concrete impl method when possible.
+        let resolved_method =
+            match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, generic_args) {
+                (Either::Left(resolved_id), resolved_args) => {
+                    Either::Left((resolved_id, resolved_args.store()))
+                }
+                (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
+                    Either::Right((derive_impl_id, derive_method, resolved_args.store()))
+                }
+            };
+        match resolved_method {
+            Either::Left((resolved_id, resolved_args)) => (resolved_id, resolved_args),
+            Either::Right((derive_impl_id, derive_method, resolved_args)) => {
+                codegen_builtin_derive_method_call(
                     fx,
-                    callee_func_id,
-                    trait_id,
-                    generic_args,
+                    derive_impl_id,
+                    derive_method,
+                    resolved_args.as_ref(),
                     args,
                     destination,
                     target,
                 );
                 return;
             }
-
-            // Static trait dispatch: resolve to concrete impl method when possible.
-            let resolved_method =
-                match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, generic_args) {
-                    (Either::Left(resolved_id), resolved_args) => {
-                        Either::Left((resolved_id, resolved_args.store()))
-                    }
-                    (Either::Right((derive_impl_id, derive_method)), resolved_args) => {
-                        Either::Right((derive_impl_id, derive_method, resolved_args.store()))
-                    }
-                };
-            match resolved_method {
-                Either::Left((resolved_id, resolved_args)) => (resolved_id, resolved_args),
-                Either::Right((derive_impl_id, derive_method, resolved_args)) => {
-                    codegen_builtin_derive_method_call(
-                        fx,
-                        derive_impl_id,
-                        derive_method,
-                        resolved_args.as_ref(),
-                        args,
-                        destination,
-                        target,
-                    );
-                    return;
-                }
-            }
-        } else {
-            (callee_func_id, generic_args.store())
-        };
+        }
+    } else {
+        (callee_func_id, generic_args.store())
+    };
 
     let callee_is_rust_call_abi =
         fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
-    let operand_lowering = if callee_is_rust_call_abi {
-        CallOperandLowering::RustCall
-    } else {
-        call_operand_lowering
-    };
+    let operand_lowering =
+        if callee_is_rust_call_abi { CallOperandLowering::RustCall } else { call_operand_lowering };
     if let Some(self_ty) = abstract_clone_copy_self_ty(fx, callee_func_id, &generic_args) {
         assert!(!args.is_empty(), "Clone::clone lowering requires a receiver argument");
         let self_ref = codegen_operand(fx, &args[0].kind);
@@ -6135,7 +6386,6 @@ fn codegen_direct_call(
     } else {
         panic!("failed to get local callee MIR for {:?}", callee_func_id);
     };
-
     // Declare callee in module (Import linkage — it may be defined elsewhere or in same module)
     let callee_id = fx
         .module
@@ -6175,6 +6425,9 @@ fn codegen_direct_call(
         &callee_abi.args,
         callee_abi.c_variadic,
     );
+    if callee_abi.requires_caller_location {
+        call_args.push(get_caller_location(fx, span));
+    }
 
     if callee_abi.c_variadic {
         let sig_ref = fx.bcx.func.dfg.ext_funcs[callee_ref].signature;
@@ -6214,6 +6467,7 @@ fn codegen_direct_call(
 /// Reference: cg_clif/src/vtable.rs `get_ptr_and_method_ref` + cg_clif/src/abi/mod.rs:525-543
 fn codegen_virtual_call(
     fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
     callee_func_id: hir_def::FunctionId,
     trait_id: TraitId,
     generic_args: GenericArgs<'_>,
@@ -6327,6 +6581,9 @@ fn codegen_virtual_call(
         &expected_abi.args[1..],
         false,
     );
+    if expected_abi.requires_caller_location {
+        call_args.push(get_caller_location(fx, span));
+    }
 
     assert_eq!(
         call_args.len(),
@@ -6353,6 +6610,7 @@ fn codegen_virtual_call(
 
 fn codegen_intrinsic_call(
     fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
     callee_func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
     args: &[Operand],
@@ -6468,6 +6726,7 @@ fn codegen_intrinsic_call(
             let layout = generic_ty_layout.clone().expect("min_align_of_val: layout error");
             Some(fx.bcx.ins().iconst(fx.pointer_type, layout.align.abi.bytes() as i64))
         }
+        "caller_location" => Some(get_caller_location(fx, span)),
         "align_of_val" => {
             assert_eq!(args.len(), 1, "align_of_val expects 1 arg");
 
@@ -6730,6 +6989,9 @@ fn codegen_intrinsic_call(
             for (arg, arg_abi) in runtime_args.into_iter().zip(callee_abi.args.iter()) {
                 call_args.extend(abi::pass_mode::adjust_arg_for_abi(fx, arg, arg_abi, false));
             }
+            if callee_abi.requires_caller_location {
+                call_args.push(get_caller_location(fx, span));
+            }
 
             let call = fx.bcx.ins().call(callee_ref, &call_args);
             let call_result =
@@ -6960,7 +7222,8 @@ fn codegen_intrinsic_call(
                 let true_ptr = if_true.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
                 let false_ptr = if_false.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
                 let selected_ptr = fx.bcx.ins().select(cond, true_ptr, false_ptr);
-                let selected = CValue::by_ref(pointer::Pointer::new(selected_ptr), dest.layout.clone());
+                let selected =
+                    CValue::by_ref(pointer::Pointer::new(selected_ptr), dest.layout.clone());
                 dest.write_cvalue(fx, selected);
             }
 
@@ -7083,6 +7346,17 @@ fn codegen_intrinsic_call(
             let b = codegen_operand(fx, &args[1].kind).load_scalar(fx);
             Some(fx.bcx.ins().imul(a, b))
         }
+        "simd_splat" => {
+            assert_eq!(args.len(), 1, "simd_splat intrinsic expects 1 arg");
+            let scalar = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let dest = codegen_place(fx, destination);
+            let BackendRepr::SimdVector { element, count } = dest.layout.backend_repr else {
+                panic!("simd_splat destination must be a SIMD vector")
+            };
+            let lane_ty = scalar_to_clif_type(fx.dl, &element);
+            let lane_values = std::iter::repeat_n(scalar, count as usize);
+            Some(build_simd_value_from_lane_values(fx, dest.layout.clone(), lane_ty, lane_values))
+        }
         "simd_bitmask" => {
             assert_eq!(args.len(), 1, "simd_bitmask intrinsic expects 1 arg");
             let simd_val = codegen_operand(fx, &args[0].kind);
@@ -7093,6 +7367,14 @@ fn codegen_intrinsic_call(
             assert!(lane_count < 128, "simd_bitmask lane_count {lane_count} exceeds 127");
             let lane_ty = scalar_to_clif_type(fx.dl, &lane_scalar);
             let lane_size = lane_ty.bytes() as i64;
+            let lane_bits = lane_ty.bits();
+            let lane_int_ty = match lane_ty {
+                types::F16 => types::I16,
+                types::F32 => types::I32,
+                types::F64 => types::I64,
+                types::F128 => types::I128,
+                ty => ty,
+            };
 
             let dest = codegen_place(fx, destination);
             let BackendRepr::Scalar(dest_scalar) = dest.layout.backend_repr else {
@@ -7110,7 +7392,14 @@ fn codegen_intrinsic_call(
                 let lane = simd_ptr
                     .offset_i64(&mut fx.bcx, fx.pointer_type, lane_idx as i64 * lane_size)
                     .load(&mut fx.bcx, lane_ty, flags);
-                let is_set = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lane, 0);
+                let lane = if lane_ty.is_float() {
+                    fx.bcx.ins().bitcast(lane_int_ty, MemFlags::new(), lane)
+                } else {
+                    lane
+                };
+                let sign_bit = iconst_from_bits(&mut fx.bcx, lane_int_ty, 1u128 << (lane_bits - 1));
+                let high_bit = fx.bcx.ins().band(lane, sign_bit);
+                let is_set = fx.bcx.ins().icmp_imm(IntCC::NotEqual, high_bit, 0);
                 let bit = iconst_from_bits(&mut fx.bcx, dest_ty, 1u128 << lane_idx);
                 let lane_bit = fx.bcx.ins().select(is_set, bit, zero);
                 result = fx.bcx.ins().bor(result, lane_bit);
@@ -7121,11 +7410,38 @@ fn codegen_intrinsic_call(
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
             let lhs = codegen_operand(fx, &args[0].kind);
             let rhs = codegen_operand(fx, &args[1].kind);
-            let lhs_val = lhs.load_scalar(fx);
-            let rhs_val = rhs.load_scalar(fx);
+            let dest = codegen_place(fx, destination);
+            let (
+                BackendRepr::SimdVector { element: lhs_element, count: lhs_count },
+                BackendRepr::SimdVector { element: dest_element, count: dest_count },
+            ) = (lhs.layout.backend_repr, dest.layout.backend_repr)
+            else {
+                panic!("{name} expects SIMD vector operands and result")
+            };
+            assert_eq!(lhs_count, dest_count, "{name} lane count mismatch");
 
-            let cmp = match lhs.layout.backend_repr {
-                BackendRepr::SimdVector { element, .. } => match element.primitive() {
+            let lhs_lane_ty = scalar_to_clif_type(fx.dl, &lhs_element);
+            let dest_lane_ty = scalar_to_clif_type(fx.dl, &dest_element);
+            let lhs_ptr = lhs.force_stack(fx);
+            let rhs_ptr = rhs.force_stack(fx);
+            let mut flags = MemFlags::new();
+            flags.set_notrap();
+
+            let mut lane_values = Vec::with_capacity(lhs_count as usize);
+            for lane_idx in 0..lhs_count {
+                let offset = lane_idx as i64 * lhs_lane_ty.bytes() as i64;
+                let lhs_lane = lhs_ptr.offset_i64(&mut fx.bcx, fx.pointer_type, offset).load(
+                    &mut fx.bcx,
+                    lhs_lane_ty,
+                    flags,
+                );
+                let rhs_lane = rhs_ptr.offset_i64(&mut fx.bcx, fx.pointer_type, offset).load(
+                    &mut fx.bcx,
+                    lhs_lane_ty,
+                    flags,
+                );
+
+                let cmp = match lhs_element.primitive() {
                     Primitive::Int(_, signed) => {
                         let cc = match (name, signed) {
                             ("simd_eq", _) => IntCC::Equal,
@@ -7140,7 +7456,7 @@ fn codegen_intrinsic_call(
                             ("simd_ge", true) => IntCC::SignedGreaterThanOrEqual,
                             _ => unreachable!(),
                         };
-                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                        fx.bcx.ins().icmp(cc, lhs_lane, rhs_lane)
                     }
                     Primitive::Float(_) => {
                         let cc = match name {
@@ -7152,7 +7468,7 @@ fn codegen_intrinsic_call(
                             "simd_ge" => FloatCC::GreaterThanOrEqual,
                             _ => unreachable!(),
                         };
-                        fx.bcx.ins().fcmp(cc, lhs_val, rhs_val)
+                        fx.bcx.ins().fcmp(cc, lhs_lane, rhs_lane)
                     }
                     Primitive::Pointer(_) => {
                         let cc = match name {
@@ -7160,19 +7476,19 @@ fn codegen_intrinsic_call(
                             "simd_ne" => IntCC::NotEqual,
                             _ => panic!("{name} is unsupported for pointer SIMD lanes"),
                         };
-                        fx.bcx.ins().icmp(cc, lhs_val, rhs_val)
+                        fx.bcx.ins().icmp(cc, lhs_lane, rhs_lane)
                     }
-                },
-                _ => panic!("{name} expects SIMD vector operands"),
-            };
+                };
 
-            let dest = codegen_place(fx, destination);
-            let dest_ty = scalar_or_simd_backend_repr_to_clif_type(fx.dl, &dest.layout.backend_repr);
-            if fx.bcx.func.dfg.value_type(cmp) == dest_ty {
-                Some(cmp)
-            } else {
-                Some(bool_to_zero_or_max_uint(fx, dest_ty, cmp))
+                lane_values.push(bool_to_zero_or_max_uint(fx, dest_lane_ty, cmp));
             }
+
+            Some(build_simd_value_from_lane_values(
+                fx,
+                dest.layout.clone(),
+                dest_lane_ty,
+                lane_values,
+            ))
         }
         "simd_and" | "simd_or" | "simd_xor" => {
             assert_eq!(args.len(), 2, "{name} intrinsic expects 2 args");
@@ -7566,6 +7882,83 @@ fn address_taken_locals(body: &MirBody) -> std::collections::HashSet<LocalId> {
     result
 }
 
+fn store_fn_param_into_place(
+    place: &CPlace,
+    param_abi: &abi::ArgAbi,
+    block_params: &[Value],
+    param_idx: &mut usize,
+    bcx: &mut FunctionBuilder<'_>,
+    module: &impl Module,
+    dl: &TargetDataLayout,
+    pointer_type: Type,
+) {
+    match param_abi.mode {
+        PassMode::Ignore => {}
+        PassMode::Direct(_) => {
+            let param_val = block_params[*param_idx];
+            *param_idx += 1;
+            if place.is_register() {
+                place.def_var(0, param_val, bcx);
+            } else {
+                let mut flags = MemFlags::new();
+                flags.set_notrap();
+                place.to_ptr().store(bcx, param_val, flags);
+            }
+        }
+        PassMode::Pair(_, _) => {
+            let val0 = block_params[*param_idx];
+            let val1 = block_params[*param_idx + 1];
+            *param_idx += 2;
+            if place.is_register() {
+                place.def_var(0, val0, bcx);
+                place.def_var(1, val1, bcx);
+            } else {
+                let mut flags = MemFlags::new();
+                flags.set_notrap();
+                let ptr = place.to_ptr();
+                ptr.store(bcx, val0, flags);
+                let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr else {
+                    unreachable!()
+                };
+                let b_off = value_and_place::scalar_pair_b_offset(dl, *a, *b);
+                ptr.offset_i64(bcx, pointer_type, b_off).store(bcx, val1, flags);
+            }
+        }
+        PassMode::Cast { ref cast, pad_i32 } => {
+            let abi_values_len = abi::pass_mode::cast_target_to_abi_params(cast).len();
+            let cast_values = if pad_i32 {
+                let values = &block_params[*param_idx + 1..*param_idx + 1 + abi_values_len];
+                *param_idx += abi_values_len + 1;
+                values
+            } else {
+                let values = &block_params[*param_idx..*param_idx + abi_values_len];
+                *param_idx += abi_values_len;
+                values
+            };
+
+            let ptr = place.to_ptr();
+            let mut flags = MemFlags::new();
+            flags.set_notrap();
+            for ((offset, _), value) in abi::pass_mode::cast_target_to_abi_params(cast)
+                .into_iter()
+                .zip(cast_values.iter().copied())
+            {
+                ptr.offset_i64(bcx, pointer_type, offset.bytes() as i64).store(bcx, value, flags);
+            }
+        }
+        PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+            panic!("unsized by-value params are not supported yet");
+        }
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
+            let ptr_val = block_params[*param_idx];
+            *param_idx += 1;
+            let dst = place.to_ptr().get_addr(bcx, pointer_type);
+            let byte_count = bcx.ins().iconst(pointer_type, place.layout.size.bytes() as i64);
+            bcx.call_memcpy(module.target_config(), dst, ptr_val, byte_count);
+        }
+    }
+}
+
 /// Compile a single MIR body to a named function in a Module (ObjectModule or JITModule).
 pub fn compile_fn(
     module: &mut impl Module,
@@ -7582,7 +7975,6 @@ pub fn compile_fn(
     let pointer_type = pointer_ty(dl);
     let fn_abi = abi::fn_abi_for_body(isa, db, dl, env, body)?;
     let sig = fn_abi.sig.clone();
-
     // Declare function in module
     let func_id = module
         .declare_function(fn_name, linkage, &sig)
@@ -7618,18 +8010,16 @@ pub fn compile_fn(
         // (We can't use FunctionCx yet because we're still building it)
         let mut local_map = Vec::with_capacity(body.locals.len());
         for (local_id, local) in body.locals.iter() {
-            let local_layout = db
-                .layout_of_ty(local.ty.clone(), env.clone())
-                .map_err(|e| {
-                    let display_target = DisplayTarget::from_crate(db, body.owner.krate(db));
-                    format!(
-                        "local layout error for _{}: ty=`{}` err={:?}\n{}",
-                        u32::from(local_id.into_raw()),
-                        local.ty.as_ref().display(db, display_target),
-                        e,
-                        body.pretty_print(db, display_target),
-                    )
-                })?;
+            let local_layout = db.layout_of_ty(local.ty.clone(), env.clone()).map_err(|e| {
+                let display_target = DisplayTarget::from_crate(db, body.owner.krate(db));
+                format!(
+                    "local layout error for _{}: ty=`{}` err={:?}\n{}",
+                    u32::from(local_id.into_raw()),
+                    local.ty.as_ref().display(db, display_target),
+                    e,
+                    body.pretty_print(db, display_target),
+                )
+            })?;
 
             // Force stack allocation for locals whose address is taken,
             // since writing through the pointer must update the actual local.
@@ -7718,60 +8108,24 @@ pub fn compile_fn(
         for (&param_local, param_abi) in body.param_locals.iter().zip(fn_abi.args.iter()) {
             let param_idx_local = param_local.into_raw().into_u32() as usize;
             let place = &local_map[param_idx_local];
-            match param_abi.mode {
-                PassMode::Ignore => {}
-                PassMode::Direct(_) => {
-                    let param_val = block_params[param_idx];
-                    param_idx += 1;
-                    if place.is_register() {
-                        place.def_var(0, param_val, &mut bcx);
-                    } else {
-                        // Address-taken scalar: store parameter into stack slot.
-                        let mut flags = MemFlags::new();
-                        flags.set_notrap();
-                        place.to_ptr().store(&mut bcx, param_val, flags);
-                    }
-                }
-                PassMode::Pair(_, _) => {
-                    let val0 = block_params[param_idx];
-                    let val1 = block_params[param_idx + 1];
-                    param_idx += 2;
-                    if place.is_register() {
-                        place.def_var(0, val0, &mut bcx);
-                        place.def_var(1, val1, &mut bcx);
-                    } else {
-                        // Address-taken scalar pair: store both parts into stack slot
-                        let mut flags = MemFlags::new();
-                        flags.set_notrap();
-                        let ptr = place.to_ptr();
-                        ptr.store(&mut bcx, val0, flags);
-                        let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr
-                        else {
-                            unreachable!()
-                        };
-                        let b_off = value_and_place::scalar_pair_b_offset(dl, *a, *b);
-                        ptr.offset_i64(&mut bcx, pointer_type, b_off).store(&mut bcx, val1, flags);
-                    }
-                }
-                PassMode::Cast { .. } => {
-                    panic!("PassMode::Cast params are not supported in function prelude yet");
-                }
-                PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
-                    panic!("unsized by-value params are not supported yet");
-                }
-                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
-                    // Memory-repr param: block param is a pointer to caller-owned data.
-                    // Materialize the parameter into the callee local place so
-                    // subsequent local mutations don't alias caller storage.
-                    let ptr_val = block_params[param_idx];
-                    param_idx += 1;
-                    let dst = place.to_ptr().get_addr(&mut bcx, pointer_type);
-                    let byte_count =
-                        bcx.ins().iconst(pointer_type, place.layout.size.bytes() as i64);
-                    bcx.call_memcpy(module.target_config(), dst, ptr_val, byte_count);
-                }
-            }
+            store_fn_param_into_place(
+                place,
+                param_abi,
+                &block_params,
+                &mut param_idx,
+                &mut bcx,
+                module,
+                dl,
+                pointer_type,
+            );
         }
+        let caller_location = if fn_abi.requires_caller_location {
+            let param = block_params[param_idx];
+            param_idx += 1;
+            Some(param)
+        } else {
+            None
+        };
         assert_eq!(
             param_idx,
             block_params.len(),
@@ -7823,6 +8177,7 @@ pub fn compile_fn(
             block_map,
             local_map,
             drop_flags,
+            caller_location,
         };
 
         // Codegen each basic block
@@ -7837,7 +8192,7 @@ pub fn compile_fn(
             }
 
             if let Some(term) = &bb.terminator {
-                codegen_terminator(&mut fx, &term.kind);
+                codegen_terminator(&mut fx, term);
             }
         }
 
@@ -8888,7 +9243,8 @@ fn scan_body_for_callees(
                         // The closure body is codegen'd as a standalone symbol.
                         CastKind::PointerCoercion(PointerCast::ClosureFnPointer(_)) => {
                             let from_ty = operand_ty(db, body, &operand.kind);
-                            if let TyKind::Closure(closure_id, closure_subst) = from_ty.as_ref().kind()
+                            if let TyKind::Closure(closure_id, closure_subst) =
+                                from_ty.as_ref().kind()
                             {
                                 let key = (closure_id.0, closure_subst.store());
                                 if closure_visited.insert(key.clone()) {
@@ -8936,12 +9292,7 @@ fn scan_body_for_callees(
                     closure_result,
                 );
             }
-            TerminatorKind::Call {
-                func,
-                args,
-                destination,
-                ..
-            } => {
+            TerminatorKind::Call { func, args, destination, .. } => {
                 collect_const_operand_callables(
                     db,
                     env,
@@ -9036,7 +9387,8 @@ fn scan_body_for_callees(
                                         let mut resolved_fn_id = fn_id;
                                         let mut resolved_fn_args = fn_args;
 
-                                        if let ItemContainerId::TraitId(_) = fn_id.loc(db).container {
+                                        if let ItemContainerId::TraitId(_) = fn_id.loc(db).container
+                                        {
                                             if hir_ty::method_resolution::is_dyn_method(
                                                 interner,
                                                 env.param_env(),
@@ -9105,7 +9457,8 @@ fn scan_body_for_callees(
                     }
                     queue.push_back((resolved_id, resolved_args.store()));
 
-                    if let Some(source_return_ty) = callable_output_ty(db, resolved_id, resolved_args)
+                    if let Some(source_return_ty) =
+                        callable_output_ty(db, resolved_id, resolved_args)
                     {
                         let dest_ty = place_ty(db, body, destination);
                         if let (Some(src_pointee), Some(dest_pointee)) = (

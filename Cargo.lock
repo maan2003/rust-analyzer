@@ -290,6 +290,7 @@ dependencies = [
  "test-fixture",
  "test-utils",
  "triomphe",
+ "typed-arena",
  "vfs",
 ]
 

@@ -224,6 +224,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: Meta) -> ControlFlow<Infal
                     "rustc_allocator_zeroed" => {
                         attr_flags.insert(AttrFlags::RUSTC_ALLOCATOR_ZEROED)
                     }
+                    "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
                     "rustc_reservation_impl" => {
                         attr_flags.insert(AttrFlags::RUSTC_RESERVATION_IMPL)
                     }
@@ -311,12 +312,13 @@ bitflags::bitflags! {
         const RUSTC_COINDUCTIVE = 1 << 43;
         const RUSTC_FORCE_INLINE = 1 << 44;
         const IS_POINTEE = 1 << 45;
+        const TRACK_CALLER = 1 << 46;
         const RUSTC_NONNULL_OPTIMIZATION_GUARANTEED = 1 << 50;
 
-        const MACRO_STYLE_BRACES = 1 << 46;
-        const MACRO_STYLE_BRACKETS = 1 << 47;
-        const MACRO_STYLE_PARENTHESES = 1 << 48;
-        const HAS_DEFAULT_ATTR = 1 << 49;
+        const MACRO_STYLE_BRACES = 1 << 47;
+        const MACRO_STYLE_BRACKETS = 1 << 48;
+        const MACRO_STYLE_PARENTHESES = 1 << 49;
+        const HAS_DEFAULT_ATTR = 1 << 51;
     }
 }
 
