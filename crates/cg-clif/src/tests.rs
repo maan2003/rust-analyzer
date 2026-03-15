@@ -1847,7 +1847,7 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 closure_subst.as_ref(),
                 &empty_map,
             );
-            if !compiled_closure_symbols.insert(closure_name.clone()) {
+            if compiled_closure_symbols.contains(&closure_name) {
                 continue;
             }
             let body = match db.monomorphized_mir_body_for_closure(
@@ -1859,6 +1859,7 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 Err(hir_ty::mir::MirLowerError::UnresolvedName(_)) => continue,
                 Err(e) => panic!("closure MIR error for {closure_name}: {e:?}"),
             };
+            compiled_closure_symbols.insert(closure_name.clone());
             crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -2245,7 +2246,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 closure_subst.as_ref(),
                 &disambiguators,
             );
-            if !compiled_closure_symbols.insert(closure_name.clone()) {
+            if compiled_closure_symbols.contains(&closure_name) {
                 if trace_enabled {
                     eprintln!("std-jit: skipping duplicate closure definition for {closure_name}");
                 }
@@ -2267,6 +2268,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 }
                 Err(e) => panic!("closure MIR error for {closure_name}: {e:?}"),
             };
+            compiled_closure_symbols.insert(closure_name.clone());
             let closure_id = crate::compile_fn(
                 &mut jit_module,
                 &*isa,
@@ -3554,8 +3556,7 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: HashMap::entry/or_insert path returns wrong value"]
-fn std_jit_hashmap_entry_probe() {
+fn std_jit_hashmap_entry_smoke() {
     let result: i32 = jit_run_with_std(
         r#"
 fn foo() -> i32 {
@@ -3570,6 +3571,26 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_dyn_fnmut_distinct_closure_vtables_smoke() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn call(f: &mut dyn FnMut(usize) -> bool, value: usize) -> i32 {
+    f(value) as i32
+}
+
+fn foo() -> i32 {
+    let captured = 2usize;
+    let mut first = |value| value == 1usize;
+    let mut second = |value| value == captured;
+    call(&mut first, 1usize) | (call(&mut second, 2usize) << 1)
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 3);
 }
 
 #[test]

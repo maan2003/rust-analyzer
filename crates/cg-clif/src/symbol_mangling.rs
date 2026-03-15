@@ -183,6 +183,29 @@ pub fn mangle_drop_in_place(
     m.out
 }
 
+/// Produce a symbol name for a vtable for `dyn Trait` over a concrete `T`.
+///
+/// This must use the full trait+type identity, not fast-reject summaries, so
+/// distinct closure/object types don't collapse onto the same vtable symbol.
+pub fn mangle_vtable(
+    db: &dyn HirDatabase,
+    concrete_ty: Ty<'_>,
+    trait_id: TraitId,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> String {
+    let out = String::from("_Rvtable_");
+    let mut m = SymbolMangler {
+        db,
+        start_offset: out.len(),
+        out,
+        ext_crate_disambiguators,
+        module_paths: HashMap::new(),
+    };
+    m.print_trait_path(trait_id, None);
+    m.print_type(concrete_ty);
+    m.out
+}
+
 // ---------------------------------------------------------------------------
 // SymbolMangler
 // ---------------------------------------------------------------------------

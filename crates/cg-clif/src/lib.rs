@@ -946,6 +946,7 @@ fn codegen_cast(
         let is_extern =
             matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
         let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
+        let generic_args = erase_regions_for_codegen(fx.db(), generic_args);
         let interner = DbInterner::new_no_crate(fx.db());
         let empty_args = GenericArgs::empty(interner);
         let (callee_sig, callee_name) = if is_extern {
@@ -1006,6 +1007,7 @@ fn codegen_cast(
         let TyKind::Closure(closure_id, closure_subst) = from_ty.as_ref().kind() else {
             panic!("ClosureFnPointer on non-closure type: {:?}", from_ty);
         };
+        let closure_subst = erase_regions_for_codegen(fx.db(), closure_subst);
 
         let closure_layout = fx
             .db()
@@ -1373,12 +1375,6 @@ fn get_or_create_vtable(
     let krate = fx.local_crate();
     let interner = DbInterner::new_no_crate(fx.db());
 
-    // Simplify the concrete type for lookup (same approach as hir-ty's method_resolution)
-    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
-    let simplified =
-        simplify_type(interner, concrete_ty.as_ref(), TreatParams::InstantiateWithInfer)
-            .expect("cannot simplify concrete type for vtable lookup");
-
     // Closure traits (`Fn` / `FnMut` / `FnOnce`) are built-in and often don't
     // show up as explicit impl items in TraitImpls. In that case, wire the
     // vtable method slot directly to the closure body symbol.
@@ -1419,16 +1415,13 @@ fn get_or_create_vtable(
     };
     let num_methods = method_func_ids.len();
 
-    // Build unique vtable name
-    let vtable_name = format!(
-        "__vtable_{}_for_{:?}",
-        trait_id
-            .trait_items(fx.db())
-            .items
-            .first()
-            .map(|(n, _)| n.as_str().to_string())
-            .unwrap_or_default(),
-        simplified,
+    // Vtable symbols must use full trait+type identity. `simplify_type` is only
+    // suitable for impl lookup and can collapse distinct closure/object types.
+    let vtable_name = symbol_mangling::mangle_vtable(
+        fx.db(),
+        concrete_ty.as_ref(),
+        trait_id,
+        fx.ext_crate_disambiguators(),
     );
 
     // Declare the vtable data object
@@ -1472,6 +1465,8 @@ fn get_or_create_vtable(
 
     // Slot 3+: trait method fn ptrs — emit as relocations
     let closure_func_id = closure_fallback.as_ref().map(|(closure_id, closure_subst)| {
+        let closure_subst =
+            erase_regions_in_stored_generic_args_for_codegen(fx.db(), closure_subst);
         let closure_body = fx
             .db()
             .monomorphized_mir_body_for_closure(
@@ -1524,7 +1519,8 @@ fn get_or_create_vtable(
             };
             match resolved_method {
                 Either::Left((impl_func_id, impl_generic_args)) => {
-                    let impl_generic_args = impl_generic_args.as_ref();
+                    let impl_generic_args =
+                        erase_regions_for_codegen(fx.db(), impl_generic_args.as_ref());
                     // Declare/import the impl function.
                     let impl_body = fx
                         .db()
@@ -3654,6 +3650,7 @@ fn codegen_const_callable_from_vtable_id(
             let is_extern =
                 matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
             let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
+            let callee_args = erase_regions_for_codegen(fx.db(), callee_args);
             let interner = DbInterner::new_no_crate(fx.db());
             let empty_args = GenericArgs::empty(interner);
 
@@ -3714,6 +3711,7 @@ fn codegen_const_callable_from_vtable_id(
             Some(fx.bcx.ins().func_addr(fx.pointer_type, callee_ref))
         }
         TyKind::Closure(closure_id, closure_subst) => {
+            let closure_subst = erase_regions_for_codegen(fx.db(), closure_subst);
             let (closure_sig, closure_name) = match fx.db().monomorphized_mir_body_for_closure(
                 closure_id.0,
                 closure_subst.store(),
@@ -4463,12 +4461,55 @@ fn drop_impl_generic_args(
     ty: &StoredTy,
 ) -> StoredGenericArgs {
     let interner = DbInterner::new_with(db, local_crate);
-    match ty.as_ref().kind() {
+    let generic_args = match ty.as_ref().kind() {
         TyKind::Adt(_, subst) => {
             GenericArgs::new_from_iter(interner, subst.iter().filter(|arg| arg.region().is_none()))
                 .store()
         }
         _ => GenericArgs::empty(interner).store(),
+    };
+    erase_regions_in_stored_generic_args_for_codegen(db, &generic_args)
+}
+
+fn erase_regions_for_codegen<'db, T>(db: &'db dyn HirDatabase, value: T) -> T
+where
+    T: rustc_type_ir::TypeFoldable<DbInterner<'db>>,
+{
+    let interner = DbInterner::new_no_crate(db);
+    rustc_type_ir::fold_regions(interner, value, |_, _| {
+        hir_ty::next_solver::Region::new_erased(interner)
+    })
+}
+
+fn erase_regions_in_stored_generic_args_for_codegen(
+    db: &dyn HirDatabase,
+    generic_args: &StoredGenericArgs,
+) -> StoredGenericArgs {
+    erase_regions_for_codegen(db, generic_args.as_ref()).store()
+}
+
+fn enqueue_fn_instance(
+    db: &dyn HirDatabase,
+    queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    func_id: hir_def::FunctionId,
+    generic_args: StoredGenericArgs,
+) {
+    queue.push_back((func_id, erase_regions_in_stored_generic_args_for_codegen(db, &generic_args)));
+}
+
+fn track_closure_instance(
+    db: &dyn HirDatabase,
+    closure_visited: &mut std::collections::HashSet<(
+        hir_ty::db::InternedClosureId,
+        StoredGenericArgs,
+    )>,
+    closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    closure_id: hir_ty::db::InternedClosureId,
+    closure_subst: StoredGenericArgs,
+) {
+    let key = (closure_id, erase_regions_in_stored_generic_args_for_codegen(db, &closure_subst));
+    if closure_visited.insert(key.clone()) {
+        closure_result.push(key);
     }
 }
 
@@ -4674,6 +4715,7 @@ fn codegen_closure_call(
     destination: &Place,
     target: &Option<BasicBlockId>,
 ) {
+    let closure_subst = erase_regions_in_stored_generic_args_for_codegen(fx.db(), &closure_subst);
     // Get closure MIR body to build the signature
     let closure_body = fx
         .db()
@@ -4753,6 +4795,7 @@ fn callable_output_ty(
     generic_args: GenericArgs<'_>,
 ) -> Option<StoredTy> {
     let interner = DbInterner::new_no_crate(db);
+    let generic_args = erase_regions_for_codegen(db, generic_args);
     let fn_sig = if generic_args.is_empty() {
         db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
     } else {
@@ -4767,12 +4810,9 @@ fn is_abstract_trait_method_instance(
     callee_func_id: hir_def::FunctionId,
     generic_args: &StoredGenericArgs,
 ) -> bool {
+    let generic_args = erase_regions_in_stored_generic_args_for_codegen(fx.db(), generic_args);
     matches!(
-        fx.db().monomorphized_mir_body(
-            callee_func_id.into(),
-            generic_args.clone(),
-            fx.env().clone()
-        ),
+        fx.db().monomorphized_mir_body(callee_func_id.into(), generic_args, fx.env().clone()),
         Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _))
     )
 }
@@ -5102,6 +5142,7 @@ fn codegen_direct_call_from_cvalues_into_dest(
     args: &[CValue],
     dest: &CPlace,
 ) {
+    let generic_args = erase_regions_for_codegen(fx.db(), generic_args);
     let stored_generic_args = generic_args.store();
     if let Some(self_ty) = abstract_clone_copy_self_ty(fx, callee_func_id, &stored_generic_args) {
         let self_ref = args.first().expect("Clone::clone lowering expects a receiver").clone();
@@ -6478,6 +6519,7 @@ fn codegen_direct_call(
     } else {
         (callee_func_id, generic_args.store())
     };
+    let generic_args = erase_regions_in_stored_generic_args_for_codegen(fx.db(), &generic_args);
 
     let callee_is_rust_call_abi =
         fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
@@ -7045,6 +7087,7 @@ fn codegen_intrinsic_call(
                 }
                 _ => panic!("unsupported const_eval_select runtime callable: {:?}", runtime_ty),
             };
+            let runtime_generic_args = erase_regions_for_codegen(fx.db(), runtime_generic_args);
 
             // `const_eval_select` passes captured arguments as a tuple in `args[0]`.
             // Runtime callables expect those as regular function parameters, so unpack.
@@ -8030,6 +8073,7 @@ fn build_fn_sig_from_ty(
     func_id: hir_def::FunctionId,
     generic_args: GenericArgs<'_>,
 ) -> Result<Signature, String> {
+    let generic_args = erase_regions_for_codegen(db, generic_args);
     let fn_abi = abi::fn_abi_for_fn_item_from_ty(isa, db, dl, env, func_id, generic_args)?;
     Ok(fn_abi.sig)
 }
@@ -8490,10 +8534,13 @@ fn collect_unsize_metadata_dependencies(
     }
 
     if let TyKind::Closure(closure_id, closure_subst) = source_tail.as_ref().kind() {
-        let key = (closure_id.0, closure_subst.store());
-        if closure_visited.insert(key.clone()) {
-            closure_result.push(key);
-        }
+        track_closure_instance(
+            db,
+            closure_visited,
+            closure_result,
+            closure_id.0,
+            closure_subst.store(),
+        );
     }
 
     // Slot 0 stores drop glue for the concrete source tail.
@@ -8508,7 +8555,7 @@ fn collect_unsize_metadata_dependencies(
         if let (Either::Left(impl_func_id), impl_generic_args) =
             db.lookup_impl_method(env.as_ref(), *trait_method_func_id, trait_method_subst)
         {
-            queue.push_back((impl_func_id, impl_generic_args.store()));
+            enqueue_fn_instance(db, queue, impl_func_id, impl_generic_args.store());
         }
     }
 }
@@ -8916,6 +8963,7 @@ where
     queue.push_back((root, empty_args));
 
     while let Some((func_id, generic_args)) = queue.pop_front() {
+        let generic_args = erase_regions_in_stored_generic_args_for_codegen(db, &generic_args);
         if !visited.insert((func_id, generic_args.clone())) {
             continue;
         }
@@ -8967,6 +9015,7 @@ where
     while i < closure_result.len() {
         let (closure_id, closure_subst) = closure_result[i].clone();
         i += 1;
+        let closure_subst = erase_regions_in_stored_generic_args_for_codegen(db, &closure_subst);
         let Ok(closure_body) =
             db.monomorphized_mir_body_for_closure(closure_id, closure_subst, env.clone())
         else {
@@ -8985,6 +9034,7 @@ where
         );
         // Process any newly discovered functions from closure bodies
         while let Some((func_id, generic_args)) = queue.pop_front() {
+            let generic_args = erase_regions_in_stored_generic_args_for_codegen(db, &generic_args);
             if !visited.insert((func_id, generic_args.clone())) {
                 continue;
             }
@@ -9143,7 +9193,7 @@ fn collect_builtin_derive_trait_call_dependency(
         db.lookup_impl_method(env.as_ref(), trait_method_func_id, method_substs);
     match resolved_callable {
         Either::Left(resolved_id) => {
-            queue.push_back((resolved_id, resolved_args.store()));
+            enqueue_fn_instance(db, queue, resolved_id, resolved_args.store());
         }
         Either::Right((derive_impl_id, derive_method)) => {
             collect_builtin_derive_method_dependencies(
@@ -9359,13 +9409,16 @@ fn enqueue_callable_from_mapped_ty(
                 }
             }
 
-            queue.push_back((callee_id, resolved_args.store()));
+            enqueue_fn_instance(db, queue, callee_id, resolved_args.store());
         }
         TyKind::Closure(closure_id, closure_subst) => {
-            let key = (closure_id.0, closure_subst.store());
-            if closure_visited.insert(key.clone()) {
-                closure_result.push(key);
-            }
+            track_closure_instance(
+                db,
+                closure_visited,
+                closure_result,
+                closure_id.0,
+                closure_subst.store(),
+            );
         }
         _ => {}
     }
@@ -9561,7 +9614,12 @@ fn scan_body_for_callees(
                                         }
                                     }
 
-                                    queue.push_back((resolved_id, resolved_args.store()));
+                                    enqueue_fn_instance(
+                                        db,
+                                        queue,
+                                        resolved_id,
+                                        resolved_args.store(),
+                                    );
                                 }
                             }
                         }
@@ -9572,10 +9630,13 @@ fn scan_body_for_callees(
                             if let TyKind::Closure(closure_id, closure_subst) =
                                 from_ty.as_ref().kind()
                             {
-                                let key = (closure_id.0, closure_subst.store());
-                                if closure_visited.insert(key.clone()) {
-                                    closure_result.push(key);
-                                }
+                                track_closure_instance(
+                                    db,
+                                    closure_visited,
+                                    closure_result,
+                                    closure_id.0,
+                                    closure_subst.store(),
+                                );
                             }
                         }
                         _ => {}
@@ -9584,10 +9645,13 @@ fn scan_body_for_callees(
                 // Closure constructions: discover closure bodies
                 StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), _)) => {
                     if let TyKind::Closure(closure_id, closure_subst) = ty.as_ref().kind() {
-                        let key = (closure_id.0, closure_subst.store());
-                        if closure_visited.insert(key.clone()) {
-                            closure_result.push(key);
-                        }
+                        track_closure_instance(
+                            db,
+                            closure_visited,
+                            closure_result,
+                            closure_id.0,
+                            closure_subst.store(),
+                        );
                     }
                 }
                 _ => {}
@@ -9667,7 +9731,12 @@ fn scan_body_for_callees(
                                 runtime_ty.as_ref().kind()
                                 && let CallableDefId::FunctionId(runtime_func_id) = runtime_def.0
                             {
-                                queue.push_back((runtime_func_id, runtime_args.store()));
+                                enqueue_fn_instance(
+                                    db,
+                                    queue,
+                                    runtime_func_id,
+                                    runtime_args.store(),
+                                );
                             }
                         }
                         continue;
@@ -9712,10 +9781,13 @@ fn scan_body_for_callees(
                         {
                             match peel_ref_layers(self_ty).kind() {
                                 TyKind::Closure(closure_id, closure_subst) => {
-                                    let key = (closure_id.0, closure_subst.store());
-                                    if closure_visited.insert(key.clone()) {
-                                        closure_result.push(key);
-                                    }
+                                    track_closure_instance(
+                                        db,
+                                        closure_visited,
+                                        closure_result,
+                                        closure_id.0,
+                                        closure_subst.store(),
+                                    );
                                     continue;
                                 }
                                 TyKind::FnDef(def, fn_args) => {
@@ -9749,7 +9821,12 @@ fn scan_body_for_callees(
                                             }
                                         }
 
-                                        queue.push_back((resolved_fn_id, resolved_fn_args.store()));
+                                        enqueue_fn_instance(
+                                            db,
+                                            queue,
+                                            resolved_fn_id,
+                                            resolved_fn_args.store(),
+                                        );
                                     }
                                     continue;
                                 }
@@ -9791,7 +9868,7 @@ fn scan_body_for_callees(
                             }
                         }
                     }
-                    queue.push_back((resolved_id, resolved_args.store()));
+                    enqueue_fn_instance(db, queue, resolved_id, resolved_args.store());
 
                     if let Some(source_return_ty) =
                         callable_output_ty(db, resolved_id, resolved_args)
@@ -9887,7 +9964,7 @@ pub fn compile_executable(
             closure_subst.as_ref(),
             ext_crate_disambiguators,
         );
-        if !compiled_closure_symbols.insert(closure_name.clone()) {
+        if compiled_closure_symbols.contains(&closure_name) {
             continue;
         }
         let body = match db.monomorphized_mir_body_for_closure(
@@ -9899,6 +9976,7 @@ pub fn compile_executable(
             Err(hir_ty::mir::MirLowerError::UnresolvedName(_)) => continue,
             Err(e) => return Err(format!("MIR error for closure {closure_name}: {e:?}")),
         };
+        compiled_closure_symbols.insert(closure_name.clone());
         compile_fn(
             &mut module,
             &*isa,
