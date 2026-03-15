@@ -2340,6 +2340,10 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
     })
 }
 
+fn host_supports_atomic_128() -> bool {
+    cfg!(target_has_atomic = "128")
+}
+
 #[test]
 fn std_jit_process_id_nonzero() {
     let result: i32 = jit_run_with_std(
@@ -4532,10 +4536,16 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std MIR lowering cannot resolve AtomicU128::fetch_add yet"]
 fn std_jit_atomic_u128_probe() {
+    if !host_supports_atomic_128() {
+        eprintln!("skipping 128-bit atomic probe on a host without `target_has_atomic = \"128\"`");
+        return;
+    }
+
     let result: i32 = jit_run_with_std(
         r#"
+#![feature(integer_atomics)]
+
 use std::sync::atomic::{AtomicU128, Ordering};
 
 fn foo() -> i32 {
@@ -4550,10 +4560,16 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std MIR lowering cannot resolve AtomicU128::compare_exchange yet"]
 fn std_jit_atomic_u128_compare_exchange_probe() {
+    if !host_supports_atomic_128() {
+        eprintln!("skipping 128-bit atomic probe on a host without `target_has_atomic = \"128\"`");
+        return;
+    }
+
     let result: i32 = jit_run_with_std(
         r#"
+#![feature(integer_atomics)]
+
 use std::sync::atomic::{AtomicU128, Ordering};
 
 fn foo() -> i32 {
@@ -4571,10 +4587,16 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: std MIR lowering cannot resolve AtomicI128::fetch_sub yet"]
 fn std_jit_atomic_i128_probe() {
+    if !host_supports_atomic_128() {
+        eprintln!("skipping 128-bit atomic probe on a host without `target_has_atomic = \"128\"`");
+        return;
+    }
+
     let result: i32 = jit_run_with_std(
         r#"
+#![feature(integer_atomics)]
+
 use std::sync::atomic::{AtomicI128, Ordering};
 
 fn foo() -> i32 {
