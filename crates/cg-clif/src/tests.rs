@@ -1806,7 +1806,6 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
             krate: local_crate,
         }
         .store();
-
         // Discover all reachable functions, closures, and drop types
         let (reachable_fns, reachable_closures, drop_types) =
             crate::collect_reachable_fns(&db, &env, entry_func_id, local_crate);
@@ -4271,20 +4270,17 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: enum drop glue does not drop active variant fields"]
 fn jit_enum_variant_field_drop_probe() {
-    let result: i32 = jit_run(
+    let result: i32 = jit_run_reachable(
         r#"
-static mut SLOT: *mut i32 = 0 as *mut i32;
-
-struct Bump;
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Bump {
+    target: *mut i32,
+}
 impl Drop for Bump {
     fn drop(&mut self) {
-        unsafe {
-            if !SLOT.is_null() {
-                *SLOT += 1;
-            }
-        }
+        unsafe { *self.target = 1; }
     }
 }
 
@@ -4293,38 +4289,33 @@ enum Wrap {
     Empty,
 }
 
+fn make_and_drop(target: *mut i32) {
+    let _value = Wrap::Hold(Bump { target });
+}
+
 fn foo() -> i32 {
     let mut dropped = 0_i32;
-    unsafe {
-        SLOT = &mut dropped;
-    }
-    {
-        let _value = Wrap::Hold(Bump);
-    }
+    make_and_drop(&mut dropped);
     dropped
 }
 "#,
-        &["foo"],
         "foo",
     );
     assert_eq!(result, 1);
 }
 
 #[test]
-#[ignore = "currently fails: reassigning enum values does not drop old variant fields"]
 fn jit_enum_reassign_drop_probe() {
-    let result: i32 = jit_run(
+    let result: i32 = jit_run_reachable(
         r#"
-static mut SLOT: *mut i32 = 0 as *mut i32;
-
-struct Bump;
+//- minicore: drop, sized, copy
+//- /main.rs
+struct Bump {
+    target: *mut i32,
+}
 impl Drop for Bump {
     fn drop(&mut self) {
-        unsafe {
-            if !SLOT.is_null() {
-                *SLOT += 1;
-            }
-        }
+        unsafe { *self.target = 1; }
     }
 }
 
@@ -4333,17 +4324,17 @@ enum Wrap {
     Empty,
 }
 
+fn overwrite_and_drop(target: *mut i32) {
+    let mut value = Wrap::Hold(Bump { target });
+    value = Wrap::Empty;
+}
+
 fn foo() -> i32 {
     let mut dropped = 0_i32;
-    unsafe {
-        SLOT = &mut dropped;
-    }
-    let mut value = Wrap::Hold(Bump);
-    value = Wrap::Empty;
+    overwrite_and_drop(&mut dropped);
     dropped
 }
 "#,
-        &["foo"],
         "foo",
     );
     assert_eq!(result, 1);

@@ -455,19 +455,13 @@ fn pattern_type_pat_single(p: &mut Parser<'_>) {
 
     if p.at(T![..=]) {
         p.bump(T![..=]);
-        if !matches!(
-            p.current(),
-            T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF
-        ) {
+        if !matches!(p.current(), T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF) {
             expressions::expr_no_range(p);
         }
         m.complete(p, PATTERN_TYPE_RANGE_PAT);
     } else if p.at(T![..]) {
         p.bump(T![..]);
-        if !matches!(
-            p.current(),
-            T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF
-        ) {
+        if !matches!(p.current(), T![|] | T![,] | T![')'] | T![']'] | T!['}'] | EOF) {
             expressions::expr_no_range(p);
         }
         m.complete(p, PATTERN_TYPE_RANGE_PAT);

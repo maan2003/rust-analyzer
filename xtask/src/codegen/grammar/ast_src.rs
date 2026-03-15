@@ -111,20 +111,19 @@ const RESERVED: &[&str] = &[
 ];
 // keywords that are keywords only in specific parse contexts
 #[doc(alias = "WEAK_KEYWORDS")]
-const CONTEXTUAL_KEYWORDS: &[&str] =
-    &[
-        "macro_rules",
-        "union",
-        "default",
-        "raw",
-        "dyn",
-        "auto",
-        "yeet",
-        "safe",
-        "bikeshed",
-        "is",
-        "null",
-    ];
+const CONTEXTUAL_KEYWORDS: &[&str] = &[
+    "macro_rules",
+    "union",
+    "default",
+    "raw",
+    "dyn",
+    "auto",
+    "yeet",
+    "safe",
+    "bikeshed",
+    "is",
+    "null",
+];
 // keywords we use for special macro expansions
 const CONTEXTUAL_BUILTIN_KEYWORDS: &[&str] = &[
     "asm",

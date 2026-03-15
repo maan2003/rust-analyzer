@@ -54,8 +54,9 @@ pub mod symbol_mangling;
 mod value_and_place;
 
 use hir_ty::layout::Layout;
+use pointer::Pointer;
 use rac_abi::callconv::PassMode;
-use value_and_place::{CPlace, CValue};
+use value_and_place::{CPlace, CValue, scalar_pair_b_offset};
 
 /// Layout Arc type alias (triomphe::Arc from hir-ty's layout_of_ty).
 type LayoutArc = TArc<Layout>;
@@ -751,24 +752,33 @@ fn atomic_scalar_clif_ty(dl: &TargetDataLayout, layout: &Layout) -> Type {
     scalar_to_clif_type(dl, &scalar)
 }
 
+fn codegen_intcast_with_bcx(
+    bcx: &mut FunctionBuilder<'_>,
+    val: Value,
+    to_ty: Type,
+    signed: bool,
+) -> Value {
+    let from_ty = bcx.func.dfg.value_type(val);
+    match (from_ty, to_ty) {
+        (_, _) if from_ty == to_ty => val,
+        (_, _) if to_ty.wider_or_equal(from_ty) => {
+            if signed {
+                bcx.ins().sextend(to_ty, val)
+            } else {
+                bcx.ins().uextend(to_ty, val)
+            }
+        }
+        (_, _) => bcx.ins().ireduce(to_ty, val),
+    }
+}
+
 pub(crate) fn codegen_intcast(
     fx: &mut FunctionCx<'_, impl Module>,
     val: Value,
     to_ty: Type,
     signed: bool,
 ) -> Value {
-    let from_ty = fx.bcx.func.dfg.value_type(val);
-    match (from_ty, to_ty) {
-        (_, _) if from_ty == to_ty => val,
-        (_, _) if to_ty.wider_or_equal(from_ty) => {
-            if signed {
-                fx.bcx.ins().sextend(to_ty, val)
-            } else {
-                fx.bcx.ins().uextend(to_ty, val)
-            }
-        }
-        (_, _) => fx.bcx.ins().ireduce(to_ty, val),
-    }
+    codegen_intcast_with_bcx(&mut fx.bcx, val, to_ty, signed)
 }
 
 pub(crate) fn codegen_libcall1(
@@ -1975,37 +1985,46 @@ fn tag_scalar_layout(dl: &TargetDataLayout, tag: &Scalar) -> TArc<Layout> {
 
 /// Compare a Cranelift value against an i128 immediate.
 /// Ported from upstream cg_clif/src/common.rs `codegen_icmp_imm`.
+fn codegen_icmp_imm_with_bcx(
+    bcx: &mut FunctionBuilder<'_>,
+    intcc: IntCC,
+    lhs: Value,
+    rhs: i128,
+) -> Value {
+    let lhs_ty = bcx.func.dfg.value_type(lhs);
+    if lhs_ty == types::I128 {
+        let (lhs_lsb, lhs_msb) = bcx.ins().isplit(lhs);
+        let (rhs_lsb, rhs_msb) = (rhs as u128 as u64 as i64, (rhs as u128 >> 64) as u64 as i64);
+        match intcc {
+            IntCC::Equal => {
+                let lsb_eq = bcx.ins().icmp_imm(IntCC::Equal, lhs_lsb, rhs_lsb);
+                let msb_eq = bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
+                bcx.ins().band(lsb_eq, msb_eq)
+            }
+            IntCC::NotEqual => {
+                let lsb_ne = bcx.ins().icmp_imm(IntCC::NotEqual, lhs_lsb, rhs_lsb);
+                let msb_ne = bcx.ins().icmp_imm(IntCC::NotEqual, lhs_msb, rhs_msb);
+                bcx.ins().bor(lsb_ne, msb_ne)
+            }
+            _ => {
+                let msb_eq = bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
+                let lsb_cc = bcx.ins().icmp_imm(intcc, lhs_lsb, rhs_lsb);
+                let msb_cc = bcx.ins().icmp_imm(intcc, lhs_msb, rhs_msb);
+                bcx.ins().select(msb_eq, lsb_cc, msb_cc)
+            }
+        }
+    } else {
+        bcx.ins().icmp_imm(intcc, lhs, rhs as i64)
+    }
+}
+
 pub(crate) fn codegen_icmp_imm(
     fx: &mut FunctionCx<'_, impl Module>,
     intcc: IntCC,
     lhs: Value,
     rhs: i128,
 ) -> Value {
-    let lhs_ty = fx.bcx.func.dfg.value_type(lhs);
-    if lhs_ty == types::I128 {
-        let (lhs_lsb, lhs_msb) = fx.bcx.ins().isplit(lhs);
-        let (rhs_lsb, rhs_msb) = (rhs as u128 as u64 as i64, (rhs as u128 >> 64) as u64 as i64);
-        match intcc {
-            IntCC::Equal => {
-                let lsb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_lsb, rhs_lsb);
-                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
-                fx.bcx.ins().band(lsb_eq, msb_eq)
-            }
-            IntCC::NotEqual => {
-                let lsb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_lsb, rhs_lsb);
-                let msb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_msb, rhs_msb);
-                fx.bcx.ins().bor(lsb_ne, msb_ne)
-            }
-            _ => {
-                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
-                let lsb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_lsb, rhs_lsb);
-                let msb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_msb, rhs_msb);
-                fx.bcx.ins().select(msb_eq, lsb_cc, msb_cc)
-            }
-        }
-    } else {
-        fx.bcx.ins().icmp_imm(intcc, lhs, rhs as i64)
-    }
+    codegen_icmp_imm_with_bcx(&mut fx.bcx, intcc, lhs, rhs)
 }
 
 /// Convert a `VariantId` to a `VariantIdx`.
@@ -2061,8 +2080,9 @@ fn truncate_bits_to_clif_int_ty(bits: u128, ty: Type) -> u128 {
     }
 }
 
-fn remap_variant_index_to_discriminant(
-    fx: &mut FunctionCx<'_, impl Module>,
+fn remap_variant_index_to_discriminant_with_bcx(
+    bcx: &mut FunctionBuilder<'_>,
+    db: &dyn HirDatabase,
     enum_ty: &StoredTy,
     variant_index_value: Value,
 ) -> Value {
@@ -2070,33 +2090,138 @@ fn remap_variant_index_to_discriminant(
         return variant_index_value;
     };
 
-    let variant_ids: Vec<_> = {
-        let db = fx.db();
-        enum_id.enum_variants(db).variants.iter().map(|&(variant_id, _, _)| variant_id).collect()
-    };
+    let variant_ids: Vec<_> =
+        enum_id.enum_variants(db).variants.iter().map(|&(variant_id, _, _)| variant_id).collect();
 
-    let discr_ty = fx.bcx.func.dfg.value_type(variant_index_value);
+    let discr_ty = bcx.func.dfg.value_type(variant_index_value);
     let mut mapped = variant_index_value;
     for (idx, variant_id) in variant_ids.into_iter().enumerate() {
-        let discr_bits = {
-            let db = fx.db();
-            db.const_eval_discriminant(variant_id).unwrap_or_else(|e| {
-                panic!(
-                    "failed to evaluate discriminant for enum {:?} variant {}: {e:?}",
-                    enum_id, idx,
-                )
-            }) as u128
-        };
+        let discr_bits = db.const_eval_discriminant(variant_id).unwrap_or_else(|e| {
+            panic!("failed to evaluate discriminant for enum {:?} variant {}: {e:?}", enum_id, idx,)
+        }) as u128;
 
         if discr_bits == idx as u128 {
             continue;
         }
 
-        let is_variant = codegen_icmp_imm(fx, IntCC::Equal, variant_index_value, idx as i128);
-        let discr_value = iconst_from_bits(&mut fx.bcx, discr_ty, discr_bits);
-        mapped = fx.bcx.ins().select(is_variant, discr_value, mapped);
+        let is_variant =
+            codegen_icmp_imm_with_bcx(bcx, IntCC::Equal, variant_index_value, idx as i128);
+        let discr_value = iconst_from_bits(bcx, discr_ty, discr_bits);
+        mapped = bcx.ins().select(is_variant, discr_value, mapped);
     }
     mapped
+}
+
+fn read_enum_discriminant_from_ptr(
+    bcx: &mut FunctionBuilder<'_>,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    pointer_type: Type,
+    enum_ptr: Pointer,
+    enum_layout: &LayoutArc,
+    enum_ty: &StoredTy,
+    dest_clif_ty: Type,
+) -> Value {
+    use rustc_abi::{TagEncoding, Variants};
+
+    match &enum_layout.variants {
+        Variants::Single { index } => {
+            let discr_val = enum_variant_discriminant_bits(db, enum_ty, *index);
+            iconst_from_bits(bcx, dest_clif_ty, discr_val)
+        }
+        Variants::Multiple { tag, tag_field, tag_encoding, .. } => {
+            let tag_clif_ty = scalar_to_clif_type(dl, tag);
+            let mut flags = MemFlags::new();
+            flags.set_notrap();
+
+            let tag_val = match enum_layout.backend_repr {
+                BackendRepr::Scalar(_) => enum_ptr.load(bcx, tag_clif_ty, flags),
+                BackendRepr::ScalarPair(a_scalar, b_scalar) => {
+                    let lane = scalar_pair_tag_lane(a_scalar, b_scalar, tag, *tag_field);
+                    let lane_ptr = match lane {
+                        0 => enum_ptr,
+                        1 => enum_ptr.offset_i64(
+                            bcx,
+                            pointer_type,
+                            scalar_pair_b_offset(dl, a_scalar, b_scalar),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    lane_ptr.load(bcx, tag_clif_ty, flags)
+                }
+                _ => {
+                    let tag_offset = enum_layout.fields.offset(tag_field.as_usize());
+                    let tag_ptr = enum_ptr.offset_i64(
+                        bcx,
+                        pointer_type,
+                        i64::try_from(tag_offset.bytes()).unwrap(),
+                    );
+                    tag_ptr.load(bcx, tag_clif_ty, flags)
+                }
+            };
+
+            match tag_encoding {
+                TagEncoding::Direct => {
+                    let signed = matches!(tag.primitive(), Primitive::Int(_, true));
+                    codegen_intcast_with_bcx(bcx, tag_val, dest_clif_ty, signed)
+                }
+                TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                    let relative_max =
+                        niche_variants.end().as_u32() - niche_variants.start().as_u32();
+
+                    let (is_niche, tagged_discr, delta) = if relative_max == 0 {
+                        let is_niche = codegen_icmp_imm_with_bcx(
+                            bcx,
+                            IntCC::Equal,
+                            tag_val,
+                            *niche_start as i128,
+                        );
+                        let tagged_discr = iconst_from_bits(
+                            bcx,
+                            dest_clif_ty,
+                            niche_variants.start().as_u32().into(),
+                        );
+                        (is_niche, tagged_discr, 0)
+                    } else {
+                        let niche_start_val = iconst_from_bits(bcx, tag_clif_ty, *niche_start);
+                        let relative_discr = bcx.ins().isub(tag_val, niche_start_val);
+                        let cast_tag =
+                            codegen_intcast_with_bcx(bcx, relative_discr, dest_clif_ty, false);
+                        let is_niche = codegen_icmp_imm_with_bcx(
+                            bcx,
+                            IntCC::UnsignedLessThanOrEqual,
+                            relative_discr,
+                            i128::from(relative_max),
+                        );
+                        (is_niche, cast_tag, niche_variants.start().as_u32() as u128)
+                    };
+
+                    let tagged_discr = if delta == 0 {
+                        tagged_discr
+                    } else {
+                        let delta_val = iconst_from_bits(bcx, dest_clif_ty, delta);
+                        bcx.ins().iadd(tagged_discr, delta_val)
+                    };
+
+                    let untagged_variant_val =
+                        iconst_from_bits(bcx, dest_clif_ty, untagged_variant.as_u32().into());
+                    let variant_index =
+                        bcx.ins().select(is_niche, tagged_discr, untagged_variant_val);
+                    remap_variant_index_to_discriminant_with_bcx(bcx, db, enum_ty, variant_index)
+                }
+            }
+        }
+        Variants::Empty => panic!("attempted to read discriminant from empty enum layout"),
+    }
+}
+
+fn remap_variant_index_to_discriminant(
+    fx: &mut FunctionCx<'_, impl Module>,
+    enum_ty: &StoredTy,
+    variant_index_value: Value,
+) -> Value {
+    let db = fx.db();
+    remap_variant_index_to_discriminant_with_bcx(&mut fx.bcx, db, enum_ty, variant_index_value)
 }
 
 /// Pick which scalar lane of a `ScalarPair` holds the enum tag.
@@ -2118,23 +2243,106 @@ fn scalar_pair_tag_lane(a: Scalar, b: Scalar, tag: &Scalar, tag_field: rac_abi::
     }
 }
 
+fn emit_drop_call(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan, ty: &StoredTy, ptr: Value) {
+    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
+    drop_sig.params.push(AbiParam::new(fx.pointer_type));
+
+    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
+    let direct_drop = lang_items
+        .Drop
+        .and_then(|drop_trait| resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, ty));
+    let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), ty);
+
+    let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
+        let generic_args = drop_impl_generic_args(fx.db(), fx.local_crate(), ty);
+        symbol_mangling::mangle_function(
+            fx.db(),
+            drop_func_id,
+            generic_args.as_ref(),
+            fx.ext_crate_disambiguators(),
+        )
+    } else {
+        symbol_mangling::mangle_drop_in_place(fx.db(), ty.as_ref(), fx.ext_crate_disambiguators())
+    };
+    let direct_drop_requires_caller_location = direct_drop
+        .filter(|_| !needs_field_drops)
+        .is_some_and(|drop_func_id| abi::function_requires_caller_location(fx.db(), drop_func_id));
+    if direct_drop_requires_caller_location {
+        drop_sig.params.push(AbiParam::new(fx.pointer_type));
+    }
+
+    let callee_id =
+        fx.module.declare_function(&fn_name, Linkage::Import, &drop_sig).expect("declare drop fn");
+    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+    let mut call_args = vec![ptr];
+    if direct_drop_requires_caller_location {
+        call_args.push(get_caller_location(fx, span));
+    }
+    fx.bcx.ins().call(callee_ref, &call_args);
+}
+
+fn maybe_drop_old_local_before_overwrite(
+    fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
+    place: &Place,
+) {
+    let projections = place.projection.lookup(&fx.ra_body().projection_store);
+    if !projections.is_empty() {
+        return;
+    }
+
+    let local_idx = place.local.into_raw().into_u32();
+    let Some(&flag_var) = fx.drop_flags.get(&local_idx) else {
+        return;
+    };
+
+    let ty = place_ty(fx.db(), fx.ra_body(), place);
+    let interner = DbInterner::new_with(fx.db(), fx.local_crate());
+    if !hir_ty::drop::has_drop_glue_mono(interner, ty.as_ref()) {
+        return;
+    }
+
+    let flag_val = fx.bcx.use_var(flag_var);
+    let do_drop_block = fx.bcx.create_block();
+    let continue_block = fx.bcx.create_block();
+    fx.bcx.ins().brif(flag_val, do_drop_block, &[], continue_block, &[]);
+
+    fx.bcx.switch_to_block(do_drop_block);
+    let drop_place = codegen_place(fx, place);
+    let ptr = drop_place.to_ptr_maybe_spill(fx).get_addr(&mut fx.bcx, fx.pointer_type);
+    emit_drop_call(fx, span, &ty, ptr);
+    fx.clear_drop_flag(place.local);
+    fx.bcx.ins().jump(continue_block, &[]);
+
+    fx.bcx.switch_to_block(continue_block);
+}
+
 // ---------------------------------------------------------------------------
 // Statement codegen
 // ---------------------------------------------------------------------------
 
-fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &StatementKind) {
+fn codegen_statement(fx: &mut FunctionCx<'_, impl Module>, stmt: &hir_ty::mir::Statement) {
     match stmt {
-        StatementKind::Assign(place, rvalue) => {
+        hir_ty::mir::Statement { kind: StatementKind::Assign(place, rvalue), span } => {
+            maybe_drop_old_local_before_overwrite(fx, *span, place);
             codegen_assign(fx, place, rvalue);
             // Mark the destination local as live for drop-flag tracking.
             if place.projection.lookup(&fx.ra_body().projection_store).is_empty() {
                 fx.set_drop_flag(place.local);
             }
         }
-        StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
-        StatementKind::Nop | StatementKind::FakeRead(_) => {}
-        StatementKind::Deinit(_) => {}
-        StatementKind::SetDiscriminant { place, variant_index } => {
+        hir_ty::mir::Statement {
+            kind: StatementKind::StorageLive(_) | StatementKind::StorageDead(_),
+            ..
+        } => {}
+        hir_ty::mir::Statement {
+            kind: StatementKind::Nop | StatementKind::FakeRead(_), ..
+        } => {}
+        hir_ty::mir::Statement { kind: StatementKind::Deinit(_), .. } => {}
+        hir_ty::mir::Statement {
+            kind: StatementKind::SetDiscriminant { place, variant_index },
+            ..
+        } => {
             let enum_ty = {
                 let body = fx.ra_body();
                 place_ty(fx.db(), body, place)
@@ -4070,6 +4278,9 @@ fn codegen_terminator(fx: &mut FunctionCx<'_, impl Module>, term: &hir_ty::mir::
             switch.emit(&mut fx.bcx, discr_val, otherwise);
         }
         TerminatorKind::Call { func, args, destination, target, .. } => {
+            if target.is_some() {
+                maybe_drop_old_local_before_overwrite(fx, term.span, destination);
+            }
             codegen_call(fx, term.span, func, args, destination, target);
         }
         TerminatorKind::Drop { place, target, .. } => {
@@ -4121,47 +4332,7 @@ fn codegen_drop(
     // Spills register-stored places to the stack if necessary.
     let drop_place = codegen_place(fx, place);
     let ptr = drop_place.to_ptr_maybe_spill(fx).get_addr(&mut fx.bcx, fx.pointer_type);
-
-    let mut drop_sig = Signature::new(fx.isa.default_call_conv());
-    drop_sig.params.push(AbiParam::new(fx.pointer_type));
-
-    // Optimization: if the type has a direct Drop impl and no fields need
-    // recursive dropping, call Drop::drop directly (avoiding the
-    // drop_in_place wrapper). Otherwise, call drop_in_place::<T>.
-    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
-    let direct_drop = lang_items
-        .Drop
-        .and_then(|drop_trait| resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, &ty));
-    let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), &ty);
-
-    let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
-        // Simple case: just call Drop::drop directly
-        let generic_args = drop_impl_generic_args(fx.db(), fx.local_crate(), &ty);
-        symbol_mangling::mangle_function(
-            fx.db(),
-            drop_func_id,
-            generic_args.as_ref(),
-            fx.ext_crate_disambiguators(),
-        )
-    } else {
-        // Needs recursive field drops — use drop_in_place glue
-        symbol_mangling::mangle_drop_in_place(fx.db(), ty.as_ref(), fx.ext_crate_disambiguators())
-    };
-    let direct_drop_requires_caller_location = direct_drop
-        .filter(|_| !needs_field_drops)
-        .is_some_and(|drop_func_id| abi::function_requires_caller_location(fx.db(), drop_func_id));
-    if direct_drop_requires_caller_location {
-        drop_sig.params.push(AbiParam::new(fx.pointer_type));
-    }
-
-    let callee_id =
-        fx.module.declare_function(&fn_name, Linkage::Import, &drop_sig).expect("declare drop fn");
-    let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
-    let mut call_args = vec![ptr];
-    if direct_drop_requires_caller_location {
-        call_args.push(get_caller_location(fx, span));
-    }
-    fx.bcx.ins().call(callee_ref, &call_args);
+    emit_drop_call(fx, span, &ty, ptr);
 
     if clear_flag_after_drop {
         fx.clear_drop_flag(place.local);
@@ -8188,7 +8359,7 @@ pub fn compile_fn(
             }
 
             for stmt in &bb.statements {
-                codegen_statement(&mut fx, &stmt.kind);
+                codegen_statement(&mut fx, stmt);
             }
 
             if let Some(term) = &bb.terminator {
@@ -8377,6 +8548,69 @@ fn collect_vtable_methods(
     );
 }
 
+fn emit_drop_in_place_call(
+    module: &mut impl Module,
+    bcx: &mut FunctionBuilder<'_>,
+    sig: &Signature,
+    db: &dyn HirDatabase,
+    field_ty: &StoredTy,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+    field_ptr: Value,
+) {
+    let name =
+        symbol_mangling::mangle_drop_in_place(db, field_ty.as_ref(), ext_crate_disambiguators);
+    let callee =
+        module.declare_function(&name, Linkage::Import, sig).expect("declare field drop_in_place");
+    let callee_ref = module.declare_func_in_func(callee, bcx.func);
+    bcx.ins().call(callee_ref, &[field_ptr]);
+}
+
+fn emit_enum_variant_field_drops(
+    module: &mut impl Module,
+    bcx: &mut FunctionBuilder<'_>,
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    interner: DbInterner,
+    pointer_type: Type,
+    field_drop_sig: &Signature,
+    enum_layout: &LayoutArc,
+    enum_id: hir_def::EnumId,
+    subst: GenericArgs<'_>,
+    self_ptr: Value,
+    variant_idx: VariantIdx,
+    ext_crate_disambiguators: &HashMap<String, u64>,
+) -> Result<(), String> {
+    let enum_place = CPlace::for_ptr(Pointer::new(self_ptr), enum_layout.clone());
+    let variant_layout = variant_layout(enum_layout, variant_idx);
+    let variant_place = enum_place.downcast_variant(variant_layout);
+    let variant_id = enum_id.enum_variants(db).variants[variant_idx.as_usize()].0;
+
+    for (field_idx, (_, field_ty_binder)) in db.field_types(variant_id.into()).iter().enumerate() {
+        let field_ty = field_ty_binder.get().instantiate(interner, subst).store();
+        if !hir_ty::drop::has_drop_glue_mono(interner, field_ty.as_ref()) {
+            continue;
+        }
+
+        let field_layout = db
+            .layout_of_ty(field_ty.clone(), env.clone())
+            .map_err(|e| format!("layout error: {:?}", e))?;
+        let field_place =
+            variant_place.place_field_with_bcx(bcx, pointer_type, field_idx, field_layout);
+        let field_ptr = field_place.to_ptr().get_addr(bcx, pointer_type);
+        emit_drop_in_place_call(
+            module,
+            bcx,
+            field_drop_sig,
+            db,
+            &field_ty,
+            ext_crate_disambiguators,
+            field_ptr,
+        );
+    }
+
+    Ok(())
+}
+
 /// Generate a `drop_in_place::<T>` glue function for the given type.
 ///
 /// The generated function takes `*mut T` and:
@@ -8464,27 +8698,104 @@ fn compile_drop_in_place(
                                 if hir_ty::drop::has_drop_glue_mono(interner, field_ty) {
                                     let offset = layout.fields.offset(field_idx).bytes() as i64;
                                     let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
-                                    let field_ty_stored = field_ty.store();
-                                    let name = symbol_mangling::mangle_drop_in_place(
+                                    let field_ty = field_ty.store();
+                                    emit_drop_in_place_call(
+                                        module,
+                                        &mut bcx,
+                                        &field_drop_sig,
                                         db,
-                                        field_ty_stored.as_ref(),
+                                        &field_ty,
                                         ext_crate_disambiguators,
+                                        field_ptr,
                                     );
-                                    let callee = module
-                                        .declare_function(&name, Linkage::Import, &field_drop_sig)
-                                        .expect("declare field drop_in_place");
-                                    let callee_ref = module.declare_func_in_func(callee, bcx.func);
-                                    bcx.ins().call(callee_ref, &[field_ptr]);
                                 }
                             }
                         }
                     }
                     hir_def::AdtId::UnionId(_) => {} // union fields not dropped
                     hir_def::AdtId::EnumId(id) => {
-                        // For enums, we need to switch on discriminant and drop
-                        // the appropriate variant's fields.
-                        // TODO: implement enum variant field drops
-                        let _ = id;
+                        let layout = db
+                            .layout_of_ty(ty.clone(), env.clone())
+                            .map_err(|e| format!("layout error: {:?}", e))?;
+
+                        match &layout.variants {
+                            rustc_abi::Variants::Single { index } => {
+                                emit_enum_variant_field_drops(
+                                    module,
+                                    &mut bcx,
+                                    db,
+                                    env,
+                                    interner,
+                                    pointer_type,
+                                    &field_drop_sig,
+                                    &layout,
+                                    id,
+                                    subst,
+                                    self_ptr,
+                                    *index,
+                                    ext_crate_disambiguators,
+                                )?;
+                            }
+                            rustc_abi::Variants::Multiple { tag, .. } => {
+                                let discr_ty = scalar_to_clif_type(dl, tag);
+                                let discr = read_enum_discriminant_from_ptr(
+                                    &mut bcx,
+                                    db,
+                                    dl,
+                                    pointer_type,
+                                    Pointer::new(self_ptr),
+                                    &layout,
+                                    ty,
+                                    discr_ty,
+                                );
+
+                                let done_block = bcx.create_block();
+                                let trap_block = bcx.create_block();
+                                let mut switch = Switch::new();
+                                let mut variant_blocks = Vec::new();
+
+                                for (variant_i, _) in
+                                    id.enum_variants(db).variants.iter().enumerate()
+                                {
+                                    let variant_idx = VariantIdx::from_u32(variant_i as u32);
+                                    let discr_bits = truncate_bits_to_clif_int_ty(
+                                        enum_variant_discriminant_bits(db, ty, variant_idx),
+                                        discr_ty,
+                                    );
+                                    let block = bcx.create_block();
+                                    switch.set_entry(discr_bits, block);
+                                    variant_blocks.push((variant_idx, block));
+                                }
+
+                                switch.emit(&mut bcx, discr, trap_block);
+
+                                for (variant_idx, block) in variant_blocks {
+                                    bcx.switch_to_block(block);
+                                    emit_enum_variant_field_drops(
+                                        module,
+                                        &mut bcx,
+                                        db,
+                                        env,
+                                        interner,
+                                        pointer_type,
+                                        &field_drop_sig,
+                                        &layout,
+                                        id,
+                                        subst,
+                                        self_ptr,
+                                        variant_idx,
+                                        ext_crate_disambiguators,
+                                    )?;
+                                    bcx.ins().jump(done_block, &[]);
+                                }
+
+                                bcx.switch_to_block(trap_block);
+                                bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+
+                                bcx.switch_to_block(done_block);
+                            }
+                            rustc_abi::Variants::Empty => {}
+                        }
                     }
                 }
             }
@@ -8496,17 +8807,16 @@ fn compile_drop_in_place(
                     if hir_ty::drop::has_drop_glue_mono(interner, elem_ty) {
                         let offset = layout.fields.offset(idx).bytes() as i64;
                         let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
-                        let elem_stored = elem_ty.store();
-                        let name = symbol_mangling::mangle_drop_in_place(
+                        let field_ty = elem_ty.store();
+                        emit_drop_in_place_call(
+                            module,
+                            &mut bcx,
+                            &field_drop_sig,
                             db,
-                            elem_stored.as_ref(),
+                            &field_ty,
                             ext_crate_disambiguators,
+                            field_ptr,
                         );
-                        let callee = module
-                            .declare_function(&name, Linkage::Import, &field_drop_sig)
-                            .expect("declare tuple field drop_in_place");
-                        let callee_ref = module.declare_func_in_func(callee, bcx.func);
-                        bcx.ins().call(callee_ref, &[field_ptr]);
                     }
                 }
             }
@@ -8522,17 +8832,16 @@ fn compile_drop_in_place(
                     if hir_ty::drop::has_drop_glue_mono(interner, cap_ty) {
                         let offset = layout.fields.offset(idx).bytes() as i64;
                         let field_ptr = bcx.ins().iadd_imm(self_ptr, offset);
-                        let cap_stored = cap_ty.store();
-                        let name = symbol_mangling::mangle_drop_in_place(
+                        let field_ty = cap_ty.store();
+                        emit_drop_in_place_call(
+                            module,
+                            &mut bcx,
+                            &field_drop_sig,
                             db,
-                            cap_stored.as_ref(),
+                            &field_ty,
                             ext_crate_disambiguators,
+                            field_ptr,
                         );
-                        let callee = module
-                            .declare_function(&name, Linkage::Import, &field_drop_sig)
-                            .expect("declare capture drop_in_place");
-                        let callee_ref = module.declare_func_in_func(callee, bcx.func);
-                        bcx.ins().call(callee_ref, &[field_ptr]);
                     }
                 }
             }
@@ -8796,6 +9105,22 @@ fn collect_drop_info(
         }
         _ => {}
     }
+}
+
+fn collect_overwrite_drop_info(
+    db: &dyn HirDatabase,
+    body: &MirBody,
+    local_crate: base_db::Crate,
+    place: &Place,
+    fn_queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
+) {
+    if !place.projection.lookup(&body.projection_store).is_empty() {
+        return;
+    }
+
+    let ty = place_ty(db, body, place);
+    collect_drop_info(db, local_crate, &ty, fn_queue, drop_types);
 }
 
 fn collect_builtin_derive_trait_call_dependency(
@@ -9171,7 +9496,7 @@ fn scan_body_for_callees(
     for (_, bb) in body.basic_blocks.iter() {
         // Scan statements for coercions and closure constructions
         for stmt in &bb.statements {
-            if let StatementKind::Assign(_, rvalue) = &stmt.kind {
+            if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                 collect_const_rvalue_callables(
                     db,
                     env,
@@ -9181,6 +9506,7 @@ fn scan_body_for_callees(
                     closure_visited,
                     closure_result,
                 );
+                collect_overwrite_drop_info(db, body, local_crate, place, queue, drop_types);
             }
 
             match &stmt.kind {
@@ -9292,7 +9618,17 @@ fn scan_body_for_callees(
                     closure_result,
                 );
             }
-            TerminatorKind::Call { func, args, destination, .. } => {
+            TerminatorKind::Call { func, args, destination, target, .. } => {
+                if target.is_some() {
+                    collect_overwrite_drop_info(
+                        db,
+                        body,
+                        local_crate,
+                        destination,
+                        queue,
+                        drop_types,
+                    );
+                }
                 collect_const_operand_callables(
                     db,
                     env,

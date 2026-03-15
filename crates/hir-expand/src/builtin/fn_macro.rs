@@ -398,12 +398,14 @@ fn cfg_select_expand(
         }
         let expand_to_if_active = match iter.next() {
             Some(tt::TtElement::Subtree(_, tt)) => {
-                let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
+                let mut builder =
+                    tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
                 builder.extend_with_tt(tt.remaining());
                 builder.build()
             }
             Some(tt::TtElement::Leaf(leaf)) => {
-                let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
+                let mut builder =
+                    tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span));
                 builder.push(leaf);
                 builder.build()
             }

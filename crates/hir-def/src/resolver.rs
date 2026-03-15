@@ -467,7 +467,8 @@ impl<'db> Resolver<'db> {
         // expansions. This mirrors rustc behavior for macros that emit
         // unqualified helper names (e.g. `const_eval_select(...)`) that are
         // intended to resolve in the defining module.
-        if n_segments == 1 && path.kind == PathKind::Plain
+        if n_segments == 1
+            && path.kind == PathKind::Plain
             && let Some(res) = resolve_macro_def_site_value_path(db, path, hygiene_id)
         {
             return Some(res);

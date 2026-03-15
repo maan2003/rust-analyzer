@@ -13,8 +13,7 @@ use rustc_abi::{
 };
 use rustc_index::IndexVec;
 use rustc_type_ir::{
-    ConstKind,
-    FloatTy, IntTy, UintTy,
+    ConstKind, FloatTy, IntTy, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
 use triomphe::Arc;
@@ -463,7 +462,8 @@ fn layout_of_pattern_ty<'db>(
             let BackendRepr::Scalar(mut scalar) = layout.backend_repr else {
                 return Err(LayoutError::NotImplemented);
             };
-            let Scalar::Initialized { value: Primitive::Pointer(_), valid_range } = &mut scalar else {
+            let Scalar::Initialized { value: Primitive::Pointer(_), valid_range } = &mut scalar
+            else {
                 return Err(LayoutError::NotImplemented);
             };
             valid_range.start = 1;
@@ -476,10 +476,7 @@ fn layout_of_pattern_ty<'db>(
             };
             let start = const_to_bits(db, start)?;
             let end = const_to_bits(db, end)?;
-            let scalar = Scalar::Initialized {
-                value,
-                valid_range: WrappingRange { start, end },
-            };
+            let scalar = Scalar::Initialized { value, valid_range: WrappingRange { start, end } };
             layout.backend_repr = BackendRepr::Scalar(scalar);
             layout.largest_niche = Niche::from_scalar(dl, rustc_abi::Size::ZERO, scalar);
         }
@@ -491,9 +488,11 @@ fn layout_of_pattern_ty<'db>(
 fn const_to_bits<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Result<u128, LayoutError> {
     match c.kind() {
         ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
-            hir_def::GeneralConstId::ConstId(id) => {
-                const_to_bits(db, db.const_eval(id, unevaluated_const.args, None).map_err(|_| LayoutError::HasErrorConst)?)
-            }
+            hir_def::GeneralConstId::ConstId(id) => const_to_bits(
+                db,
+                db.const_eval(id, unevaluated_const.args, None)
+                    .map_err(|_| LayoutError::HasErrorConst)?,
+            ),
             hir_def::GeneralConstId::StaticId(id) => {
                 const_to_bits(db, db.const_eval_static(id).map_err(|_| LayoutError::HasErrorConst)?)
             }

@@ -40,10 +40,11 @@ use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundVarIndexKind, ConstKind, DebruijnIndex, ExistentialPredicate,
-    ExistentialProjection, ExistentialTraitRef, FnSig, Interner, OutlivesPredicate, TermKind,
-    TyKind::{self}, IntTy, UintTy,
+    ExistentialProjection, ExistentialTraitRef, FnSig, IntTy, Interner, OutlivesPredicate,
+    TermKind,
+    TyKind::{self},
+    TypeFoldable, TypeVisitableExt, UintTy, Upcast, UpcastFrom, elaborate,
     fast_reject::{TreatParams, simplify_type},
-    TypeFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
     inherent::{Clause as _, GenericArgs as _, IntoKind as _, Region as _, Ty as _},
 };
 use smallvec::SmallVec;
@@ -52,11 +53,11 @@ use tracing::debug;
 use triomphe::{Arc, ThinArc};
 
 use crate::{
-    FnAbi, ImplTraitId, TyLoweringDiagnostic, TyLoweringDiagnosticKind,
+    FnAbi, ImplTraitId, MemoryMap, ParamEnvAndCrate, TyLoweringDiagnostic,
+    TyLoweringDiagnosticKind,
     consteval::intern_const_ref,
     db::{HirDatabase, InternedOpaqueTyId},
     generics::{Generics, generics},
-    MemoryMap, ParamEnvAndCrate,
     next_solver::{
         AliasTy, Binder, BoundExistentialPredicates, Clause, ClauseKind, Clauses, Const,
         ConstBytes, DbInterner, EarlyBinder, EarlyParamRegion, ErrorGuaranteed, FxIndexMap,
@@ -325,10 +326,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             hir_def::hir::Expr::BinaryOp { .. } | hir_def::hir::Expr::Call { .. }
                 if matches!(const_type.kind(), TyKind::Uint(UintTy::Usize)) =>
             {
-                self.try_eval_const_usize_expr(const_expr_id)
-                    .map_or_else(|| unknown_const(const_type), |value| {
+                self.try_eval_const_usize_expr(const_expr_id).map_or_else(
+                    || unknown_const(const_type),
+                    |value| {
                         crate::consteval::usize_const(self.db, Some(value), self.resolver.krate())
-                    })
+                    },
+                )
             }
             _ => unknown_const(const_type),
         }
@@ -403,19 +406,18 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             return None;
         }
 
-        let type_arg_ref = path
-            .segments()
-            .last()
-            .and_then(|segment| segment.args_and_bindings)
-            .and_then(|generic_args| {
-                if generic_args.args.len() != 1 {
-                    return None;
-                }
-                match generic_args.args[0] {
-                    hir_def::expr_store::path::GenericArg::Type(ty) => Some(ty),
-                    _ => None,
-                }
-            })?;
+        let type_arg_ref =
+            path.segments().last().and_then(|segment| segment.args_and_bindings).and_then(
+                |generic_args| {
+                    if generic_args.args.len() != 1 {
+                        return None;
+                    }
+                    match generic_args.args[0] {
+                        hir_def::expr_store::path::GenericArg::Type(ty) => Some(ty),
+                        _ => None,
+                    }
+                },
+            )?;
 
         let ty = self.lower_ty(type_arg_ref);
         let env = ParamEnvAndCrate {
@@ -719,11 +721,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         (ty, res)
     }
 
-    fn lower_pattern_ref(
-        &mut self,
-        pat: &HirPatternRef,
-        base_ty: Ty<'db>,
-    ) -> Option<Pattern<'db>> {
+    fn lower_pattern_ref(&mut self, pat: &HirPatternRef, base_ty: Ty<'db>) -> Option<Pattern<'db>> {
         Some(match pat {
             HirPatternRef::Const(c) => {
                 let c = self.lower_const(*c, base_ty);
@@ -733,7 +731,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             HirPatternRef::Or(pats) => {
                 let pats = PatList::new_from_iter(
                     self.interner,
-                    pats.iter().map(|it| self.lower_pattern_ref(it, base_ty)).collect::<Option<Vec<_>>>()?,
+                    pats.iter()
+                        .map(|it| self.lower_pattern_ref(it, base_ty))
+                        .collect::<Option<Vec<_>>>()?,
                 );
                 Pattern::new(self.interner, PatternKind::Or(pats))
             }
@@ -794,9 +794,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) | TyKind::Char => 4,
             TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => 8,
             TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => 16,
-            TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => {
-                std::mem::size_of::<usize>()
-            }
+            TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => std::mem::size_of::<usize>(),
             _ => return None,
         })
     }
@@ -815,14 +813,15 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     fn const_to_bits(&self, c: Const<'db>) -> Option<u128> {
         match c.kind() {
-            rustc_type_ir::ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
-                hir_def::GeneralConstId::ConstId(id) => {
-                    self.const_to_bits(self.db.const_eval(id, unevaluated_const.args, None).ok()?)
+            rustc_type_ir::ConstKind::Unevaluated(unevaluated_const) => {
+                match unevaluated_const.def.0 {
+                    hir_def::GeneralConstId::ConstId(id) => self
+                        .const_to_bits(self.db.const_eval(id, unevaluated_const.args, None).ok()?),
+                    hir_def::GeneralConstId::StaticId(id) => {
+                        self.const_to_bits(self.db.const_eval_static(id).ok()?)
+                    }
                 }
-                hir_def::GeneralConstId::StaticId(id) => {
-                    self.const_to_bits(self.db.const_eval_static(id).ok()?)
-                }
-            },
+            }
             rustc_type_ir::ConstKind::Value(val) => {
                 Some(u128::from_le_bytes(crate::mir::pad16(&val.value.inner().memory, false)))
             }

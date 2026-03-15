@@ -54,9 +54,9 @@ use crate::{
     lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
     type_ref::{
-        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId,
-        PatternRef, PatternTypeRef, RangePatternRef, Rawness, RefType, TraitBoundModifier,
-        TraitRef, TypeBound, TypeRef, TypeRefId, UseArgRef,
+        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, PatternRef,
+        PatternTypeRef, RangePatternRef, Rawness, RefType, TraitBoundModifier, TraitRef, TypeBound,
+        TypeRef, TypeRefId, UseArgRef,
     },
 };
 
@@ -740,7 +740,8 @@ impl<'db> ExprCollector<'db> {
                     .into_boxed_slice(),
             ),
             ast::PatternTypePat::PatternTypeRangePat(it) => {
-                let mut exprs = it.syntax().children().filter_map(ast::Expr::cast).collect::<Vec<_>>();
+                let mut exprs =
+                    it.syntax().children().filter_map(ast::Expr::cast).collect::<Vec<_>>();
                 let starts_with_range = it.syntax().first_token().is_some_and(|it| {
                     matches!(it.kind(), syntax::SyntaxKind::DOT2 | syntax::SyntaxKind::DOT2EQ)
                 });
@@ -753,9 +754,10 @@ impl<'db> ExprCollector<'db> {
                 PatternRef::Range(RangePatternRef {
                     start: start.map(|it| ConstRef { expr: self.collect_expr(it) }),
                     end: end.map(|it| ConstRef { expr: self.collect_expr(it) }),
-                    end_inclusive: it.syntax().children_with_tokens().any(|it| {
-                        matches!(it.kind(), syntax::SyntaxKind::DOT2EQ)
-                    }),
+                    end_inclusive: it
+                        .syntax()
+                        .children_with_tokens()
+                        .any(|it| matches!(it.kind(), syntax::SyntaxKind::DOT2EQ)),
                 })
             }
         })
@@ -2138,7 +2140,9 @@ impl<'db> ExprCollector<'db> {
                             return None;
                         }
                         match expr {
-                            ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(statements, mac),
+                            ast::Expr::MacroExpr(mac) => {
+                                this.collect_macro_as_stmt(statements, mac)
+                            }
                             expr => Some(this.collect_expr(expr)),
                         }
                     })

@@ -187,7 +187,9 @@ impl<'db> Filler<'db> {
                         Rvalue::UnaryOp(_, op) => {
                             self.fill_operand(op)?;
                         }
-                        Rvalue::Ref(_, _) | Rvalue::AddressOf(_, _) | Rvalue::Len(_)
+                        Rvalue::Ref(_, _)
+                        | Rvalue::AddressOf(_, _)
+                        | Rvalue::Len(_)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
                         Rvalue::ThreadLocalRef(_) => (),

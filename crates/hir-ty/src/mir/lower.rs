@@ -1815,7 +1815,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.push_assignment(
             current,
             tuple_place,
-            Rvalue::Aggregate(AggregateKind::Tuple(tuple_ty_stored), tuple_fields.into_boxed_slice()),
+            Rvalue::Aggregate(
+                AggregateKind::Tuple(tuple_ty_stored),
+                tuple_fields.into_boxed_slice(),
+            ),
             span,
         );
         args.push(Operand { kind: OperandKind::Move(tuple_place), span: Some(span) });

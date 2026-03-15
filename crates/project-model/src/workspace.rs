@@ -545,7 +545,9 @@ impl ProjectWorkspace {
             (Some(RustLibSource::Discover), Some(sysroot_src)) => {
                 Sysroot::discover_with_src_override(dir, &config.extra_env, sysroot_src.clone())
             }
-            (Some(RustLibSource::Path(path)), None) => Sysroot::discover_rust_lib_src_dir(path.clone()),
+            (Some(RustLibSource::Path(path)), None) => {
+                Sysroot::discover_rust_lib_src_dir(path.clone())
+            }
             (Some(RustLibSource::Path(sysroot)), Some(sysroot_src)) => {
                 Sysroot::new(Some(sysroot.clone()), Some(sysroot_src.clone()))
             }
