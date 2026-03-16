@@ -12,6 +12,16 @@ repository = "https://github.com/rust-lang/rust-analyzer"
 
 [profile.dev]
 debug = 1
+opt-level = 3
+# codegen-backend = "cranelift"
+
+[profile.dev.package.cg-clif]
+opt-level = 0
+codegen-backend = "cranelift"
+
+[profile.dev.package."*"]
+opt-level = 3
+codegen-backend = "llvm"
 
 [profile.dev.package]
 # These speed up local tests.
