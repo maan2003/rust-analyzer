@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::ops::Range;
 
 use base_db::Crate;
 use hir_def::{
@@ -17,8 +18,12 @@ use hir_def::{
 };
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::Mutability;
-use hir_ty::next_solver::{Const, GenericArgKind, GenericArgs, IntoKind, Ty, TyKind};
+use hir_ty::next_solver::{
+    Binder, BoundExistentialPredicates, BoundVarKind, Const, ExistentialPredicate, GenericArg,
+    GenericArgKind, GenericArgs, IntoKind, Region, RegionKind, TermKind, Ty, TyKind,
+};
 use hir_ty::primitive::{FloatTy, IntTy, UintTy};
+use rustc_type_ir::BoundVarIndexKind;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -42,6 +47,7 @@ pub fn mangle_function(
         out,
         ext_crate_disambiguators,
         module_paths: HashMap::new(),
+        binders: vec![],
     };
 
     let container = func_id.loc(db).container;
@@ -101,6 +107,7 @@ pub fn mangle_static(
         out,
         ext_crate_disambiguators,
         module_paths: HashMap::new(),
+        binders: vec![],
     };
 
     m.out.push_str("N");
@@ -149,6 +156,7 @@ pub fn mangle_closure(
         out,
         ext_crate_disambiguators,
         module_paths: HashMap::new(),
+        binders: vec![],
     };
     m.out.push('I');
     for arg in generic_args.iter() {
@@ -178,6 +186,7 @@ pub fn mangle_drop_in_place(
         out,
         ext_crate_disambiguators,
         module_paths: HashMap::new(),
+        binders: vec![],
     };
     m.print_type(ty);
     m.out
@@ -200,6 +209,7 @@ pub fn mangle_vtable(
         out,
         ext_crate_disambiguators,
         module_paths: HashMap::new(),
+        binders: vec![],
     };
     m.print_trait_path(trait_id, None);
     m.print_type(concrete_ty);
@@ -218,6 +228,13 @@ struct SymbolMangler<'a> {
     ext_crate_disambiguators: &'a HashMap<String, u64>,
     /// Cache of printed module paths to emit rustc-style `B..._` backrefs.
     module_paths: HashMap<ModuleId, usize>,
+    binders: Vec<BinderLevel>,
+}
+
+struct BinderLevel {
+    /// Flatten bound lifetime vars across nested binders into true de Bruijn
+    /// indices, following rustc's v0 mangler scheme.
+    lifetime_depths: Range<u32>,
 }
 
 impl<'a> SymbolMangler<'a> {
@@ -252,6 +269,96 @@ impl<'a> SymbolMangler<'a> {
         debug_assert!(i >= self.start_offset);
         self.out.push('B');
         self.push_integer_62((i - self.start_offset) as u64);
+    }
+
+    fn wrap_binder<T>(&mut self, value: &Binder<'_, T>, print_value: impl FnOnce(&mut Self, &T))
+    where
+        T: rustc_type_ir::TypeVisitable<hir_ty::next_solver::DbInterner<'a>>,
+    {
+        let mut lifetime_depths =
+            self.binders.last().map(|binder| binder.lifetime_depths.end).map_or(0..0, |i| i..i);
+        let lifetimes = value
+            .bound_vars()
+            .iter()
+            .filter(|var| matches!(var, BoundVarKind::Region(_)))
+            .count() as u32;
+
+        self.push_opt_integer_62("G", lifetimes as u64);
+        lifetime_depths.end += lifetimes;
+        self.binders.push(BinderLevel { lifetime_depths });
+        print_value(self, value.as_ref().skip_binder());
+        self.binders.pop();
+    }
+
+    fn print_region(&mut self, region: Region<'a>) {
+        let idx = match region.kind() {
+            RegionKind::ReErased
+            | RegionKind::ReStatic
+            | RegionKind::ReEarlyParam(_)
+            | RegionKind::ReLateParam(_)
+            | RegionKind::RePlaceholder(_)
+            | RegionKind::ReVar(_)
+            | RegionKind::ReError(_) => 0,
+            RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), bound_region) => {
+                let binder = &self.binders[self.binders.len() - 1 - debruijn.index()];
+                let depth = binder.lifetime_depths.start + bound_region.var.as_u32();
+                1 + (self.binders.last().expect("bound region without binder").lifetime_depths.end
+                    - 1
+                    - depth)
+            }
+            RegionKind::ReBound(BoundVarIndexKind::Canonical, _) => 0,
+        };
+        self.out.push('L');
+        self.push_integer_62(idx as u64);
+    }
+
+    fn region_has_nontrivial_mangling(&self, region: Region<'a>) -> bool {
+        matches!(region.kind(), RegionKind::ReBound(BoundVarIndexKind::Bound(..), _))
+    }
+
+    fn print_generic_arg(&mut self, arg: GenericArg<'a>) {
+        match arg.kind() {
+            GenericArgKind::Lifetime(region) => self.print_region(region),
+            GenericArgKind::Type(ty) => self.print_type(ty),
+            GenericArgKind::Const(konst) => {
+                self.out.push('K');
+                self.print_const(konst);
+            }
+        }
+    }
+
+    fn print_path_with_generic_args(
+        &mut self,
+        print_prefix: impl FnOnce(&mut Self),
+        args: GenericArgs<'a>,
+        skip_self_arg: bool,
+    ) {
+        let print_regions = args.iter().enumerate().any(|(idx, arg)| {
+            (!skip_self_arg || idx != 0)
+                && matches!(arg.kind(), GenericArgKind::Lifetime(region) if self.region_has_nontrivial_mangling(region))
+        });
+        let has_any_args = args.iter().enumerate().any(|(idx, arg)| {
+            (!skip_self_arg || idx != 0)
+                && !matches!(arg.kind(), GenericArgKind::Lifetime(_) if !print_regions)
+        });
+
+        if !has_any_args {
+            print_prefix(self);
+            return;
+        }
+
+        self.out.push('I');
+        print_prefix(self);
+        for (idx, arg) in args.iter().enumerate() {
+            if skip_self_arg && idx == 0 {
+                continue;
+            }
+            if matches!(arg.kind(), GenericArgKind::Lifetime(_)) && !print_regions {
+                continue;
+            }
+            self.print_generic_arg(arg);
+        }
+        self.out.push('E');
     }
 
     fn function_disambiguator(
@@ -418,7 +525,20 @@ impl<'a> SymbolMangler<'a> {
         }
     }
 
-    fn print_trait_path(&mut self, trait_id: TraitId, args: Option<GenericArgs<'_>>) {
+    fn print_trait_path(&mut self, trait_id: TraitId, args: Option<GenericArgs<'a>>) {
+        self.print_trait_path_with_args(trait_id, args, true);
+    }
+
+    fn print_existential_trait_path(&mut self, trait_id: TraitId, args: GenericArgs<'a>) {
+        self.print_trait_path_with_args(trait_id, Some(args), false);
+    }
+
+    fn print_trait_path_with_args(
+        &mut self,
+        trait_id: TraitId,
+        args: Option<GenericArgs<'a>>,
+        skip_self_arg: bool,
+    ) {
         let print_simple = |this: &mut Self| {
             let module = trait_id.module(this.db);
             let name = this.db.trait_signature(trait_id).name.as_str().to_owned();
@@ -433,36 +553,49 @@ impl<'a> SymbolMangler<'a> {
             print_simple(self);
             return;
         };
+        self.print_path_with_generic_args(print_simple, args, skip_self_arg);
+    }
 
-        // TraitRef args are `[Self, ..trait params]`; mangle only real params.
-        let has_non_lifetime_args = args
-            .iter()
-            .enumerate()
-            .any(|(idx, arg)| idx != 0 && !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
-
-        if !has_non_lifetime_args {
-            print_simple(self);
+    fn print_dyn_existential(&mut self, predicates: BoundExistentialPredicates<'a>) {
+        let Some(first) = predicates.iter().next() else {
+            self.out.push('E');
             return;
-        }
-
-        self.out.push('I');
-        print_simple(self);
-        for (idx, arg) in args.iter().enumerate() {
-            if idx == 0 {
-                continue;
+        };
+        self.wrap_binder(&first, |this, _| {
+            for predicate in predicates.iter() {
+                match predicate.skip_binder() {
+                    ExistentialPredicate::Trait(trait_ref) => {
+                        this.print_existential_trait_path(trait_ref.def_id.0, trait_ref.args);
+                    }
+                    ExistentialPredicate::Projection(projection) => {
+                        this.out.push('p');
+                        let assoc_name = this
+                            .db
+                            .type_alias_signature(projection.def_id.expect_type_alias())
+                            .name
+                            .as_str()
+                            .to_owned();
+                        this.push_ident(&assoc_name);
+                        match projection.term.kind() {
+                            TermKind::Ty(ty) => this.print_type(ty),
+                            TermKind::Const(konst) => {
+                                this.out.push('K');
+                                this.print_const(konst);
+                            }
+                        }
+                    }
+                    ExistentialPredicate::AutoTrait(trait_id) => {
+                        this.print_trait_path(trait_id.0, None);
+                    }
+                }
             }
-            match arg.kind() {
-                GenericArgKind::Type(ty) => self.print_type(ty),
-                GenericArgKind::Const(konst) => self.print_const(konst),
-                GenericArgKind::Lifetime(_) => {}
-            }
-        }
+        });
         self.out.push('E');
     }
 
     // -- Type encoding ------------------------------------------------------
 
-    fn print_type(&mut self, ty: Ty<'_>) {
+    fn print_type(&mut self, ty: Ty<'a>) {
         let basic = match ty.kind() {
             TyKind::Bool => "b",
             TyKind::Char => "c",
@@ -493,12 +626,14 @@ impl<'a> SymbolMangler<'a> {
         }
 
         match ty.kind() {
-            TyKind::Ref(_, inner_ty, mutbl) => {
+            TyKind::Ref(region, inner_ty, mutbl) => {
                 self.out.push_str(match mutbl {
                     Mutability::Not => "R",
                     Mutability::Mut => "Q",
                 });
-                // Lifetimes erased — don't emit region.
+                if self.region_has_nontrivial_mangling(region) {
+                    self.print_region(region);
+                }
                 self.print_type(inner_ty);
             }
             TyKind::RawPtr(inner_ty, mutbl) => {
@@ -516,6 +651,11 @@ impl<'a> SymbolMangler<'a> {
                 self.out.push('A');
                 self.print_type(inner_ty);
                 self.print_const(len);
+            }
+            TyKind::Dynamic(predicates, region) => {
+                self.out.push('D');
+                self.print_dyn_existential(predicates);
+                self.print_region(region);
             }
             TyKind::Tuple(tys) => {
                 self.out.push('T');
@@ -542,14 +682,14 @@ impl<'a> SymbolMangler<'a> {
         }
     }
 
-    fn print_const(&mut self, konst: Const<'_>) {
+    fn print_const(&mut self, konst: Const<'a>) {
         // Minimal const encoding for symbol uniqueness between distinct const
         // generic instantiations.
         self.out.push('p');
         self.push_integer_62(stable_hash_bytes(format!("{konst:?}").as_bytes()));
     }
 
-    fn print_adt_path(&mut self, adt_id: AdtId, substs: GenericArgs<'_>) {
+    fn print_adt_path(&mut self, adt_id: AdtId, substs: GenericArgs<'a>) {
         let name = match adt_id {
             AdtId::StructId(id) => self.db.struct_signature(id).name.as_str().to_owned(),
             AdtId::EnumId(id) => self.db.enum_signature(id).name.as_str().to_owned(),
@@ -561,31 +701,17 @@ impl<'a> SymbolMangler<'a> {
             AdtId::UnionId(id) => id.module(self.db),
         };
 
-        let has_non_lifetime_args =
-            substs.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
-
-        if !has_non_lifetime_args {
-            self.out.push('N');
-            self.out.push('t'); // TypeNs
-            self.print_module_path(module);
-            self.push_disambiguator(0);
-            self.push_ident(&name);
-        } else {
-            self.out.push('I');
-            self.out.push('N');
-            self.out.push('t'); // TypeNs
-            self.print_module_path(module);
-            self.push_disambiguator(0);
-            self.push_ident(&name);
-            for arg in substs.iter() {
-                match arg.kind() {
-                    GenericArgKind::Type(ty) => self.print_type(ty),
-                    GenericArgKind::Const(konst) => self.print_const(konst),
-                    GenericArgKind::Lifetime(_) => {}
-                }
-            }
-            self.out.push('E');
-        }
+        self.print_path_with_generic_args(
+            |this| {
+                this.out.push('N');
+                this.out.push('t'); // TypeNs
+                this.print_module_path(module);
+                this.push_disambiguator(0);
+                this.push_ident(&name);
+            },
+            substs,
+            false,
+        );
     }
 }
 

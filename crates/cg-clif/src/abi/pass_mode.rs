@@ -199,7 +199,8 @@ pub(crate) fn to_casted_value(
     arg: CValue,
     cast: &CastTarget,
 ) -> Vec<Value> {
-    let ptr = arg.force_stack(fx);
+    let (ptr, meta) = arg.force_stack(fx);
+    assert!(meta.is_none(), "casted value lowering does not support unsized operands");
     cast_target_to_abi_params(cast)
         .into_iter()
         .map(|(offset, param)| {
@@ -264,7 +265,9 @@ pub(crate) fn adjust_arg_for_abi(
             let arg = if matches!(arg.layout.backend_repr, BackendRepr::Scalar(_)) {
                 arg
             } else {
-                CValue::by_ref(arg.force_stack(fx), abi_layout)
+                let (ptr, meta) = arg.force_stack(fx);
+                assert!(meta.is_none(), "Direct ABI lowering does not support unsized operands");
+                CValue::by_ref(ptr, abi_layout)
             };
             vec![arg.load_scalar(fx)]
         }
@@ -273,7 +276,9 @@ pub(crate) fn adjust_arg_for_abi(
             let arg = if matches!(arg.layout.backend_repr, BackendRepr::ScalarPair(_, _)) {
                 arg
             } else {
-                CValue::by_ref(arg.force_stack(fx), abi_layout)
+                let (ptr, meta) = arg.force_stack(fx);
+                assert!(meta.is_none(), "Pair ABI lowering does not support unsized operands");
+                CValue::by_ref(ptr, abi_layout)
             };
             let (a, b) = arg.load_scalar_pair(fx);
             vec![a, b]
@@ -287,7 +292,9 @@ pub(crate) fn adjust_arg_for_abi(
         }
         PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
             if is_owned {
-                vec![arg.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type)]
+                let (ptr, meta) = arg.force_stack(fx);
+                assert!(meta.is_none(), "Indirect ABI lowering does not support unsized operands");
+                vec![ptr.get_addr(&mut fx.bcx, fx.pointer_type)]
             } else {
                 let layout = arg_abi.layout.as_ref().expect("Indirect ABI without layout").clone();
                 let tmp = CPlace::new_stack_slot(fx, layout);

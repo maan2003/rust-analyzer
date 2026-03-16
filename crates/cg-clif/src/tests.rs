@@ -298,6 +298,27 @@ fn find_const(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::Con
     panic!("const `{name}` not found")
 }
 
+fn find_static(db: &TestDB, file_id: EditionedFileId, name: &str) -> hir_def::StaticId {
+    let module_id = module_for_file(db, file_id.file_id(db));
+    let def_map = module_id.def_map(db);
+    let scope = &def_map[module_id].scope;
+
+    if let Some(static_id) = scope.declarations().find_map(|x| match x {
+        hir_def::ModuleDefId::StaticId(x) => {
+            if db.static_signature(x).name.display(db, Edition::CURRENT).to_string() == name {
+                Some(x)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }) {
+        return static_id;
+    }
+
+    panic!("static `{name}` not found")
+}
+
 fn get_mir_and_env(
     db: &TestDB,
     func_id: hir_def::FunctionId,
@@ -1105,6 +1126,20 @@ fn mangle_fn(src: &str, name: &str) -> String {
     })
 }
 
+fn mangle_drop_name_for_first_param(src: &str, name: &str) -> String {
+    let full_src = format!("//- /main.rs\n{src}");
+    let (db, file_ids) = TestDB::with_many_files(&full_src);
+    attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let func_id = find_fn(&db, file_id, name);
+        let fn_sig = db.callable_item_signature(func_id.into()).skip_binder().skip_binder();
+        let param_ty = *fn_sig.inputs_and_output.inputs().first().expect("expected parameter");
+        let empty_map = std::collections::HashMap::new();
+        let param_ty = crate::erase_regions_for_codegen(&db, param_ty);
+        symbol_mangling::mangle_drop_in_place(&db, param_ty, &empty_map)
+    })
+}
+
 #[test]
 fn mangle_crate_root_fn() {
     let mangled = mangle_fn("fn main() {}", "main");
@@ -1132,6 +1167,52 @@ fn mangle_different_functions_differ() {
     let mangled_a = mangle_fn("fn alpha() {}\nfn beta() {}", "alpha");
     let mangled_b = mangle_fn("fn alpha() {}\nfn beta() {}", "beta");
     assert_ne!(mangled_a, mangled_b, "different functions should have different mangled names");
+}
+
+#[test]
+fn mangle_dyn_auto_trait_order_is_canonical() {
+    let src = r#"
+trait Foo {}
+impl Foo for i32 {}
+
+fn a(_: Box<dyn Foo + Send + Sync>) {}
+fn b(_: Box<dyn Foo + Sync + Send>) {}
+"#;
+    let mangled_a = mangle_drop_name_for_first_param(src, "a");
+    let mangled_b = mangle_drop_name_for_first_param(src, "b");
+    assert_eq!(mangled_a, mangled_b);
+}
+
+#[test]
+fn mangle_dyn_projection_bound_drop_ty_smoke() {
+    let mangled = mangle_drop_name_for_first_param(
+        r#"
+fn foo(_: Box<dyn Iterator<Item = i32>>) {}
+"#,
+        "foo",
+    );
+    assert!(mangled.starts_with("_Rdrop_"), "unexpected drop mangling: {mangled}");
+}
+
+#[test]
+fn std_jit_local_unsafe_cell_static_is_writable() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::cell::UnsafeCell;
+
+struct Wrap(UnsafeCell<usize>);
+static WRAP: Wrap = Wrap(UnsafeCell::new(5));
+
+fn foo() -> i32 {
+    unsafe {
+        *WRAP.0.get() = 9;
+        (*WRAP.0.get() == 9) as i32
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
 }
 
 #[test]
@@ -1821,6 +1902,21 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 generic_args.as_ref(),
                 &empty_map,
             );
+            if crate::is_abort_only_catch_unwind_catch_fn(&db, *func_id) {
+                crate::compile_abort_only_catch_unwind_catch_fn(
+                    &mut jit_module,
+                    &*isa,
+                    &db,
+                    &dl,
+                    &env,
+                    *func_id,
+                    generic_args.as_ref(),
+                    &fn_name,
+                    cranelift_module::Linkage::Export,
+                )
+                .unwrap_or_else(|e| panic!("compiling fn failed: {e}"));
+                continue;
+            }
             let body = db
                 .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
                 .unwrap_or_else(|e| panic!("MIR error for {fn_name}: {:?}", e));
@@ -1877,8 +1973,12 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
 
         // Compile drop_in_place glue functions
         for ty in &drop_types {
-            let drop_name =
-                crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &empty_map);
+            let canonical_ty = crate::canonicalize_drop_ty_for_codegen(&db, ty);
+            let drop_name = crate::symbol_mangling::mangle_drop_in_place(
+                &db,
+                canonical_ty.as_ref(),
+                &empty_map,
+            );
             if !compiled_drop_symbols.insert(drop_name) {
                 continue;
             }
@@ -1888,7 +1988,7 @@ fn jit_run_reachable<R: Copy>(src: &str, entry: &str) -> R {
                 &db,
                 &dl,
                 &env,
-                ty,
+                &canonical_ty,
                 local_crate,
                 &empty_map,
             )
@@ -2212,28 +2312,43 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 continue;
             }
 
-            let body = db
-                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "MIR error for required compiled fn {fn_name} \
-                         (cross_crate={is_cross_crate}, generic={is_generic_instance}, \
-                         exported_in_libstd={exported_in_libstd}): {e:?}"
-                    )
-                });
-            let compiled_id = crate::compile_fn(
-                &mut jit_module,
-                &*isa,
-                &db,
-                &dl,
-                &env,
-                &body,
-                &fn_name,
-                cranelift_module::Linkage::Export,
-                local_crate,
-                &disambiguators,
-            )
-            .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"));
+            let compiled_id = if crate::is_abort_only_catch_unwind_catch_fn(&db, *func_id) {
+                crate::compile_abort_only_catch_unwind_catch_fn(
+                    &mut jit_module,
+                    &*isa,
+                    &db,
+                    &dl,
+                    &env,
+                    *func_id,
+                    generic_args.as_ref(),
+                    &fn_name,
+                    cranelift_module::Linkage::Export,
+                )
+                .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"))
+            } else {
+                let body = db
+                    .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "MIR error for required compiled fn {fn_name} \
+                             (cross_crate={is_cross_crate}, generic={is_generic_instance}, \
+                             exported_in_libstd={exported_in_libstd}): {e:?}"
+                        )
+                    });
+                crate::compile_fn(
+                    &mut jit_module,
+                    &*isa,
+                    &db,
+                    &dl,
+                    &env,
+                    &body,
+                    &fn_name,
+                    cranelift_module::Linkage::Export,
+                    local_crate,
+                    &disambiguators,
+                )
+                .unwrap_or_else(|e| panic!("compiling fn {fn_name} failed: {e}"))
+            };
             if trace_enabled {
                 finalized_symbol_ids.push((fn_name, compiled_id));
             }
@@ -2288,8 +2403,12 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
         }
 
         for ty in &drop_types {
-            let drop_name =
-                crate::symbol_mangling::mangle_drop_in_place(&db, ty.as_ref(), &disambiguators);
+            let canonical_ty = crate::canonicalize_drop_ty_for_codegen(&db, ty);
+            let drop_name = crate::symbol_mangling::mangle_drop_in_place(
+                &db,
+                canonical_ty.as_ref(),
+                &disambiguators,
+            );
             if !compiled_drop_symbols.insert(drop_name.clone()) {
                 if trace_enabled {
                     eprintln!("std-jit: skipping duplicate drop glue definition for {drop_name}");
@@ -2302,7 +2421,7 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
                 &db,
                 &dl,
                 &env,
-                ty,
+                &canonical_ty,
                 local_crate,
                 &disambiguators,
             )
@@ -3473,7 +3592,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: GenericArgNotProvided while collecting std::thread::spawn drop glue"]
 fn std_jit_thread_spawn_join_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3571,6 +3689,81 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_immutable_atomic_static_is_writable() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static COUNTER: AtomicUsize = AtomicUsize::new(5);
+
+fn foo() -> i32 {
+    COUNTER.store(9, Ordering::Relaxed);
+    (COUNTER.load(Ordering::Relaxed) == 9) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn freeze_atomic_is_not_freeze() {
+    let (db, file_id, krate) = load_sysroot_and_user_code(
+        r#"
+use std::sync::atomic::AtomicUsize;
+
+static COUNTER: AtomicUsize = AtomicUsize::new(5);
+"#,
+    );
+    let static_id = find_static(&db, file_id, "COUNTER");
+    let interner = DbInterner::new_with(&db, krate);
+    attach_db(&db, || {
+        assert!(!hir_ty::freeze::is_freeze_mono(interner, crate::static_pointee_ty(&db, static_id)));
+    });
+}
+
+#[test]
+fn freeze_phantom_data_ignores_inner_unsafe_cell() {
+    let (db, file_id, krate) = load_sysroot_and_user_code(
+        r#"
+use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+
+static MARKER: PhantomData<UnsafeCell<u8>> = PhantomData;
+"#,
+    );
+    let static_id = find_static(&db, file_id, "MARKER");
+    let interner = DbInterner::new_with(&db, krate);
+    attach_db(&db, || {
+        assert!(hir_ty::freeze::is_freeze_mono(interner, crate::static_pointee_ty(&db, static_id)));
+    });
+}
+
+#[test]
+fn std_jit_mem_forget_suppresses_drop() {
+    let result: i32 = jit_run_with_std(
+        r#"
+struct Bomb(*mut i32);
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        unsafe { *self.0 = 1; }
+    }
+}
+
+fn foo() -> i32 {
+    let mut dropped = 0;
+    let bomb = Bomb(&mut dropped as *mut i32);
+    std::mem::forget(bomb);
+    dropped
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 0);
 }
 
 #[test]

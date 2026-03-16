@@ -48,14 +48,18 @@ pub(crate) struct CValue {
 
 #[derive(Clone, Copy)]
 enum CValueInner {
-    ByRef(Pointer),
+    ByRef(Pointer, Option<Value>),
     ByVal(Value),
     ByValPair(Value, Value),
 }
 
 impl CValue {
     pub(crate) fn by_ref(ptr: Pointer, layout: Arc<Layout>) -> Self {
-        CValue { inner: CValueInner::ByRef(ptr), layout }
+        CValue { inner: CValueInner::ByRef(ptr, None), layout }
+    }
+
+    pub(crate) fn by_ref_unsized(ptr: Pointer, extra: Value, layout: Arc<Layout>) -> Self {
+        CValue { inner: CValueInner::ByRef(ptr, Some(extra)), layout }
     }
 
     pub(crate) fn by_val(value: Value, layout: Arc<Layout>) -> Self {
@@ -80,11 +84,14 @@ impl CValue {
     pub(crate) fn load_scalar(&self, fx: &mut FunctionCx<'_, impl Module>) -> Value {
         match self.inner {
             CValueInner::ByVal(val) => val,
-            CValueInner::ByRef(ptr) => {
+            CValueInner::ByRef(ptr, None) => {
                 let clif_ty = backend_repr_to_clif_type(fx.dl, &self.layout.backend_repr);
                 let mut flags = MemFlags::new();
                 flags.set_notrap();
                 ptr.load(&mut fx.bcx, clif_ty, flags)
+            }
+            CValueInner::ByRef(_, Some(_)) => {
+                panic!("load_scalar on unsized ByRef; use pointer metadata-aware lowering")
             }
             CValueInner::ByValPair(_, _) => {
                 panic!("load_scalar on ByValPair; use load_scalar_pair instead")
@@ -96,7 +103,7 @@ impl CValue {
     pub(crate) fn load_scalar_pair(&self, fx: &mut FunctionCx<'_, impl Module>) -> (Value, Value) {
         match self.inner {
             CValueInner::ByValPair(a, b) => (a, b),
-            CValueInner::ByRef(ptr) => {
+            CValueInner::ByRef(ptr, None) => {
                 let BackendRepr::ScalarPair(a_scalar, b_scalar) = self.layout.backend_repr else {
                     panic!(
                         "load_scalar_pair on non-ScalarPair layout: {:?}",
@@ -116,6 +123,9 @@ impl CValue {
                 );
                 (a_val, b_val)
             }
+            CValueInner::ByRef(_, Some(_)) => {
+                panic!("load_scalar_pair on unsized ByRef; use pointer metadata-aware lowering")
+            }
             CValueInner::ByVal(_) => {
                 panic!("load_scalar_pair on ByVal; use load_scalar instead")
             }
@@ -123,13 +133,13 @@ impl CValue {
     }
 
     /// Force the value into memory and return the pointer.
-    pub(crate) fn force_stack(self, fx: &mut FunctionCx<'_, impl Module>) -> Pointer {
+    pub(crate) fn force_stack(self, fx: &mut FunctionCx<'_, impl Module>) -> (Pointer, Option<Value>) {
         match self.inner {
-            CValueInner::ByRef(ptr) => ptr,
+            CValueInner::ByRef(ptr, extra) => (ptr, extra),
             CValueInner::ByVal(_) | CValueInner::ByValPair(_, _) => {
                 let place = CPlace::new_stack_slot(fx, self.layout.clone());
                 place.write_cvalue(fx, self);
-                place.to_ptr()
+                (place.to_ptr(), None)
             }
         }
     }
@@ -245,7 +255,7 @@ impl CPlace {
             CPlaceInner::Addr(ptr, _) => ptr,
             CPlaceInner::Var(_) | CPlaceInner::VarPair(_, _) => {
                 let cval = self.to_cvalue(fx);
-                cval.force_stack(fx)
+                cval.force_stack(fx).0
             }
         }
     }
@@ -274,6 +284,8 @@ impl CPlace {
             CPlaceInner::Addr(ptr, _extra) => {
                 if self.layout.is_zst() {
                     CValue::zst(self.layout.clone())
+                } else if let Some(extra) = self.get_extra() {
+                    CValue::by_ref_unsized(ptr, extra, self.layout.clone())
                 } else {
                     CValue::by_ref(ptr, self.layout.clone())
                 }
@@ -303,10 +315,13 @@ impl CPlace {
                     CValueInner::ByValPair(_, _) => {
                         panic!("cannot write ScalarPair register value into scalar Var place")
                     }
-                    CValueInner::ByRef(ptr) => {
+                    CValueInner::ByRef(ptr, None) => {
                         let mut flags = MemFlags::new();
                         flags.set_notrap();
                         ptr.load(&mut fx.bcx, dst_ty, flags)
+                    }
+                    CValueInner::ByRef(_, Some(_)) => {
+                        panic!("cannot write unsized ByRef into scalar Var place")
                     }
                 };
                 fx.bcx.def_var(var, val);
@@ -343,7 +358,7 @@ impl CPlace {
                         }
                         _ => panic!("writing ByValPair to non-scalar memory is unsupported"),
                     },
-                    CValueInner::ByRef(from_ptr) => {
+                    CValueInner::ByRef(from_ptr, None) => {
                         // Delegate to scalar/pair load if possible, else memcpy
                         match self.layout.backend_repr {
                             BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => {
@@ -388,6 +403,9 @@ impl CPlace {
                                 );
                             }
                         }
+                    }
+                    CValueInner::ByRef(_, Some(_)) => {
+                        panic!("writing unsized ByRef values is unsupported")
                     }
                 }
             }
@@ -507,9 +525,12 @@ impl CPlace {
             CPlaceInner::Var(_) | CPlaceInner::VarPair(_, _) => {
                 // Register-stored value: spill to stack so we can take its address.
                 let cval = self.to_cvalue(fx);
-                let ptr = cval.force_stack(fx);
+                let (ptr, extra) = cval.force_stack(fx);
                 let addr = ptr.get_addr(&mut fx.bcx, fx.pointer_type);
-                CValue::by_val(addr, ref_layout)
+                match extra {
+                    Some(extra) => CValue::by_val_pair(addr, extra, ref_layout),
+                    None => CValue::by_val(addr, ref_layout),
+                }
             }
         }
     }

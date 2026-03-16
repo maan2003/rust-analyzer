@@ -30,7 +30,6 @@ use hir_ty::PointerCast;
 use hir_ty::consteval::{try_const_usize, usize_const};
 use hir_ty::db::HirDatabase;
 use hir_ty::display::{DisplayTarget, HirDisplay};
-use hir_ty::method_resolution::TraitImpls;
 use hir_ty::mir::{
     BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind, Place,
     ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp,
@@ -949,6 +948,15 @@ fn codegen_cast(
         let generic_args = erase_regions_for_codegen(fx.db(), generic_args);
         let interner = DbInterner::new_no_crate(fx.db());
         let empty_args = GenericArgs::empty(interner);
+        let is_catch_unwind_intrinsic = FunctionSignature::is_intrinsic(fx.db(), callee_func_id)
+            && fx.db().function_signature(callee_func_id).name.as_str() == "catch_unwind";
+        if is_catch_unwind_intrinsic {
+            let shim_id =
+                declare_abort_only_catch_unwind_intrinsic_shim(fx, callee_func_id, generic_args);
+            let callee_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+            let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, callee_ref);
+            return CValue::by_val(func_addr, result_layout.clone());
+        }
         let (callee_sig, callee_name) = if is_extern {
             let sig =
                 build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
@@ -1020,28 +1028,19 @@ fn codegen_cast(
             );
         }
 
-        let closure_body = fx
-            .db()
-            .monomorphized_mir_body_for_closure(
-                closure_id.0,
-                closure_subst.store(),
-                fx.env().clone(),
-            )
-            .expect("failed to get closure MIR for ClosureFnPointer");
-        let closure_sig =
-            build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure sig");
-        let closure_name = symbol_mangling::mangle_closure(
-            fx.db(),
+        let fn_ptr_ty = closure_subst.split_closure_args().closure_sig_as_fn_ptr_ty;
+        let fn_ptr_sig =
+            build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)
+                .expect("closure fn ptr sig");
+        let shim_id = declare_non_capturing_closure_fn_ptr_shim(
+            fx,
             closure_id.0,
             closure_subst,
-            fx.ext_crate_disambiguators(),
+            &closure_layout,
+            &fn_ptr_sig,
         );
-        let closure_func_id = fx
-            .module
-            .declare_function(&closure_name, Linkage::Import, &closure_sig)
-            .expect("declare closure for ClosureFnPointer");
-        let closure_ref = fx.module.declare_func_in_func(closure_func_id, fx.bcx.func);
-        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, closure_ref);
+        let shim_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+        let func_addr = fx.bcx.ins().func_addr(fx.pointer_type, shim_ref);
         return CValue::by_val(func_addr, result_layout.clone());
     }
 
@@ -1136,7 +1135,8 @@ pub(crate) fn codegen_transmute(
         }
         _ => {
             // Different representations: spill to stack, reload with new layout.
-            let ptr = from.force_stack(fx);
+            let (ptr, meta) = from.force_stack(fx);
+            assert!(meta.is_none(), "bitcast across unsized by-ref values is unsupported");
             CValue::by_ref(ptr, target_layout.clone())
         }
     }
@@ -1644,7 +1644,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     use rustc_abi::Variants;
                     if matches!(&cplace.layout.variants, Variants::Multiple { .. }) {
                         let cval = cplace.to_cvalue(fx);
-                        let ptr = cval.force_stack(fx);
+                        let (ptr, meta) = cval.force_stack(fx);
+                        assert!(meta.is_none(), "downcast spill unexpectedly preserved metadata");
                         cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                     }
                 }
@@ -1706,7 +1707,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 // Arrays in registers → spill to memory
                 if cplace.is_register() {
                     let cval = cplace.to_cvalue(fx);
-                    let ptr = cval.force_stack(fx);
+                    let (ptr, meta) = cval.force_stack(fx);
+                    assert!(meta.is_none(), "index spill unexpectedly preserved metadata");
                     cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                 }
                 let base_ptr = if is_slice { cplace.to_ptr_unsized().0 } else { cplace.to_ptr() };
@@ -1771,7 +1773,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                 };
                 if cplace.is_register() {
                     let cval = cplace.to_cvalue(fx);
-                    let ptr = cval.force_stack(fx);
+                    let (ptr, meta) = cval.force_stack(fx);
+                    assert!(meta.is_none(), "constant-index spill unexpectedly preserved metadata");
                     cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                 }
                 let byte_offset = fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64);
@@ -1791,7 +1794,8 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
 
                     if cplace.is_register() {
                         let cval = cplace.to_cvalue(fx);
-                        let ptr = cval.force_stack(fx);
+                        let (ptr, meta) = cval.force_stack(fx);
+                        assert!(meta.is_none(), "subslice spill unexpectedly preserved metadata");
                         cplace = CPlace::for_ptr(ptr, cplace.layout.clone());
                     }
 
@@ -1855,6 +1859,14 @@ fn type_is_copy_for_codegen(fx: &FunctionCx<'_, impl Module>, ty: &StoredTy) -> 
         return false;
     };
     hir_ty::traits::implements_trait_unique(ty.as_ref(), fx.db(), fx.env().as_ref(), copy_trait)
+}
+
+fn type_is_freeze_for_codegen(
+    db: &dyn HirDatabase,
+    krate: base_db::Crate,
+    ty: &StoredTy,
+) -> bool {
+    hir_ty::freeze::is_freeze_mono(DbInterner::new_with(db, krate), ty.as_ref())
 }
 
 fn place_operand_consumes_ownership(fx: &FunctionCx<'_, impl Module>, place: &Place) -> bool {
@@ -2240,21 +2252,20 @@ fn scalar_pair_tag_lane(a: Scalar, b: Scalar, tag: &Scalar, tag_field: rac_abi::
 }
 
 fn emit_drop_call(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan, ty: &StoredTy, ptr: Value) {
+    let ty = erase_regions_for_codegen(fx.db(), ty.as_ref().clone()).store();
     let mut drop_sig = Signature::new(fx.isa.default_call_conv());
     drop_sig.params.push(AbiParam::new(fx.pointer_type));
 
-    let lang_items = hir_def::lang_item::lang_items(fx.db(), fx.local_crate());
-    let direct_drop = lang_items
-        .Drop
-        .and_then(|drop_trait| resolve_drop_impl(fx.db(), fx.local_crate(), drop_trait, ty));
-    let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), ty);
+    let direct_drop = resolve_drop_impl_method(fx.db(), fx.env(), fx.local_crate(), &ty);
+    let needs_field_drops = type_has_droppable_fields(fx.db(), fx.local_crate(), &ty);
 
-    let fn_name = if let (Some(drop_func_id), false) = (direct_drop, needs_field_drops) {
-        let generic_args = drop_impl_generic_args(fx.db(), fx.local_crate(), ty);
+    let fn_name = if let (Some((drop_func_id, drop_generic_args)), false) =
+        (direct_drop.as_ref(), needs_field_drops)
+    {
         symbol_mangling::mangle_function(
             fx.db(),
-            drop_func_id,
-            generic_args.as_ref(),
+            *drop_func_id,
+            drop_generic_args.as_ref(),
             fx.ext_crate_disambiguators(),
         )
     } else {
@@ -2262,7 +2273,9 @@ fn emit_drop_call(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan, ty: &Stor
     };
     let direct_drop_requires_caller_location = direct_drop
         .filter(|_| !needs_field_drops)
-        .is_some_and(|drop_func_id| abi::function_requires_caller_location(fx.db(), drop_func_id));
+        .is_some_and(|(drop_func_id, _)| {
+            abi::function_requires_caller_location(fx.db(), drop_func_id)
+        });
     if direct_drop_requires_caller_location {
         drop_sig.params.push(AbiParam::new(fx.pointer_type));
     }
@@ -3160,7 +3173,6 @@ fn codegen_unop(
 fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: StaticId) -> CValue {
     let db = fx.db();
     let static_sig = db.static_signature(static_id);
-    let is_mutable = static_sig.flags.contains(StaticFlags::MUTABLE);
     let is_extern = static_sig.flags.contains(StaticFlags::EXTERN);
     let is_local_static = static_id.krate(db) == fx.local_crate();
     let symbol_name = if static_sig.flags.contains(StaticFlags::EXTERN) {
@@ -3168,6 +3180,8 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
     } else {
         symbol_mangling::mangle_static(db, static_id, fx.ext_crate_disambiguators())
     };
+    let is_writable = static_sig.flags.contains(StaticFlags::MUTABLE)
+        || !type_is_freeze_for_codegen(db, static_id.krate(db), &static_pointee_ty(db, static_id).store());
 
     let static_ref_ty = static_operand_ty(db, static_id);
     let layout =
@@ -3176,7 +3190,7 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
     let ptr = if is_extern {
         let data_id = fx
             .module
-            .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
+            .declare_data(&symbol_name, Linkage::Import, is_writable, false)
             .unwrap_or_else(|e| panic!("declare imported static `{symbol_name}` failed: {e}"));
         let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
         fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
@@ -3185,14 +3199,14 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
         if !is_local_static && const_eval_result.is_err() {
             let data_id = fx
                 .module
-                .declare_data(&symbol_name, Linkage::Import, is_mutable, false)
+                .declare_data(&symbol_name, Linkage::Import, is_writable, false)
                 .unwrap_or_else(|e| panic!("declare imported static `{symbol_name}` failed: {e}"));
             let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
             fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
         } else {
             let data_id = fx
                 .module
-                .declare_data(&symbol_name, Linkage::Local, is_mutable, false)
+                .declare_data(&symbol_name, Linkage::Local, is_writable, false)
                 .unwrap_or_else(|e| panic!("declare static `{symbol_name}` failed: {e}"));
 
             match const_eval_result {
@@ -3625,19 +3639,21 @@ fn codegen_const_callable_from_vtable_id(
                 return None;
             };
             let mut callee_args = generic_args;
+            let env = fx.env().clone();
 
             if let ItemContainerId::TraitId(_) = callee_func_id.loc(fx.db()).container {
                 let interner = DbInterner::new_no_crate(fx.db());
                 if hir_ty::method_resolution::is_dyn_method(
                     interner,
-                    fx.env().param_env(),
+                    env.param_env(),
                     callee_func_id,
                     callee_args,
                 )
                 .is_none()
                 {
-                    match fx.db().lookup_impl_method(fx.env().as_ref(), callee_func_id, callee_args)
-                    {
+                    let lookup_result =
+                        fx.db().lookup_impl_method(env.as_ref(), callee_func_id, callee_args);
+                    match lookup_result {
                         (Either::Left(resolved_id), resolved_args) => {
                             callee_func_id = resolved_id;
                             callee_args = resolved_args;
@@ -3654,12 +3670,26 @@ fn codegen_const_callable_from_vtable_id(
             let interner = DbInterner::new_no_crate(fx.db());
             let empty_args = GenericArgs::empty(interner);
 
+            let is_catch_unwind_intrinsic =
+                FunctionSignature::is_intrinsic(fx.db(), callee_func_id)
+                    && fx.db().function_signature(callee_func_id).name.as_str()
+                        == "catch_unwind";
+            if is_catch_unwind_intrinsic {
+                let shim_id = declare_abort_only_catch_unwind_intrinsic_shim(
+                    fx,
+                    callee_func_id,
+                    callee_args,
+                );
+                let callee_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+                return Some(fx.bcx.ins().func_addr(fx.pointer_type, callee_ref));
+            }
+
             let (callee_sig, callee_name) = if is_extern {
                 let sig = build_fn_sig_from_ty(
                     fx.isa,
                     fx.db(),
                     fx.dl,
-                    fx.env(),
+                    &env,
                     callee_func_id,
                     empty_args,
                 )
@@ -3671,7 +3701,7 @@ fn codegen_const_callable_from_vtable_id(
                     fx.isa,
                     fx.db(),
                     fx.dl,
-                    fx.env(),
+                    &env,
                     callee_func_id,
                     callee_args,
                 )
@@ -3712,36 +3742,29 @@ fn codegen_const_callable_from_vtable_id(
         }
         TyKind::Closure(closure_id, closure_subst) => {
             let closure_subst = erase_regions_for_codegen(fx.db(), closure_subst);
-            let (closure_sig, closure_name) = match fx.db().monomorphized_mir_body_for_closure(
+            let interner = DbInterner::new_no_crate(fx.db());
+            let closure_ty =
+                hir_ty::next_solver::Ty::new_closure(interner, closure_id.0.into(), closure_subst);
+            let closure_layout = fx
+                .db()
+                .layout_of_ty(closure_ty.store(), fx.env().clone())
+                .expect("closure layout for const fn ptr");
+            if !closure_layout.is_zst() {
+                return None;
+            }
+
+            let fn_ptr_ty = closure_subst.split_closure_args().closure_sig_as_fn_ptr_ty;
+            let fn_ptr_sig =
+                build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)?;
+            let shim_id = declare_non_capturing_closure_fn_ptr_shim(
+                fx,
                 closure_id.0,
-                closure_subst.store(),
-                fx.env().clone(),
-            ) {
-                Ok(closure_body) => {
-                    let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body)
-                        .expect("closure sig for const fn ptr");
-                    let name = symbol_mangling::mangle_closure(
-                        fx.db(),
-                        closure_id.0,
-                        closure_subst,
-                        fx.ext_crate_disambiguators(),
-                    );
-                    (sig, name)
-                }
-                Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
-                    let fn_ptr_ty = closure_subst.split_closure_args().closure_sig_as_fn_ptr_ty;
-                    let sig =
-                        build_fn_ptr_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), fn_ptr_ty)?;
-                    (sig, name)
-                }
-                Err(_) => return None,
-            };
-            let closure_func_id = fx
-                .module
-                .declare_function(&closure_name, Linkage::Import, &closure_sig)
-                .expect("declare closure for const fn ptr");
-            let closure_ref = fx.module.declare_func_in_func(closure_func_id, fx.bcx.func);
-            Some(fx.bcx.ins().func_addr(fx.pointer_type, closure_ref))
+                closure_subst,
+                &closure_layout,
+                &fn_ptr_sig,
+            );
+            let shim_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+            Some(fx.bcx.ins().func_addr(fx.pointer_type, shim_ref))
         }
         _ => None,
     }
@@ -3826,6 +3849,140 @@ fn call_result_unsize_metadata(
     };
 
     unsize_metadata_for_pointees(fx, src_pointee.store(), dest_pointee.store(), None)
+}
+
+fn declare_non_capturing_closure_fn_ptr_shim(
+    fx: &mut FunctionCx<'_, impl Module>,
+    closure_id: hir_ty::db::InternedClosureId,
+    closure_subst: hir_ty::next_solver::GenericArgs<'_>,
+    closure_layout: &LayoutArc,
+    fn_ptr_sig: &Signature,
+) -> FuncId {
+    let closure_body = match fx.db().monomorphized_mir_body_for_closure(
+        closure_id,
+        closure_subst.store(),
+        fx.env().clone(),
+    ) {
+        Ok(body) => body,
+        Err(hir_ty::mir::MirLowerError::UnresolvedName(name)) => {
+            return fx
+                .module
+                .declare_function(&name, Linkage::Import, fn_ptr_sig)
+                .expect("declare unresolved closure fn ptr target");
+        }
+        Err(err) => panic!("closure MIR for fn ptr shim: {err:?}"),
+    };
+
+    let closure_name = symbol_mangling::mangle_closure(
+        fx.db(),
+        closure_id,
+        closure_subst,
+        fx.ext_crate_disambiguators(),
+    );
+    let shim_name = format!("__closure_fn_ptr_shim_{closure_name}");
+    let shim_id = fx
+        .module
+        .declare_function(&shim_name, Linkage::Local, fn_ptr_sig)
+        .expect("declare closure fn ptr shim");
+    let closure_sig =
+        build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &closure_body).expect("closure body sig");
+
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, shim_id.as_u32()),
+        fn_ptr_sig.clone(),
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let entry_block = bcx.create_block();
+        bcx.switch_to_block(entry_block);
+        bcx.append_block_params_for_function_params(entry_block);
+
+        let callee_id = fx
+            .module
+            .declare_function(&closure_name, Linkage::Import, &closure_sig)
+            .expect("declare closure body for fn ptr shim");
+        let callee_ref = fx.module.declare_func_in_func(callee_id, bcx.func);
+
+        let receiver = Pointer::dangling(closure_layout.align.abi).get_addr(&mut bcx, fx.pointer_type);
+        let mut call_args = vec![receiver];
+        call_args.extend_from_slice(bcx.block_params(entry_block));
+        let call = bcx.ins().call(callee_ref, &call_args);
+        let results = bcx.inst_results(call).to_vec();
+        bcx.ins().return_(&results);
+
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::for_function(func);
+    match fx.module.define_function(shim_id, &mut ctx) {
+        Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
+        Err(e) => panic!("define closure fn ptr shim: {e}"),
+    }
+
+    shim_id
+}
+
+fn declare_abort_only_catch_unwind_intrinsic_shim(
+    fx: &mut FunctionCx<'_, impl Module>,
+    intrinsic_func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
+) -> FuncId {
+    let shim_sig =
+        build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), intrinsic_func_id, generic_args)
+            .expect("catch_unwind shim sig");
+    assert!(
+        shim_sig.params.len() == 3 && shim_sig.returns.len() == 1,
+        "unexpected catch_unwind shim ABI",
+    );
+
+    let intrinsic_name = symbol_mangling::mangle_function(
+        fx.db(),
+        intrinsic_func_id,
+        generic_args,
+        fx.ext_crate_disambiguators(),
+    );
+    let shim_name = format!("__abort_only_intrinsic_shim_{intrinsic_name}");
+    let shim_id = fx
+        .module
+        .declare_function(&shim_name, Linkage::Local, &shim_sig)
+        .expect("declare catch_unwind intrinsic shim");
+
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, shim_id.as_u32()),
+        shim_sig.clone(),
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let entry_block = bcx.create_block();
+        bcx.switch_to_block(entry_block);
+        bcx.append_block_params_for_function_params(entry_block);
+
+        let block_params = bcx.block_params(entry_block);
+        let try_fn = block_params[0];
+        let data = block_params[1];
+
+        let mut try_sig = Signature::new(fx.isa.default_call_conv());
+        try_sig.params.push(AbiParam::new(fx.pointer_type));
+        let try_sig = bcx.import_signature(try_sig);
+        bcx.ins().call_indirect(try_sig, try_fn, &[data]);
+
+        let zero = bcx.ins().iconst(types::I32, 0);
+        bcx.ins().return_(&[zero]);
+
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::for_function(func);
+    match fx.module.define_function(shim_id, &mut ctx) {
+        Ok(()) | Err(ModuleError::DuplicateDefinition(_)) => {}
+        Err(e) => panic!("define catch_unwind intrinsic shim: {e}"),
+    }
+
+    shim_id
 }
 
 /// Prepare a call result `CValue` for the destination place.
@@ -3971,7 +4128,8 @@ fn lower_rust_call_operands_for_abi(
     let mut lowered_args = lower_call_operands_for_abi(fx, leading_args);
     let tuple_arg = codegen_call_argument_operand(fx, tuple_arg);
     let tuple_layout = tuple_arg.cval.layout.clone();
-    let tuple_ptr = tuple_arg.cval.force_stack(fx);
+    let (tuple_ptr, tuple_meta) = tuple_arg.cval.force_stack(fx);
+    assert!(tuple_meta.is_none(), "rust-call tuple arg cannot be unsized");
 
     lowered_args.reserve(tuple_field_tys.len());
     for (field_idx, field_ty) in tuple_field_tys.iter().enumerate() {
@@ -4393,82 +4551,45 @@ fn type_has_droppable_fields(db: &dyn HirDatabase, krate: base_db::Crate, ty: &S
     }
 }
 
-/// Resolve the `Drop::drop` impl method for a given type, if any.
-///
-/// Returns `Some(FunctionId)` for the impl's `drop` method if the type
-/// directly implements the `Drop` trait. Returns `None` if the type does
-/// not have a `Drop` impl.
-fn resolve_drop_impl(
-    db: &dyn HirDatabase,
-    krate: base_db::Crate,
-    drop_trait: TraitId,
-    ty: &StoredTy,
-) -> Option<hir_def::FunctionId> {
+fn drop_trait_method(db: &dyn HirDatabase, drop_trait: TraitId) -> Option<hir_def::FunctionId> {
     use hir_expand::name::Name;
     use intern::sym;
 
-    // Only ADTs can have Drop impls
-    let TyKind::Adt(adt_def, _) = ty.as_ref().kind() else {
+    drop_trait.trait_items(db).items.iter().find_map(|(name, item)| match item {
+        AssocItemId::FunctionId(fid) if *name == Name::new_symbol_root(sym::drop) => {
+            Some(*fid)
+        }
+        _ => None,
+    })
+}
+
+/// Resolve the concrete `Drop::drop` impl method and its full substitutions.
+fn resolve_drop_impl_method(
+    db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
+    krate: base_db::Crate,
+    ty: &StoredTy,
+) -> Option<(hir_def::FunctionId, StoredGenericArgs)> {
+    let TyKind::Adt(_, _) = ty.as_ref().kind() else {
         return None;
     };
 
-    let interner = DbInterner::new_no_crate(db);
+    let drop_trait = hir_def::lang_item::lang_items(db, krate).Drop?;
+    let drop_trait_method = drop_trait_method(db, drop_trait)?;
+    let method_substs = trait_method_substs_for_receiver(db, krate, drop_trait_method, ty);
 
-    // Check if the ADT has a Drop impl
-    use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
-    let simplified = simplify_type(interner, ty.as_ref(), TreatParams::InstantiateWithInfer)?;
-
-    // Search in the krate where the type is defined and our local crate
-    let adt_id = adt_def.inner().id;
-    let type_krate = match adt_id {
-        hir_def::AdtId::StructId(id) => id.krate(db),
-        hir_def::AdtId::EnumId(id) => id.krate(db),
-        hir_def::AdtId::UnionId(id) => id.krate(db),
-    };
-
-    for search_krate in [krate, type_krate] {
-        let trait_impls = TraitImpls::for_crate(db, search_krate);
-        let (impl_ids, _) = trait_impls.for_trait_and_self_ty(drop_trait, &simplified);
-        if let Some(&impl_id) = impl_ids.first() {
-            // Found the Drop impl — look up the `drop` method
-            let impl_items = impl_id.impl_items(db);
-            let drop_method = impl_items.items.iter().find_map(|(name, item)| {
-                if *name == Name::new_symbol_root(sym::drop) {
-                    match item {
-                        AssocItemId::FunctionId(fid) => Some(*fid),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            });
-            if let Some(func_id) = drop_method {
-                return Some(func_id);
-            }
+    match db.lookup_impl_method(env.as_ref(), drop_trait_method, method_substs) {
+        (Either::Left(impl_func_id), impl_args)
+            if matches!(impl_func_id.loc(db).container, ItemContainerId::ImplId(_)) =>
+        {
+            let impl_args = erase_regions_for_codegen(db, impl_args).store();
+            Some((impl_func_id, impl_args))
+        }
+        (Either::Left(_), _) => None,
+        (Either::Right(_), _) => {
+            unreachable!("Drop::drop should not resolve to a builtin derive impl")
         }
     }
-
-    None
-}
-
-/// Build generic args for calling a resolved `Drop::drop` impl method.
-///
-/// `TyKind::Adt` substitutions include regions, but impl-method
-/// monomorphization expects type/const entries only.
-fn drop_impl_generic_args(
-    db: &dyn HirDatabase,
-    local_crate: base_db::Crate,
-    ty: &StoredTy,
-) -> StoredGenericArgs {
-    let interner = DbInterner::new_with(db, local_crate);
-    let generic_args = match ty.as_ref().kind() {
-        TyKind::Adt(_, subst) => {
-            GenericArgs::new_from_iter(interner, subst.iter().filter(|arg| arg.region().is_none()))
-                .store()
-        }
-        _ => GenericArgs::empty(interner).store(),
-    };
-    erase_regions_in_stored_generic_args_for_codegen(db, &generic_args)
 }
 
 fn erase_regions_for_codegen<'db, T>(db: &'db dyn HirDatabase, value: T) -> T
@@ -4486,6 +4607,115 @@ fn erase_regions_in_stored_generic_args_for_codegen(
     generic_args: &StoredGenericArgs,
 ) -> StoredGenericArgs {
     erase_regions_for_codegen(db, generic_args.as_ref()).store()
+}
+
+fn canonicalize_drop_ty_for_codegen(db: &dyn HirDatabase, ty: &StoredTy) -> StoredTy {
+    erase_regions_for_codegen(db, ty.as_ref().clone()).store()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreMemWrapper {
+    Forget,
+    ManuallyDropNew,
+    MaybeDanglingNew,
+}
+
+fn crate_name_for_codegen(db: &dyn HirDatabase, krate: base_db::Crate) -> Option<String> {
+    krate.extra_data(db).display_name.as_ref().map(|name| name.crate_name().as_str().to_owned())
+}
+
+fn adt_name_for_codegen(db: &dyn HirDatabase, adt_id: hir_def::AdtId) -> Option<String> {
+    match adt_id {
+        hir_def::AdtId::StructId(id) => Some(db.struct_signature(id).name.as_str().to_owned()),
+        hir_def::AdtId::EnumId(id) => Some(db.enum_signature(id).name.as_str().to_owned()),
+        hir_def::AdtId::UnionId(id) => Some(db.union_signature(id).name.as_str().to_owned()),
+    }
+}
+
+fn core_mem_wrapper_kind(
+    db: &dyn HirDatabase,
+    func_id: hir_def::FunctionId,
+) -> Option<CoreMemWrapper> {
+    let crate_name = crate_name_for_codegen(db, func_id.krate(db))?;
+    if crate_name != "core" {
+        return None;
+    }
+
+    let fn_name = db.function_signature(func_id).name.as_str().to_owned();
+    if fn_name == "forget" {
+        return Some(CoreMemWrapper::Forget);
+    }
+
+    let ItemContainerId::ImplId(impl_id) = func_id.loc(db).container else {
+        return None;
+    };
+    let self_ty = db.impl_self_ty(impl_id).skip_binder();
+    let TyKind::Adt(adt_def, _) = self_ty.kind() else {
+        return None;
+    };
+    let adt_name = adt_name_for_codegen(db, adt_def.inner().id)?;
+    match (fn_name.as_str(), adt_name.as_str()) {
+        ("new", "ManuallyDrop") => Some(CoreMemWrapper::ManuallyDropNew),
+        ("new", "MaybeDangling") => Some(CoreMemWrapper::MaybeDanglingNew),
+        _ => None,
+    }
+}
+
+fn is_abort_only_catch_unwind_catch_fn(
+    db: &dyn HirDatabase,
+    func_id: hir_def::FunctionId,
+) -> bool {
+    if db.function_signature(func_id).name.as_str() != "do_catch" {
+        return false;
+    }
+
+    let krate = func_id.krate(db);
+    krate
+        .extra_data(db)
+        .display_name
+        .as_ref()
+        .is_some_and(|name| name.crate_name().as_str() == "std")
+}
+
+fn compile_abort_only_catch_unwind_catch_fn(
+    module: &mut impl Module,
+    isa: &dyn TargetIsa,
+    db: &dyn HirDatabase,
+    dl: &TargetDataLayout,
+    env: &StoredParamEnvAndCrate,
+    func_id: hir_def::FunctionId,
+    generic_args: GenericArgs<'_>,
+    fn_name: &str,
+    linkage: Linkage,
+) -> Result<FuncId, String> {
+    let sig = build_fn_sig_from_ty(isa, db, dl, env, func_id, generic_args)?;
+    assert!(
+        !sig.params.iter().any(|param| param.purpose == ArgumentPurpose::StructReturn)
+            && sig.returns.is_empty(),
+        "abort-only catch_unwind stub must be a plain void fn: {fn_name}",
+    );
+
+    let func_id =
+        module.declare_function(fn_name, linkage, &sig).map_err(|e| format!("declare stub: {e}"))?;
+    let mut func = cranelift_codegen::ir::Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+        sig,
+    );
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let entry_block = bcx.create_block();
+        bcx.switch_to_block(entry_block);
+        bcx.append_block_params_for_function_params(entry_block);
+        bcx.ins().return_(&[]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+
+    let mut ctx = Context::new();
+    ctx.func = func;
+    module.define_function(func_id, &mut ctx).map_err(|e| format!("define stub: {e}"))?;
+    Ok(func_id)
 }
 
 fn enqueue_fn_instance(
@@ -4708,6 +4938,7 @@ fn codegen_fn_ptr_call(
 /// MIR body instead of going through trait dispatch.
 fn codegen_closure_call(
     fx: &mut FunctionCx<'_, impl Module>,
+    span: MirSpan,
     closure_id: hir_ty::db::InternedClosureId,
     closure_subst: StoredGenericArgs,
     operand_lowering: CallOperandLowering,
@@ -4739,9 +4970,11 @@ fn codegen_closure_call(
         .declare_function(&closure_name, Linkage::Import, &callee_abi.sig)
         .expect("declare closure");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
+    let receiver_ty = operand_ty(fx.db(), fx.ra_body(), &args[0].kind);
 
-    let raw_lowered_args =
+    let mut raw_lowered_args =
         lower_call_operands_with_lowering(fx, args, &callee_abi.args, operand_lowering);
+    adapt_closure_receiver_to_body_abi(fx, &receiver_ty, &mut raw_lowered_args, &callee_abi.args);
     let lowered_args = select_lowered_call_args_for_abi(&raw_lowered_args, &callee_abi.args);
 
     assert!(!args.is_empty(), "closure call is missing receiver argument");
@@ -4766,6 +4999,9 @@ fn codegen_closure_call(
     };
 
     append_lowered_call_args(fx, &mut call_args, &lowered_args, &callee_abi.args, false);
+    if callee_abi.requires_caller_location {
+        call_args.push(get_caller_location(fx, span));
+    }
 
     // Emit the call
     let call = fx.bcx.ins().call(callee_ref, &call_args);
@@ -4778,6 +5014,40 @@ fn codegen_closure_call(
         destination,
     );
     store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+}
+
+fn adapt_closure_receiver_to_body_abi(
+    fx: &mut FunctionCx<'_, impl Module>,
+    _receiver_ty: &StoredTy,
+    lowered_args: &mut [CallArgument],
+    arg_abis: &[abi::ArgAbi],
+) {
+    let Some(receiver) = lowered_args.first_mut() else { return };
+    let Some(expected_abi) = arg_abis.first() else { return };
+    let Some(expected_layout) = expected_abi.layout.as_ref() else { return };
+
+    let expected_is_ptr = matches!(
+        expected_layout.backend_repr,
+        BackendRepr::Scalar(scalar) if matches!(scalar.primitive(), Primitive::Pointer(_))
+    );
+    let receiver_is_ptr = matches!(
+        receiver.cval.layout.backend_repr,
+        BackendRepr::Scalar(scalar) if matches!(scalar.primitive(), Primitive::Pointer(_))
+    );
+
+    if !expected_is_ptr {
+        return;
+    }
+
+    if receiver_is_ptr {
+        return;
+    }
+
+    let (receiver_ptr, receiver_meta) = receiver.cval.clone().force_stack(fx);
+    assert!(receiver_meta.is_none(), "closure receiver spill cannot carry unsized metadata");
+    let receiver_ptr = receiver_ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+    receiver.cval = CValue::by_val(receiver_ptr, expected_layout.clone());
+    receiver.is_owned = false;
 }
 
 fn method_output_ty(
@@ -5107,7 +5377,9 @@ fn decode_option_ordering_state(
     value: CValue,
 ) -> Value {
     // 0 = None, 1 = Equal, 2 = Less, 3 = Greater
-    let option_place = CPlace::for_ptr(value.force_stack(fx), info.option_layout.clone());
+    let (option_ptr, option_meta) = value.force_stack(fx);
+    assert!(option_meta.is_none(), "Option<Ordering> scratch value cannot be unsized");
+    let option_place = CPlace::for_ptr(option_ptr, info.option_layout.clone());
     let option_discr_layout = enum_discriminant_layout(fx, &info.option_layout);
     let option_discr =
         codegen_get_discriminant(fx, &option_place, &info.option_ty, &option_discr_layout);
@@ -5154,6 +5426,25 @@ fn codegen_direct_call_from_cvalues_into_dest(
     let is_extern =
         matches!(callee_func_id.loc(fx.db()).container, ItemContainerId::ExternBlockId(_));
     let is_cross_crate = callee_func_id.krate(fx.db()) != fx.local_crate();
+
+    let is_catch_unwind_intrinsic = FunctionSignature::is_intrinsic(fx.db(), callee_func_id)
+        && fx.db().function_signature(callee_func_id).name.as_str() == "catch_unwind";
+    if is_catch_unwind_intrinsic {
+        let shim_id =
+            declare_abort_only_catch_unwind_intrinsic_shim(fx, callee_func_id, generic_args);
+        let callee_ref = fx.module.declare_func_in_func(shim_id, fx.bcx.func);
+        let call_args = [
+            args[0].load_scalar(fx),
+            args[1].load_scalar(fx),
+            args[2].load_scalar(fx),
+        ];
+        let call = fx.bcx.ins().call(callee_ref, &call_args);
+        let result = fx.bcx.inst_results(call)[0];
+        if !dest.layout.is_zst() {
+            dest.write_cvalue(fx, CValue::by_val(result, dest.layout.clone()));
+        }
+        return;
+    }
 
     let interner = DbInterner::new_no_crate(fx.db());
     let empty_args = GenericArgs::empty(interner);
@@ -5243,7 +5534,8 @@ fn codegen_direct_call_from_cvalues_into_dest(
                 call_args.push(arg.load_scalar(fx));
             }
             _ => {
-                let ptr = arg.clone().force_stack(fx);
+                let (ptr, meta) = arg.clone().force_stack(fx);
+                assert!(meta.is_none(), "direct-call arg spill does not support unsized values");
                 call_args.push(ptr.get_addr(&mut fx.bcx, fx.pointer_type));
             }
         }
@@ -6392,6 +6684,7 @@ fn codegen_direct_call(
                     TyKind::Closure(closure_id, closure_subst) => {
                         codegen_closure_call(
                             fx,
+                            span,
                             closure_id.0,
                             closure_subst.store(),
                             CallOperandLowering::from_rust_call_abi(trait_method_is_rust_call),
@@ -6541,6 +6834,30 @@ fn codegen_direct_call(
         panic!(
             "attempted to call abstract trait method without lowering rule: callee={callee_func_id:?} generic_args={generic_args:?}"
         );
+    }
+    if let Some(wrapper_kind) = core_mem_wrapper_kind(fx.db(), callee_func_id) {
+        match wrapper_kind {
+            CoreMemWrapper::Forget => {
+                assert_eq!(args.len(), 1, "core::mem::forget expects exactly one argument");
+                let _ = codegen_call_argument_operand(fx, &args[0]);
+            }
+            CoreMemWrapper::ManuallyDropNew | CoreMemWrapper::MaybeDanglingNew => {
+                assert_eq!(args.len(), 1, "{wrapper_kind:?} expects exactly one argument");
+                let arg = codegen_call_argument_operand(fx, &args[0]);
+                let dest = codegen_place(fx, destination);
+                if !dest.layout.is_zst() {
+                    dest.write_cvalue(fx, arg.cval);
+                }
+                if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
+                    fx.set_drop_flag(destination.local);
+                }
+            }
+        }
+        if let Some(target) = target {
+            let block = fx.clif_block(*target);
+            fx.bcx.ins().jump(block, &[]);
+        }
+        return;
     }
     let source_return_ty = callable_output_ty(fx.db(), callee_func_id, generic_args.as_ref());
     // Check if this is an extern function (no MIR available)
@@ -7100,7 +7417,8 @@ fn codegen_intrinsic_call(
 
             let tuple_cval = codegen_operand(fx, &args[0].kind);
             let tuple_layout = tuple_cval.layout.clone();
-            let tuple_ptr = tuple_cval.force_stack(fx);
+            let (tuple_ptr, tuple_meta) = tuple_cval.force_stack(fx);
+            assert!(tuple_meta.is_none(), "const_eval_select tuple arg cannot be unsized");
             let mut runtime_args = Vec::with_capacity(tuple_fields.len());
             for (idx, field_ty) in tuple_fields.iter().enumerate() {
                 let field_layout = fx
@@ -7213,7 +7531,6 @@ fn codegen_intrinsic_call(
             store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
             return true;
         }
-
         // --- memory operations ---
         "copy_nonoverlapping" => {
             assert_eq!(args.len(), 3, "copy_nonoverlapping expects 3 args");
@@ -7433,8 +7750,11 @@ fn codegen_intrinsic_call(
             let dest = codegen_place(fx, destination);
 
             if !dest.layout.is_zst() {
-                let true_ptr = if_true.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
-                let false_ptr = if_false.force_stack(fx).get_addr(&mut fx.bcx, fx.pointer_type);
+                let (true_ptr, true_meta) = if_true.force_stack(fx);
+                let (false_ptr, false_meta) = if_false.force_stack(fx);
+                assert!(true_meta.is_none() && false_meta.is_none());
+                let true_ptr = true_ptr.get_addr(&mut fx.bcx, fx.pointer_type);
+                let false_ptr = false_ptr.get_addr(&mut fx.bcx, fx.pointer_type);
                 let selected_ptr = fx.bcx.ins().select(cond, true_ptr, false_ptr);
                 let selected =
                     CValue::by_ref(pointer::Pointer::new(selected_ptr), dest.layout.clone());
@@ -7596,7 +7916,8 @@ fn codegen_intrinsic_call(
             };
             let dest_ty = scalar_to_clif_type(fx.dl, &dest_scalar);
 
-            let simd_ptr = simd_val.force_stack(fx);
+            let (simd_ptr, simd_meta) = simd_val.force_stack(fx);
+            assert!(simd_meta.is_none(), "SIMD scratch spill cannot be unsized");
             let mut flags = MemFlags::new();
             flags.set_notrap();
 
@@ -7636,8 +7957,9 @@ fn codegen_intrinsic_call(
 
             let lhs_lane_ty = scalar_to_clif_type(fx.dl, &lhs_element);
             let dest_lane_ty = scalar_to_clif_type(fx.dl, &dest_element);
-            let lhs_ptr = lhs.force_stack(fx);
-            let rhs_ptr = rhs.force_stack(fx);
+            let (lhs_ptr, lhs_meta) = lhs.force_stack(fx);
+            let (rhs_ptr, rhs_meta) = rhs.force_stack(fx);
+            assert!(lhs_meta.is_none() && rhs_meta.is_none());
             let mut flags = MemFlags::new();
             flags.set_notrap();
 
@@ -7789,6 +8111,19 @@ fn codegen_intrinsic_call(
                 Some(fx.bcx.ins().urem(a, b))
             }
         }
+        "catch_unwind" => {
+            assert_eq!(args.len(), 3, "catch_unwind intrinsic expects 3 args");
+
+            let try_fn = codegen_operand(fx, &args[0].kind).load_scalar(fx);
+            let data = codegen_operand(fx, &args[1].kind).load_scalar(fx);
+
+            let mut try_sig = Signature::new(fx.isa.default_call_conv());
+            try_sig.params.push(AbiParam::new(fx.pointer_type));
+            let try_sig_ref = fx.bcx.import_signature(try_sig);
+            fx.bcx.ins().call_indirect(try_sig_ref, try_fn, &[data]);
+
+            Some(fx.bcx.ins().iconst(types::I32, 0))
+        }
 
         // --- abort / unreachable ---
         "abort" | "unreachable" => {
@@ -7814,7 +8149,8 @@ fn codegen_intrinsic_call(
             let src = codegen_operand(fx, &args[0].kind);
             let dest = codegen_place(fx, destination);
             // Force src to stack, then read back as dest type
-            let ptr = src.force_stack(fx);
+            let (ptr, meta) = src.force_stack(fx);
+            assert!(meta.is_none(), "transmute scratch spill cannot be unsized");
             let dest_val = CValue::by_ref(ptr, dest.layout.clone());
             dest.write_cvalue(fx, dest_val);
             if destination.projection.lookup(&fx.ra_body().projection_store).is_empty() {
@@ -8417,6 +8753,11 @@ pub fn compile_fn(
 
     // Compile and define the function
     let mut ctx = Context::for_function(func);
+    if let Some(pattern) = std::env::var_os("CG_CLIF_DUMP_FN_MATCH")
+        && fn_name.contains(pattern.to_string_lossy().as_ref())
+    {
+        eprintln!("-- function: {fn_name} --\n{}", ctx.func.display());
+    }
     module.define_function(func_id, &mut ctx).map_err(|e| {
         format!("define_function: {e}\n-- function: {fn_name} --\n{}", ctx.func.display(),)
     })?;
@@ -8544,7 +8885,7 @@ fn collect_unsize_metadata_dependencies(
     }
 
     // Slot 0 stores drop glue for the concrete source tail.
-    collect_drop_info(db, local_crate, &source_tail, queue, drop_types);
+    collect_drop_info(db, env, local_crate, &source_tail, queue, drop_types);
 
     // Slots 3+ store trait method implementations.
     let trait_items = trait_id.trait_items(db);
@@ -8675,6 +9016,7 @@ fn compile_drop_in_place(
     local_crate: base_db::Crate,
     ext_crate_disambiguators: &HashMap<String, u64>,
 ) -> Result<FuncId, String> {
+    let ty = canonicalize_drop_ty_for_codegen(db, ty);
     let pointer_type = pointer_ty(dl);
     let interner = DbInterner::new_with(db, local_crate);
 
@@ -8700,26 +9042,24 @@ fn compile_drop_in_place(
         let self_ptr = bcx.block_params(entry_block)[0];
 
         // 1. If T has a direct Drop impl, call Drop::drop(&mut *ptr)
-        let lang_items = hir_def::lang_item::lang_items(db, local_crate);
-        if let Some(drop_trait) = lang_items.Drop {
-            if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
-                let mut drop_sig = Signature::new(isa.default_call_conv());
-                drop_sig.params.push(AbiParam::new(pointer_type));
+        if let Some((drop_func_id, drop_generic_args)) =
+            resolve_drop_impl_method(db, env, local_crate, &ty)
+        {
+            let mut drop_sig = Signature::new(isa.default_call_conv());
+            drop_sig.params.push(AbiParam::new(pointer_type));
 
-                let generic_args = drop_impl_generic_args(db, local_crate, ty);
-                let drop_fn_name = symbol_mangling::mangle_function(
-                    db,
-                    drop_func_id,
-                    generic_args.as_ref(),
-                    ext_crate_disambiguators,
-                );
+            let drop_fn_name = symbol_mangling::mangle_function(
+                db,
+                drop_func_id,
+                drop_generic_args.as_ref(),
+                ext_crate_disambiguators,
+            );
 
-                let callee_id = module
-                    .declare_function(&drop_fn_name, Linkage::Import, &drop_sig)
-                    .expect("declare Drop::drop");
-                let callee_ref = module.declare_func_in_func(callee_id, bcx.func);
-                bcx.ins().call(callee_ref, &[self_ptr]);
-            }
+            let callee_id = module
+                .declare_function(&drop_fn_name, Linkage::Import, &drop_sig)
+                .expect("declare Drop::drop");
+            let callee_ref = module.declare_func_in_func(callee_id, bcx.func);
+            bcx.ins().call(callee_ref, &[self_ptr]);
         }
 
         // 2. Drop fields that need dropping
@@ -8792,7 +9132,7 @@ fn compile_drop_in_place(
                                     pointer_type,
                                     Pointer::new(self_ptr),
                                     &layout,
-                                    ty,
+                                    &ty,
                                     discr_ty,
                                 );
 
@@ -8806,7 +9146,7 @@ fn compile_drop_in_place(
                                 {
                                     let variant_idx = VariantIdx::from_u32(variant_i as u32);
                                     let discr_bits = truncate_bits_to_clif_int_ty(
-                                        enum_variant_discriminant_bits(db, ty, variant_idx),
+                                        enum_variant_discriminant_bits(db, &ty, variant_idx),
                                         discr_ty,
                                     );
                                     let block = bcx.create_block();
@@ -8843,6 +9183,37 @@ fn compile_drop_in_place(
                             }
                             rustc_abi::Variants::Empty => {}
                         }
+                    }
+                }
+            }
+            TyKind::Array(elem_ty, len) => {
+                let layout = db
+                    .layout_of_ty(ty.clone(), env.clone())
+                    .map_err(|e| format!("layout error: {:?}", e))?;
+                let elem_ty = elem_ty.store();
+                let elem_layout = db
+                    .layout_of_ty(elem_ty.clone(), env.clone())
+                    .map_err(|e| format!("layout error: {:?}", e))?;
+                let len = try_const_usize(db, len)
+                    .expect("array drop glue requires concrete length");
+
+                for idx in 0..len {
+                    if hir_ty::drop::has_drop_glue_mono(interner, elem_ty.as_ref()) {
+                        let offset = layout.fields.offset(idx as usize).bytes() as i64;
+                        let field_ptr = if elem_layout.is_zst() {
+                            self_ptr
+                        } else {
+                            bcx.ins().iadd_imm(self_ptr, offset)
+                        };
+                        emit_drop_in_place_call(
+                            module,
+                            &mut bcx,
+                            &field_drop_sig,
+                            db,
+                            &elem_ty,
+                            ext_crate_disambiguators,
+                            field_ptr,
+                        );
                     }
                 }
             }
@@ -8988,6 +9359,13 @@ where
 
         result.push((func_id, generic_args.clone()));
 
+        // `panic=abort` still permits `catch_unwind`, but only its success path:
+        // `std::panicking::do_catch` still needs a symbol for fn-pointer materialization,
+        // while its real unwind body remains unreachable.
+        if is_abort_only_catch_unwind_catch_fn(db, func_id) {
+            continue;
+        }
+
         if !should_scan_body(func_id, &generic_args) {
             continue;
         }
@@ -9052,6 +9430,9 @@ where
                 continue;
             }
             result.push((func_id, generic_args.clone()));
+            if is_abort_only_catch_unwind_catch_fn(db, func_id) {
+                continue;
+            }
             if !should_scan_body(func_id, &generic_args) {
                 continue;
             }
@@ -9083,12 +9464,19 @@ where
 /// they get compiled.
 fn collect_drop_info(
     db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
     local_crate: base_db::Crate,
     ty: &StoredTy,
     fn_queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
     drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
+    let ty = canonicalize_drop_ty_for_codegen(db, ty);
     let interner = DbInterner::new_with(db, local_crate);
+
+    if let TyKind::Slice(elem_ty) = ty.as_ref().kind() {
+        collect_drop_info(db, env, local_crate, &elem_ty.store(), fn_queue, drop_types);
+        return;
+    }
 
     if !hir_ty::drop::has_drop_glue_mono(interner, ty.as_ref()) {
         return;
@@ -9098,12 +9486,8 @@ fn collect_drop_info(
     }
 
     // If this type has a direct Drop impl, add its method to the fn queue
-    let lang_items = hir_def::lang_item::lang_items(db, local_crate);
-    if let Some(drop_trait) = lang_items.Drop {
-        if let Some(drop_func_id) = resolve_drop_impl(db, local_crate, drop_trait, ty) {
-            let drop_args = drop_impl_generic_args(db, local_crate, ty);
-            fn_queue.push_back((drop_func_id, drop_args));
-        }
+    if let Some((drop_func_id, drop_args)) = resolve_drop_impl_method(db, env, local_crate, &ty) {
+        enqueue_fn_instance(db, fn_queue, drop_func_id, drop_args);
     }
 
     // Recurse into fields
@@ -9123,7 +9507,7 @@ fn collect_drop_info(
                     let field_types = db.field_types(id.into());
                     for (_, field_ty) in field_types.iter() {
                         let ft = field_ty.get().instantiate(interner, subst).store();
-                        collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+                        collect_drop_info(db, env, local_crate, &ft, fn_queue, drop_types);
                     }
                 }
                 hir_def::AdtId::UnionId(_) => {} // union fields not dropped
@@ -9132,16 +9516,19 @@ fn collect_drop_info(
                         let field_types = db.field_types(variant.into());
                         for (_, field_ty) in field_types.iter() {
                             let ft = field_ty.get().instantiate(interner, subst).store();
-                            collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+                            collect_drop_info(db, env, local_crate, &ft, fn_queue, drop_types);
                         }
                     }
                 }
             }
         }
+        TyKind::Array(elem_ty, _) => {
+            collect_drop_info(db, env, local_crate, &elem_ty.store(), fn_queue, drop_types);
+        }
         TyKind::Tuple(tys) => {
             for elem_ty in tys.iter() {
                 let ft = elem_ty.store();
-                collect_drop_info(db, local_crate, &ft, fn_queue, drop_types);
+                collect_drop_info(db, env, local_crate, &ft, fn_queue, drop_types);
             }
         }
         TyKind::Closure(closure_id, subst) => {
@@ -9150,7 +9537,7 @@ fn collect_drop_info(
             let (captures, _) = infer.closure_info(closure_id.0);
             for capture in captures.iter() {
                 let cap_ty = capture.ty(db, subst).store();
-                collect_drop_info(db, local_crate, &cap_ty, fn_queue, drop_types);
+                collect_drop_info(db, env, local_crate, &cap_ty, fn_queue, drop_types);
             }
         }
         _ => {}
@@ -9159,6 +9546,7 @@ fn collect_drop_info(
 
 fn collect_overwrite_drop_info(
     db: &dyn HirDatabase,
+    env: &StoredParamEnvAndCrate,
     body: &MirBody,
     local_crate: base_db::Crate,
     place: &Place,
@@ -9170,7 +9558,7 @@ fn collect_overwrite_drop_info(
     }
 
     let ty = place_ty(db, body, place);
-    collect_drop_info(db, local_crate, &ty, fn_queue, drop_types);
+    collect_drop_info(db, env, local_crate, &ty, fn_queue, drop_types);
 }
 
 fn collect_builtin_derive_trait_call_dependency(
@@ -9428,6 +9816,7 @@ fn collect_const_operand_callables(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     interner: DbInterner,
+    local_crate: base_db::Crate,
     operand: &Operand,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
     closure_visited: &mut std::collections::HashSet<(
@@ -9435,6 +9824,7 @@ fn collect_const_operand_callables(
         StoredGenericArgs,
     )>,
     closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
     let OperandKind::Constant { konst, ty } = &operand.kind else {
         return;
@@ -9445,6 +9835,11 @@ fn collect_const_operand_callables(
     let value = resolve_const_value(db, konst.as_ref());
     let const_bytes = value.value.inner();
     let memory_map = &const_bytes.memory_map;
+    let operand_ty = ty.as_ref();
+    let dyn_pointee = operand_ty
+        .builtin_deref(true)
+        .filter(|pointee| matches!(pointee.kind(), TyKind::Dynamic(..)))
+        .map(|pointee| pointee.store());
 
     let mut maybe_collect = |offset: usize| {
         let Some(addr) = read_usize_le(&const_bytes.memory, offset) else {
@@ -9456,15 +9851,29 @@ fn collect_const_operand_callables(
         let Ok(mapped_ty) = memory_map.vtable_ty(addr) else {
             return;
         };
-        enqueue_callable_from_mapped_ty(
-            db,
-            env,
-            interner,
-            mapped_ty,
-            queue,
-            closure_visited,
-            closure_result,
-        );
+        if let Some(target_pointee) = dyn_pointee.clone() {
+            collect_unsize_metadata_dependencies(
+                db,
+                env,
+                local_crate,
+                mapped_ty.store(),
+                target_pointee,
+                queue,
+                closure_visited,
+                closure_result,
+                drop_types,
+            );
+        } else {
+            enqueue_callable_from_mapped_ty(
+                db,
+                env,
+                interner,
+                mapped_ty,
+                queue,
+                closure_visited,
+                closure_result,
+            );
+        }
     };
 
     match &layout.backend_repr {
@@ -9489,6 +9898,7 @@ fn collect_const_rvalue_callables(
     db: &dyn HirDatabase,
     env: &StoredParamEnvAndCrate,
     interner: DbInterner,
+    local_crate: base_db::Crate,
     rvalue: &Rvalue,
     queue: &mut std::collections::VecDeque<(hir_def::FunctionId, StoredGenericArgs)>,
     closure_visited: &mut std::collections::HashSet<(
@@ -9496,16 +9906,19 @@ fn collect_const_rvalue_callables(
         StoredGenericArgs,
     )>,
     closure_result: &mut Vec<(hir_ty::db::InternedClosureId, StoredGenericArgs)>,
+    drop_types: &mut std::collections::HashSet<StoredTy>,
 ) {
     let mut collect_operand = |operand: &Operand| {
         collect_const_operand_callables(
             db,
             env,
             interner,
+            local_crate,
             operand,
             queue,
             closure_visited,
             closure_result,
+            drop_types,
         );
     };
 
@@ -9554,12 +9967,14 @@ fn scan_body_for_callees(
                     db,
                     env,
                     interner,
+                    local_crate,
                     rvalue,
                     queue,
                     closure_visited,
                     closure_result,
+                    drop_types,
                 );
-                collect_overwrite_drop_info(db, body, local_crate, place, queue, drop_types);
+                collect_overwrite_drop_info(db, env, body, local_crate, place, queue, drop_types);
             }
 
             match &stmt.kind {
@@ -9665,10 +10080,12 @@ fn scan_body_for_callees(
                     db,
                     env,
                     interner,
+                    local_crate,
                     discr,
                     queue,
                     closure_visited,
                     closure_result,
+                    drop_types,
                 );
             }
             TerminatorKind::Assert { cond, .. } => {
@@ -9676,41 +10093,24 @@ fn scan_body_for_callees(
                     db,
                     env,
                     interner,
+                    local_crate,
                     cond,
                     queue,
                     closure_visited,
                     closure_result,
+                    drop_types,
                 );
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 if target.is_some() {
                     collect_overwrite_drop_info(
                         db,
+                        env,
                         body,
                         local_crate,
                         destination,
                         queue,
                         drop_types,
-                    );
-                }
-                collect_const_operand_callables(
-                    db,
-                    env,
-                    interner,
-                    func,
-                    queue,
-                    closure_visited,
-                    closure_result,
-                );
-                for arg in args.iter() {
-                    collect_const_operand_callables(
-                        db,
-                        env,
-                        interner,
-                        arg,
-                        queue,
-                        closure_visited,
-                        closure_result,
                     );
                 }
 
@@ -9720,7 +10120,63 @@ fn scan_body_for_callees(
                 let func_ty = operand_ty(db, body, &func.kind);
                 let TyKind::FnDef(def, callee_args) = func_ty.as_ref().kind() else { continue };
                 if let CallableDefId::FunctionId(callee_id) = def.0 {
+                    collect_const_operand_callables(
+                        db,
+                        env,
+                        interner,
+                        local_crate,
+                        func,
+                        queue,
+                        closure_visited,
+                        closure_result,
+                        drop_types,
+                    );
+
                     if FunctionSignature::is_intrinsic(db, callee_id) {
+                        if db.function_signature(callee_id).name.as_str() == "catch_unwind" {
+                            if let Some(callback) = args.first() {
+                                collect_const_operand_callables(
+                                    db,
+                                    env,
+                                    interner,
+                                    local_crate,
+                                    callback,
+                                    queue,
+                                    closure_visited,
+                                    closure_result,
+                                    drop_types,
+                                );
+                            }
+                            if let Some(cleanup) = args.get(2) {
+                                let cleanup_ty = operand_ty(db, body, &cleanup.kind);
+                                if let TyKind::FnDef(cleanup_def, cleanup_args) =
+                                    cleanup_ty.as_ref().kind()
+                                    && let CallableDefId::FunctionId(cleanup_id) = cleanup_def.0
+                                {
+                                    enqueue_fn_instance(
+                                        db,
+                                        queue,
+                                        cleanup_id,
+                                        cleanup_args.store(),
+                                    );
+                                }
+                            }
+                        } else {
+                            for arg in args.iter() {
+                                collect_const_operand_callables(
+                                    db,
+                                    env,
+                                    interner,
+                                    local_crate,
+                                    arg,
+                                    queue,
+                                    closure_visited,
+                                    closure_result,
+                                    drop_types,
+                                );
+                            }
+                        }
+
                         // Runtime lowering of `const_eval_select` calls its runtime-arm
                         // function directly; ensure reachability includes that callee.
                         if db.function_signature(callee_id).name.as_str() == "const_eval_select"
@@ -9742,11 +10198,25 @@ fn scan_body_for_callees(
                         continue;
                     }
 
+                    for arg in args.iter() {
+                        collect_const_operand_callables(
+                            db,
+                            env,
+                            interner,
+                            local_crate,
+                            arg,
+                            queue,
+                            closure_visited,
+                            closure_result,
+                            drop_types,
+                        );
+                    }
+
                     let lang_items = hir_def::lang_item::lang_items(db, local_crate);
                     if Some(callee_id) == lang_items.DropInPlace {
                         if !callee_args.is_empty() {
                             let pointee_ty = callee_args.type_at(0).store();
-                            collect_drop_info(db, local_crate, &pointee_ty, queue, drop_types);
+                            collect_drop_info(db, env, local_crate, &pointee_ty, queue, drop_types);
                         }
                         continue;
                     }
@@ -9896,7 +10366,7 @@ fn scan_body_for_callees(
             TerminatorKind::Drop { place, .. } => {
                 // Transitively discover drop types and their Drop impl methods
                 let ty = place_ty(db, body, place);
-                collect_drop_info(db, local_crate, &ty, queue, drop_types);
+                collect_drop_info(db, env, local_crate, &ty, queue, drop_types);
             }
             _ => {}
         }
@@ -9929,27 +10399,41 @@ pub fn compile_executable(
     let mut compiled_drop_symbols = std::collections::HashSet::new();
 
     for (func_id, generic_args) in &reachable_fns {
-        let body = db
-            .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
-            .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
         let fn_name = symbol_mangling::mangle_function(
             db,
             *func_id,
             generic_args.as_ref(),
             ext_crate_disambiguators,
         );
-        let func_clif_id = compile_fn(
-            &mut module,
-            &*isa,
-            db,
-            dl,
-            env,
-            &body,
-            &fn_name,
-            Linkage::Export,
-            local_crate,
-            ext_crate_disambiguators,
-        )?;
+        let func_clif_id = if is_abort_only_catch_unwind_catch_fn(db, *func_id) {
+            compile_abort_only_catch_unwind_catch_fn(
+                &mut module,
+                &*isa,
+                db,
+                dl,
+                env,
+                *func_id,
+                generic_args.as_ref(),
+                &fn_name,
+                Linkage::Export,
+            )?
+        } else {
+            let body = db
+                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
+            compile_fn(
+                &mut module,
+                &*isa,
+                db,
+                dl,
+                env,
+                &body,
+                &fn_name,
+                Linkage::Export,
+                local_crate,
+                ext_crate_disambiguators,
+            )?
+        };
 
         if *func_id == main_func_id {
             user_main_id = Some(func_clif_id);
@@ -9993,8 +10477,12 @@ pub fn compile_executable(
 
     // Compile drop_in_place glue functions
     for ty in &drop_types {
-        let drop_name =
-            symbol_mangling::mangle_drop_in_place(db, ty.as_ref(), ext_crate_disambiguators);
+        let canonical_ty = canonicalize_drop_ty_for_codegen(db, ty);
+        let drop_name = symbol_mangling::mangle_drop_in_place(
+            db,
+            canonical_ty.as_ref(),
+            ext_crate_disambiguators,
+        );
         if !compiled_drop_symbols.insert(drop_name) {
             continue;
         }
@@ -10004,7 +10492,7 @@ pub fn compile_executable(
             db,
             dl,
             env,
-            ty,
+            &canonical_ty,
             local_crate,
             ext_crate_disambiguators,
         )?;

@@ -45,6 +45,7 @@ pub mod diagnostics;
 pub mod display;
 pub mod drop;
 pub mod dyn_compatibility;
+pub mod freeze;
 pub mod generics;
 pub mod lang_items;
 pub mod layout;
