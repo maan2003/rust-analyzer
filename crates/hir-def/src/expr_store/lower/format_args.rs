@@ -319,6 +319,7 @@ impl<'db> ExprCollector<'db> {
             let args_tuple = self.alloc_expr_desugared(Expr::Tuple { exprs: elements });
             // FIXME: Make this a `super let` when we have this statement.
             let let_statement_1 = Statement::Let {
+                is_super: true,
                 pat: args_pat,
                 type_ref: None,
                 initializer: Some(args_tuple),
@@ -351,6 +352,7 @@ impl<'db> ExprCollector<'db> {
             self.add_definition_to_binding(args_binding, args_pat);
             // FIXME: Make this a `super let` when we have this statement.
             let let_statement_2 = Statement::Let {
+                is_super: true,
                 pat: args_pat,
                 type_ref: None,
                 initializer: Some(args),
@@ -664,6 +666,7 @@ impl<'db> ExprCollector<'db> {
             self.add_definition_to_binding(args_binding, args_pat);
             // TODO: We don't have `super let` yet.
             let let_stmt = Statement::Let {
+                is_super: true,
                 pat: args_pat,
                 type_ref: None,
                 initializer: Some(args),
@@ -694,6 +697,7 @@ impl<'db> ExprCollector<'db> {
             let args_tuple = self.alloc_expr_desugared(Expr::Tuple { exprs: elements });
             // TODO: We don't have `super let` yet
             let let_stmt1 = Statement::Let {
+                is_super: true,
                 pat: args_pat,
                 type_ref: None,
                 initializer: Some(args_tuple),
@@ -729,6 +733,7 @@ impl<'db> ExprCollector<'db> {
             let args_pat = self.alloc_pat_desugared(Pat::Bind { id: args_binding, subpat: None });
             self.add_definition_to_binding(args_binding, args_pat);
             let let_stmt2 = Statement::Let {
+                is_super: true,
                 pat: args_pat,
                 type_ref: None,
                 initializer: Some(array),

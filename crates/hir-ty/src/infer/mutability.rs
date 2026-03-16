@@ -90,7 +90,13 @@ impl<'db> InferenceContext<'_, 'db> {
             | Expr::Unsafe { id: _, statements, tail } => {
                 for st in statements.iter() {
                     match st {
-                        Statement::Let { pat, type_ref: _, initializer, else_branch } => {
+                        Statement::Let {
+                            pat,
+                            type_ref: _,
+                            initializer,
+                            else_branch,
+                            ..
+                        } => {
                             if let Some(i) = initializer {
                                 self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));
                             }

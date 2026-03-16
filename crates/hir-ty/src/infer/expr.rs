@@ -1476,7 +1476,13 @@ impl<'db> InferenceContext<'_, 'db> {
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let { pat, type_ref, initializer, else_branch } => {
+                        Statement::Let {
+                            pat,
+                            type_ref,
+                            initializer,
+                            else_branch,
+                            ..
+                        } => {
                             let decl_ty = type_ref
                                 .as_ref()
                                 .map(|&tr| this.make_body_ty(tr))

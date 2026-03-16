@@ -562,7 +562,13 @@ impl<'db> InferenceContext<'_, 'db> {
             | Expr::Block { statements, tail, .. } => {
                 for s in statements.iter() {
                     match s {
-                        Statement::Let { pat, type_ref: _, initializer, else_branch } => {
+                        Statement::Let {
+                            pat,
+                            type_ref: _,
+                            initializer,
+                            else_branch,
+                            ..
+                        } => {
                             if let Some(else_branch) = else_branch {
                                 self.consume_expr(*else_branch);
                             }

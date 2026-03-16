@@ -573,6 +573,7 @@ pub struct RecordLitField {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Statement {
     Let {
+        is_super: bool,
         pat: PatId,
         type_ref: Option<TypeRefId>,
         initializer: Option<ExprId>,

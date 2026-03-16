@@ -3342,7 +3342,6 @@ fn foo() -> i32 {
 }
 
 #[test]
-#[ignore = "currently fails: formatting pipeline crashes when rendering Debug for Vec"]
 fn std_jit_format_debug_vec_probe() {
     let result: i32 = jit_run_with_std(
         r#"

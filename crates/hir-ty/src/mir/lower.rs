@@ -76,6 +76,12 @@ struct DropScope {
     locals: Vec<LocalId>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StorageScopeOverride {
+    source_depth: usize,
+    target_depth: usize,
+}
+
 struct MirLowerCtx<'a, 'db> {
     result: MirBody,
     owner: DefWithBodyId,
@@ -88,6 +94,7 @@ struct MirLowerCtx<'a, 'db> {
     types: &'db crate::next_solver::DefaultAny<'db>,
     resolver: Resolver<'db>,
     drop_scopes: Vec<DropScope>,
+    storage_scope_override: Option<StorageScopeOverride>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -325,6 +332,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             labeled_loop_blocks: Default::default(),
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
+            storage_scope_override: None,
             env,
             infcx,
         }
@@ -2022,13 +2030,54 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.push_storage_live_for_local(l, current, MirSpan::BindingId(b))
     }
 
+    fn storage_scope_index(&self) -> usize {
+        match self.storage_scope_override {
+            Some(override_) if self.drop_scopes.len() == override_.source_depth => {
+                override_.target_depth
+            }
+            _ => self.drop_scopes.len() - 1,
+        }
+    }
+
+    fn with_storage_scope_override<T>(
+        &mut self,
+        target_depth: usize,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prev = self.storage_scope_override.replace(StorageScopeOverride {
+            source_depth: self.drop_scopes.len(),
+            target_depth,
+        });
+        let result = f(self);
+        self.storage_scope_override = prev;
+        result
+    }
+
+    fn with_statement_storage_scope<T>(
+        &mut self,
+        is_super: bool,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if is_super {
+            let target_depth = self
+                .drop_scopes
+                .len()
+                .checked_sub(2)
+                .expect("super let requires a parent scope");
+            self.with_storage_scope_override(target_depth, f)
+        } else {
+            f(self)
+        }
+    }
+
     fn push_storage_live_for_local(
         &mut self,
         l: LocalId,
         current: BasicBlockId,
         span: MirSpan,
     ) -> Result<'db, ()> {
-        self.drop_scopes.last_mut().unwrap().locals.push(l);
+        let storage_scope_index = self.storage_scope_index();
+        self.drop_scopes[storage_scope_index].locals.push(l);
         self.push_statement(current, StatementKind::StorageLive(l).with_span(span));
         Ok(())
     }
@@ -2044,11 +2093,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let scope = self.push_drop_scope();
         for statement in statements.iter() {
             match statement {
-                hir_def::hir::Statement::Let { pat, initializer, else_branch, type_ref: _ } => {
+                hir_def::hir::Statement::Let {
+                    pat,
+                    initializer,
+                    else_branch,
+                    type_ref: _,
+                    is_super,
+                } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
-                        let Some((init_place, c)) =
-                            self.lower_expr_as_place(current, *expr_id, true)?
+                        let Some((init_place, c)) = self
+                            .with_statement_storage_scope(*is_super, |this| {
+                                this.lower_expr_as_place(current, *expr_id, true)
+                            })?
                         else {
                             scope.pop_assume_dropped(self);
                             return Ok(None);
@@ -2059,8 +2116,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         // and has all declarations of the `let`.
                         let resolver_guard =
                             self.resolver.update_to_inner_scope(self.db, self.owner, *expr_id);
-                        (current, else_block) =
-                            self.pattern_match(current, None, init_place, *pat)?;
+                        (current, else_block) = self.with_statement_storage_scope(
+                            *is_super,
+                            |this| this.pattern_match(current, None, init_place, *pat),
+                        )?;
                         self.resolver.reset_to_guard(resolver_guard);
                         match (else_block, else_branch) {
                             (None, _) => (),
@@ -2077,10 +2136,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         }
                     } else {
                         let mut err = None;
-                        self.body.walk_bindings_in_pat(*pat, |b| {
-                            if let Err(e) = self.push_storage_live(b, current) {
-                                err = Some(e);
-                            }
+                        self.with_statement_storage_scope(*is_super, |this| {
+                            this.body.walk_bindings_in_pat(*pat, |b| {
+                                if let Err(e) = this.push_storage_live(b, current) {
+                                    err = Some(e);
+                                }
+                            });
                         });
                         if let Some(e) = err {
                             return Err(e);

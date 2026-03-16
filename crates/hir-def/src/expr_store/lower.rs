@@ -995,6 +995,7 @@ impl<'db> ExprCollector<'db> {
             let pat_id = self.alloc_pat_desugared(Pat::Bind { id: binding_id, subpat: None });
             let expr = self.alloc_expr_desugared(Expr::Path(name.into()));
             statements.push(Statement::Let {
+                is_super: false,
                 pat: *param,
                 type_ref: None,
                 initializer: Some(expr),
@@ -1810,6 +1811,7 @@ impl<'db> ExprCollector<'db> {
                     Expr::Block {
                         id: None,
                         statements: Box::new([Statement::Let {
+                            is_super: false,
                             pat,
                             type_ref: Some(type_ref),
                             initializer: Some(expr_id),
@@ -2171,7 +2173,13 @@ impl<'db> ExprCollector<'db> {
                     .let_else()
                     .and_then(|let_else| let_else.block_expr())
                     .map(|block| self.collect_block(block));
-                statements.push(Statement::Let { pat, type_ref, initializer, else_branch });
+                statements.push(Statement::Let {
+                    is_super: stmt.super_token().is_some(),
+                    pat,
+                    type_ref,
+                    initializer,
+                    else_branch,
+                });
             }
             ast::Stmt::ExprStmt(stmt) => {
                 let Some(expr) = stmt.expr() else {

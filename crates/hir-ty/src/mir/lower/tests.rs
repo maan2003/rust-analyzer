@@ -1,4 +1,5 @@
-use hir_def::DefWithBodyId;
+use hir_def::{DefWithBodyId, HasModule, db::DefDatabase};
+use span::Edition;
 use test_fixture::WithFixture;
 
 use crate::{db::HirDatabase, setup_tracing, test_db::TestDB};
@@ -18,6 +19,31 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         for func in funcs {
             _ = db.mir_body(func.into());
         }
+    })
+}
+
+fn lowered_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
+    let _tracing = setup_tracing();
+    let (db, file_ids) = TestDB::with_many_files(ra_fixture);
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let def_map = module_id.def_map(&db);
+        let scope = &def_map[module_id].scope;
+        let func = scope
+            .declarations()
+            .find_map(|x| match x {
+                hir_def::ModuleDefId::FunctionId(it)
+                    if db.function_signature(it).name.display(&db, Edition::CURRENT).to_string()
+                        == "main" =>
+                {
+                    Some(it)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let body = db.mir_body(func.into()).unwrap();
+        body.pretty_print(&db, crate::display::DisplayTarget::from_crate(&db, func.krate(&db)))
     })
 }
 
@@ -107,4 +133,32 @@ pub struct AssocTy {
 }
     "#,
     );
+}
+
+#[test]
+fn super_let_extends_top_level_temporary_lifetime() {
+    let mir = lowered_mir(
+        r#"
+fn id(_: &i32) -> i32 {
+    0
+}
+
+fn main() -> i32 {
+    super let x = {
+        let y = 1;
+        y
+    };
+    id(&x)
+}
+        "#,
+    );
+    let call = mir.find("Call {").unwrap();
+    let drop_x = mir.find("StorageDead(x_1)").unwrap();
+    let drop_temp = mir.find("StorageDead(_3)").unwrap();
+    let drop_inner = mir.find("StorageDead(y_2)").unwrap();
+    let bind_x = mir.find("StorageLive(x_1)").unwrap();
+
+    assert!(call < drop_x, "{mir}");
+    assert!(drop_x < drop_temp, "{mir}");
+    assert!(drop_inner < bind_x, "{mir}");
 }
