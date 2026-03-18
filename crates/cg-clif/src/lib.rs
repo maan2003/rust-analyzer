@@ -4609,6 +4609,42 @@ fn erase_regions_in_stored_generic_args_for_codegen(
     erase_regions_for_codegen(db, generic_args.as_ref()).store()
 }
 
+fn complete_stored_codegen_fn_generic_args(
+    db: &dyn HirDatabase,
+    func_id: hir_def::FunctionId,
+    generic_args: &StoredGenericArgs,
+) -> StoredGenericArgs {
+    complete_codegen_generic_args(db, func_id, generic_args.as_ref()).store()
+}
+
+pub(crate) fn complete_codegen_generic_args<'db>(
+    db: &'db dyn HirDatabase,
+    def: impl Into<hir_ty::next_solver::SolverDefId>,
+    generic_args: GenericArgs<'db>,
+) -> GenericArgs<'db> {
+    use hir_def::GenericParamId;
+    use hir_ty::next_solver::{Const, GenericArg, ParamConst, Region, Ty};
+    use rustc_type_ir::inherent::GenericArg as _;
+
+    let interner = DbInterner::new_no_crate(db);
+    let generic_args = erase_regions_for_codegen(db, generic_args);
+    let mut provided_args = generic_args.iter().peekable();
+
+    GenericArgs::fill_rest(interner, def.into(), std::iter::empty(), |idx, id, _| {
+        let matches_kind = |arg: &GenericArg<'db>| match id {
+            GenericParamId::LifetimeParamId(_) => arg.as_region().is_some(),
+            GenericParamId::TypeParamId(_) => arg.as_type().is_some(),
+            GenericParamId::ConstParamId(_) => arg.as_const().is_some(),
+        };
+
+        provided_args.next_if(matches_kind).unwrap_or_else(|| match id {
+            GenericParamId::LifetimeParamId(_) => Region::new_erased(interner).into(),
+            GenericParamId::TypeParamId(id) => Ty::new_param(interner, id, idx).into(),
+            GenericParamId::ConstParamId(id) => Const::new_param(interner, ParamConst { index: idx, id }).into(),
+        })
+    })
+}
+
 fn canonicalize_drop_ty_for_codegen(db: &dyn HirDatabase, ty: &StoredTy) -> StoredTy {
     erase_regions_for_codegen(db, ty.as_ref().clone()).store()
 }
@@ -4724,7 +4760,7 @@ fn enqueue_fn_instance(
     func_id: hir_def::FunctionId,
     generic_args: StoredGenericArgs,
 ) {
-    queue.push_back((func_id, erase_regions_in_stored_generic_args_for_codegen(db, &generic_args)));
+    queue.push_back((func_id, complete_stored_codegen_fn_generic_args(db, func_id, &generic_args)));
 }
 
 fn track_closure_instance(
@@ -5065,7 +5101,7 @@ fn callable_output_ty(
     generic_args: GenericArgs<'_>,
 ) -> Option<StoredTy> {
     let interner = DbInterner::new_no_crate(db);
-    let generic_args = erase_regions_for_codegen(db, generic_args);
+    let generic_args = complete_codegen_generic_args(db, func_id, generic_args);
     let fn_sig = if generic_args.is_empty() {
         db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
     } else {
@@ -5080,7 +5116,7 @@ fn is_abstract_trait_method_instance(
     callee_func_id: hir_def::FunctionId,
     generic_args: &StoredGenericArgs,
 ) -> bool {
-    let generic_args = erase_regions_in_stored_generic_args_for_codegen(fx.db(), generic_args);
+    let generic_args = complete_stored_codegen_fn_generic_args(fx.db(), callee_func_id, generic_args);
     matches!(
         fx.db().monomorphized_mir_body(callee_func_id.into(), generic_args, fx.env().clone()),
         Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _))
@@ -6812,7 +6848,7 @@ fn codegen_direct_call(
     } else {
         (callee_func_id, generic_args.store())
     };
-    let generic_args = erase_regions_in_stored_generic_args_for_codegen(fx.db(), &generic_args);
+    let generic_args = complete_stored_codegen_fn_generic_args(fx.db(), callee_func_id, &generic_args);
 
     let callee_is_rust_call_abi =
         fx.db().function_signature(callee_func_id).abi == Some(sym::rust_dash_call);
@@ -9334,7 +9370,7 @@ where
     queue.push_back((root, empty_args));
 
     while let Some((func_id, generic_args)) = queue.pop_front() {
-        let generic_args = erase_regions_in_stored_generic_args_for_codegen(db, &generic_args);
+        let generic_args = complete_stored_codegen_fn_generic_args(db, func_id, &generic_args);
         if !visited.insert((func_id, generic_args.clone())) {
             continue;
         }
@@ -9412,7 +9448,7 @@ where
         );
         // Process any newly discovered functions from closure bodies
         while let Some((func_id, generic_args)) = queue.pop_front() {
-            let generic_args = erase_regions_in_stored_generic_args_for_codegen(db, &generic_args);
+            let generic_args = complete_stored_codegen_fn_generic_args(db, func_id, &generic_args);
             if !visited.insert((func_id, generic_args.clone())) {
                 continue;
             }
@@ -10419,7 +10455,11 @@ pub fn compile_executable(
             )?
         } else {
             let body = db
-                .monomorphized_mir_body((*func_id).into(), generic_args.clone(), env.clone())
+                .monomorphized_mir_body(
+                    (*func_id).into(),
+                    complete_stored_codegen_fn_generic_args(db, *func_id, generic_args),
+                    env.clone(),
+                )
                 .map_err(|e| format!("MIR error for reachable fn: {:?}", e))?;
             compile_fn(
                 &mut module,

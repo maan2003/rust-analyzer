@@ -242,6 +242,7 @@ pub(crate) fn fn_abi_for_fn_item_from_ty(
     generic_args: GenericArgs<'_>,
 ) -> Result<FnAbi, String> {
     let interner = DbInterner::new_no_crate(db);
+    let generic_args = crate::complete_codegen_generic_args(db, func_id, generic_args);
     let fn_sig = if generic_args.is_empty() {
         db.callable_item_signature(func_id.into()).skip_binder().skip_binder()
     } else {
