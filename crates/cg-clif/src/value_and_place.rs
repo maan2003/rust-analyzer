@@ -3,9 +3,15 @@
 //! Adapted from cg_clif's `value_and_place.rs`. CValue is a read-only value
 //! with its layout; CPlace is a mutable location with its layout.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value};
+use cranelift_codegen::ir::{
+    condcodes::IntCC, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value,
+};
 use cranelift_frontend::Variable;
 use cranelift_module::Module;
+use hir_ty::{
+    layout::Layout,
+    next_solver::{IntoKind, StoredTy, TyKind},
+};
 use rustc_abi::{BackendRepr, Scalar, Size, TargetDataLayout};
 use triomphe::Arc;
 
@@ -16,8 +22,7 @@ fn align_to_shift(align_bytes: u64) -> u8 {
 }
 
 use crate::pointer::Pointer;
-use crate::{FunctionCx, scalar_to_clif_type};
-use hir_ty::layout::Layout;
+use crate::{FunctionCx, scalar_to_clif_type, size_and_align_of_pointee};
 
 pub(crate) fn scalar_pair_b_offset(dl: &TargetDataLayout, a: Scalar, b: Scalar) -> i64 {
     let b_offset = a.size(dl).align_to(b.align(dl).abi);
@@ -33,6 +38,49 @@ fn backend_repr_to_clif_type(dl: &TargetDataLayout, repr: &BackendRepr) -> Type 
                 .expect("unsupported SIMD lane shape")
         }
         _ => panic!("backend repr is not a single clif value: {repr:?}"),
+    }
+}
+
+fn codegen_field_ptr(
+    fx: &mut FunctionCx<'_, impl Module>,
+    base: Pointer,
+    extra: Option<Value>,
+    field_idx: usize,
+    field_ty: &StoredTy,
+    field_layout: &Arc<Layout>,
+    packed_align: Option<u64>,
+    base_layout: &Arc<Layout>,
+) -> Pointer {
+    let field_offset = base_layout.fields.offset(field_idx);
+    let simple_offset = i64::try_from(field_offset.bytes()).unwrap();
+
+    if field_layout.is_sized() {
+        return base.offset_i64(&mut fx.bcx, fx.pointer_type, simple_offset);
+    }
+
+    match field_ty.as_ref().kind() {
+        TyKind::Slice(..) | TyKind::Str => {
+            base.offset_i64(&mut fx.bcx, fx.pointer_type, simple_offset)
+        }
+        _ => {
+            let unaligned_offset = field_offset.bytes();
+            let (_, mut unsized_align) =
+                size_and_align_of_pointee(fx, field_ty.clone(), field_layout, extra);
+
+            if let Some(packed_align) = packed_align {
+                let packed = fx.bcx.ins().iconst(fx.pointer_type, packed_align as i64);
+                let cmp = fx.bcx.ins().icmp(IntCC::UnsignedLessThan, unsized_align, packed);
+                unsized_align = fx.bcx.ins().select(cmp, unsized_align, packed);
+            }
+
+            let one = fx.bcx.ins().iconst(fx.pointer_type, 1);
+            let align_sub_1 = fx.bcx.ins().isub(unsized_align, one);
+            let and_lhs = fx.bcx.ins().iadd_imm(align_sub_1, unaligned_offset as i64);
+            let zero = fx.bcx.ins().iconst(fx.pointer_type, 0);
+            let and_rhs = fx.bcx.ins().isub(zero, unsized_align);
+            let offset = fx.bcx.ins().band(and_lhs, and_rhs);
+            base.offset_value(&mut fx.bcx, fx.pointer_type, offset)
+        }
     }
 }
 
@@ -467,6 +515,37 @@ impl CPlace {
         field_layout: Arc<Layout>,
     ) -> CPlace {
         self.place_field_with_bcx(&mut fx.bcx, fx.pointer_type, field_idx, field_layout)
+    }
+
+    pub(crate) fn place_field_typed(
+        &self,
+        fx: &mut FunctionCx<'_, impl Module>,
+        field_idx: usize,
+        field_ty: StoredTy,
+        field_layout: Arc<Layout>,
+        packed_align: Option<u64>,
+    ) -> CPlace {
+        match self.inner {
+            CPlaceInner::Addr(ptr, extra) => {
+                let field_ptr = codegen_field_ptr(
+                    fx,
+                    ptr,
+                    extra,
+                    field_idx,
+                    &field_ty,
+                    &field_layout,
+                    packed_align,
+                    &self.layout,
+                );
+                if matches!(field_layout.backend_repr, BackendRepr::Memory { sized: false })
+                    && let Some(extra) = extra
+                {
+                    return CPlace::for_ptr_with_extra(field_ptr, extra, field_layout);
+                }
+                CPlace::for_ptr(field_ptr, field_layout)
+            }
+            _ => self.place_field_with_bcx(&mut fx.bcx, fx.pointer_type, field_idx, field_layout),
+        }
     }
 
     /// Project directly to lane `0`/`1` of a ScalarPair place.

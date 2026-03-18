@@ -647,7 +647,7 @@ fn lockstep_unsized_tails(
 ///
 /// Mirrors upstream cg_clif's `unsize::size_and_align_of` behavior for
 /// `size_of_val`/`align_of_val` intrinsics.
-fn size_and_align_of_pointee(
+pub(crate) fn size_and_align_of_pointee(
     fx: &mut FunctionCx<'_, impl Module>,
     pointee_ty: StoredTy,
     pointee_layout: &LayoutArc,
@@ -1580,6 +1580,13 @@ fn vtable_memflags() -> MemFlags {
     flags
 }
 
+fn packed_align_bytes(db: &dyn HirDatabase, ty: &StoredTy) -> Option<u64> {
+    let TyKind::Adt(adt_id, _) = ty.as_ref().kind() else { return None };
+    AttrFlags::repr(db, adt_id.inner().id.into())
+        .and_then(|repr| repr.pack)
+        .map(|align| align.bytes())
+}
+
 // ---------------------------------------------------------------------------
 // Place codegen
 // ---------------------------------------------------------------------------
@@ -1606,7 +1613,13 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("field layout error");
 
-                cplace = cplace.place_field(fx, field_idx, field_layout);
+                cplace = cplace.place_field_typed(
+                    fx,
+                    field_idx,
+                    field_ty.clone(),
+                    field_layout,
+                    packed_align_bytes(fx.db(), &cur_ty),
+                );
                 cur_ty = field_ty;
             }
             ProjectionElem::Deref => {
@@ -1660,7 +1673,13 @@ fn codegen_place(fx: &mut FunctionCx<'_, impl Module>, place: &Place) -> CPlace 
                     .db()
                     .layout_of_ty(field_ty.clone(), fx.env().clone())
                     .expect("closure field layout error");
-                cplace = cplace.place_field(fx, *idx, field_layout);
+                cplace = cplace.place_field_typed(
+                    fx,
+                    *idx,
+                    field_ty.clone(),
+                    field_layout,
+                    packed_align_bytes(fx.db(), &cur_ty),
+                );
                 cur_ty = field_ty;
             }
             ProjectionElem::Index(index_local) => {

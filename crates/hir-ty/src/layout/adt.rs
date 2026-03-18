@@ -9,13 +9,14 @@ use hir_def::{
 };
 use rustc_abi::{Integer, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
+use rustc_type_ir::solve::SizedTraitKind;
 use smallvec::SmallVec;
 use triomphe::Arc;
 
 use crate::{
     db::HirDatabase,
     layout::{Layout, LayoutCx, LayoutError, field_ty},
-    next_solver::StoredGenericArgs,
+    next_solver::{DbInterner, StoredGenericArgs},
     traits::StoredParamEnvAndCrate,
 };
 
@@ -71,6 +72,22 @@ pub fn layout_of_adt_query(
         .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
         .collect::<SmallVec<[_; 1]>>();
     let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
+    let maybe_unsized = match def {
+        AdtId::StructId(struct_id) => {
+            let variant_id: VariantId = struct_id.into();
+            let interner = DbInterner::new_with(db, krate);
+            db.field_types(variant_id)
+                .iter()
+                .last()
+                .is_some_and(|(_, field_ty)| {
+                    !field_ty
+                        .get()
+                        .skip_binder()
+                        .has_trivial_sizedness(interner, SizedTraitKind::Sized)
+                })
+        }
+        AdtId::UnionId(_) | AdtId::EnumId(_) => false,
+    };
     let result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
@@ -88,12 +105,7 @@ pub fn layout_of_adt_query(
                     .ok()?;
                 Some((id, d))
             }),
-            !matches!(def, AdtId::EnumId(..))
-                && variants
-                    .iter()
-                    .next()
-                    .and_then(|it| it.iter().last().map(|it| !it.is_unsized()))
-                    .unwrap_or(true),
+            !maybe_unsized,
         )?
     };
     Ok(Arc::new(result))
