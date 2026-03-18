@@ -2,7 +2,10 @@ use std::{
     alloc::Layout,
     collections::{HashMap, HashSet},
     fmt, panic,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use cranelift_module::Module;
@@ -2080,35 +2083,42 @@ fn discover_rustc_sysroot_src_override() -> Option<vfs::AbsPathBuf> {
     src_root.join("core/src/lib.rs").is_file().then(|| vfs::AbsPathBuf::assert_utf8(src_root))
 }
 
-/// Load sysroot crates through project-model's metadata-first flow (with stitched
-/// fallback), then attach detached user source as the local crate.
-fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_db::Crate) {
-    use base_db::FileChange;
-    use project_model::{
-        CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
-    };
-    use vfs::{AbsPathBuf, file_set::FileSet};
-
-    let detached_file_path = AbsPathBuf::assert_utf8(std::env::temp_dir().join("rac_test_main.rs"));
-    let detached_file_manifest =
-        ManifestPath::try_from(detached_file_path.clone()).expect("detached file path");
+fn std_test_cargo_config() -> project_model::CargoConfig {
+    use project_model::{CargoConfig, RustLibSource};
 
     let mut cargo_config = CargoConfig::default();
     cargo_config.sysroot = Some(RustLibSource::Discover);
     cargo_config.sysroot_src = discover_rustc_sysroot_src_override();
+    cargo_config
+}
 
-    let mut workspace =
-        ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
-            .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
-    workspace.kind =
-        ProjectWorkspaceKind::DetachedFile { file: detached_file_manifest.clone(), cargo: None };
+fn package_root_contains_path(
+    package_root: &project_model::PackageRoot,
+    path: &vfs::AbsPath,
+) -> bool {
+    let path = <vfs::AbsPath as AsRef<std::path::Path>>::as_ref(path);
+    package_root.include.iter().any(|include| {
+        path.starts_with(<vfs::AbsPathBuf as AsRef<std::path::Path>>::as_ref(include))
+    }) && !package_root.exclude.iter().any(|exclude| {
+        path.starts_with(<vfs::AbsPathBuf as AsRef<std::path::Path>>::as_ref(exclude))
+    })
+}
 
+fn load_project_workspace_into_test_db(
+    workspace: &project_model::ProjectWorkspace,
+    cargo_config: &project_model::CargoConfig,
+    file_overrides: &HashMap<vfs::AbsPathBuf, String>,
+    forced_local_paths: &HashSet<vfs::AbsPathBuf>,
+) -> (TestDB, HashMap<vfs::AbsPathBuf, FileId>) {
+    use base_db::FileChange;
+    use vfs::{AbsPathBuf, file_set::FileSet};
+
+    let package_roots = workspace.to_roots();
     let mut source_change = FileChange::default();
     let mut local_file_set = FileSet::default();
     let mut library_file_set = FileSet::default();
     let mut next_file_raw = 0u32;
     let mut file_ids_by_path = HashMap::<AbsPathBuf, FileId>::new();
-    let detached_file_abs_path: AbsPathBuf = detached_file_manifest.clone().into();
 
     let mut load_file = |path: &vfs::AbsPath, is_local: bool| -> Option<FileId> {
         let abs_path = path.to_path_buf();
@@ -2122,8 +2132,8 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
             return Some(file_id);
         }
 
-        let contents = if abs_path == detached_file_abs_path {
-            user_src.to_owned()
+        let contents = if let Some(contents) = file_overrides.get(&abs_path) {
+            contents.clone()
         } else {
             std::fs::read_to_string(<AbsPathBuf as AsRef<std::path::Path>>::as_ref(&abs_path))
                 .ok()?
@@ -2145,12 +2155,16 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
     };
 
     let mut graph_loader = |path: &vfs::AbsPath| {
-        let is_local = path == detached_file_abs_path.as_path();
+        let abs_path = path.to_path_buf();
+        let is_local = forced_local_paths.contains(&abs_path)
+            || package_roots.iter().any(|package_root| {
+                package_root.is_local && package_root_contains_path(package_root, path)
+            });
         load_file(path, is_local)
     };
     let (crate_graph, _) = workspace.to_crate_graph(&mut graph_loader, &cargo_config.extra_env);
 
-    for package_root in workspace.to_roots() {
+    for package_root in package_roots {
         let excluded_prefixes: Vec<std::path::PathBuf> = package_root
             .exclude
             .iter()
@@ -2176,19 +2190,177 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
         roots.push(SourceRoot::new_local(local_file_set));
     }
 
-    let user_file_id = *file_ids_by_path
-        .get(&detached_file_abs_path)
-        .expect("detached user file was not loaded into source roots");
-
     source_change.set_roots(roots);
     source_change.set_crate_graph(crate_graph);
 
     let mut db = TestDB::default();
     source_change.apply(&mut db);
+    (db, file_ids_by_path)
+}
 
+/// Load sysroot crates through project-model's metadata-first flow (with stitched
+/// fallback), then attach detached user source as the local crate.
+fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_db::Crate) {
+    use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind};
+    use vfs::AbsPathBuf;
+
+    let detached_file_path = AbsPathBuf::assert_utf8(std::env::temp_dir().join("rac_test_main.rs"));
+    let detached_file_manifest =
+        ManifestPath::try_from(detached_file_path.clone()).expect("detached file path");
+
+    let cargo_config = std_test_cargo_config();
+    let mut workspace =
+        ProjectWorkspace::load_detached_file(&detached_file_manifest, &cargo_config)
+            .unwrap_or_else(|e| panic!("failed to load detached workspace: {e:#}"));
+    workspace.kind =
+        ProjectWorkspaceKind::DetachedFile { file: detached_file_manifest.clone(), cargo: None };
+
+    let mut file_overrides = HashMap::new();
+    file_overrides.insert(detached_file_path.clone(), user_src.to_owned());
+    let forced_local_paths = HashSet::from([detached_file_path.clone()]);
+    let (db, file_ids_by_path) = load_project_workspace_into_test_db(
+        &workspace,
+        &cargo_config,
+        &file_overrides,
+        &forced_local_paths,
+    );
+
+    let user_file_id = *file_ids_by_path
+        .get(&detached_file_path)
+        .expect("detached user file was not loaded into source roots");
     let user_crate = module_for_file(&db, user_file_id).krate(&db);
     let user_file = EditionedFileId::new(&db, user_file_id, Edition::Edition2021, user_crate);
     (db, user_file, user_crate)
+}
+
+#[derive(Clone, Copy)]
+struct SourceDependency<'a> {
+    name: &'a str,
+    lib_rs: &'a str,
+    deps: &'a [&'a str],
+}
+
+struct TempCargoWorkspace {
+    root: std::path::PathBuf,
+}
+
+impl TempCargoWorkspace {
+    fn new(
+        test_name: &str,
+        main_src: &str,
+        root_deps: &[&str],
+        deps: &[SourceDependency<'_>],
+    ) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "rac_source_workspace_{test_name}_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).expect("create temp cargo workspace root");
+
+        write_workspace_file(
+            &root.join("Cargo.toml"),
+            &workspace_manifest_contents(deps.iter().map(|dep| dep.name)),
+        );
+        write_workspace_crate(&root, "main", "main_crate", main_src, root_deps);
+        for dep in deps {
+            write_workspace_crate(&root, dep.name, dep.name, dep.lib_rs, dep.deps);
+        }
+
+        Self { root }
+    }
+
+    fn main_manifest_path(&self) -> vfs::AbsPathBuf {
+        vfs::AbsPathBuf::assert_utf8(self.root.join("main/Cargo.toml"))
+    }
+
+    fn main_lib_path(&self) -> vfs::AbsPathBuf {
+        vfs::AbsPathBuf::assert_utf8(self.root.join("main/src/lib.rs"))
+    }
+}
+
+impl Drop for TempCargoWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn workspace_manifest_contents<'a>(deps: impl Iterator<Item = &'a str>) -> String {
+    let mut members = vec!["\"main\"".to_owned()];
+    members.extend(deps.map(|dep| format!("\"{dep}\"")));
+    format!("[workspace]\nresolver = \"2\"\nmembers = [{}]\n", members.join(", "))
+}
+
+fn lib_crate_manifest_contents(package_name: &str, deps: &[&str]) -> String {
+    let mut manifest =
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n");
+    if !deps.is_empty() {
+        manifest.push_str("\n[dependencies]\n");
+        for dep in deps {
+            manifest.push_str(&format!("{dep} = {{ path = \"../{dep}\" }}\n"));
+        }
+    }
+    manifest
+}
+
+fn write_workspace_crate(
+    root: &std::path::Path,
+    dir_name: &str,
+    package_name: &str,
+    lib_rs: &str,
+    deps: &[&str],
+) {
+    let crate_dir = root.join(dir_name);
+    let src_dir = crate_dir.join("src");
+    std::fs::create_dir_all(&src_dir).expect("create workspace crate src dir");
+    write_workspace_file(
+        &crate_dir.join("Cargo.toml"),
+        &lib_crate_manifest_contents(package_name, deps),
+    );
+    write_workspace_file(&src_dir.join("lib.rs"), lib_rs);
+}
+
+fn write_workspace_file(path: &std::path::Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create workspace file parent dir");
+    }
+    std::fs::write(path, contents)
+        .unwrap_or_else(|e| panic!("write {} failed: {e}", path.display()));
+}
+
+fn load_sysroot_and_source_workspace(
+    test_name: &str,
+    main_src: &str,
+    root_deps: &[&str],
+    deps: &[SourceDependency<'_>],
+) -> (TempCargoWorkspace, TestDB, EditionedFileId, base_db::Crate) {
+    use project_model::{ManifestPath, ProjectManifest, ProjectWorkspace};
+
+    let temp_workspace = TempCargoWorkspace::new(test_name, main_src, root_deps, deps);
+    let cargo_config = std_test_cargo_config();
+    let manifest_path =
+        ManifestPath::try_from(temp_workspace.main_manifest_path()).expect("main Cargo.toml path");
+    let workspace =
+        ProjectWorkspace::load(ProjectManifest::CargoToml(manifest_path), &cargo_config, &|_| {})
+            .unwrap_or_else(|e| panic!("failed to load source-dependency workspace: {e:#}"));
+
+    let main_lib_path = temp_workspace.main_lib_path();
+    let forced_local_paths = HashSet::from([main_lib_path.clone()]);
+    let (db, file_ids_by_path) = load_project_workspace_into_test_db(
+        &workspace,
+        &cargo_config,
+        &HashMap::default(),
+        &forced_local_paths,
+    );
+    let main_file_id = *file_ids_by_path
+        .get(&main_lib_path)
+        .expect("main crate lib.rs was not loaded into source roots");
+    let main_crate = module_for_file(&db, main_file_id).krate(&db);
+    let main_file = EditionedFileId::new(&db, main_file_id, Edition::Edition2021, main_crate);
+    (temp_workspace, db, main_file, main_crate)
 }
 
 /// JIT harness for std calls in the mirdataless architecture.
@@ -2199,11 +2371,15 @@ fn load_sysroot_and_user_code(user_src: &str) -> (TestDB, EditionedFileId, base_
 ///   (commonly `#[inline]`) are compiled.
 /// - Cross-crate monomorphic calls are left as imports and resolved from libstd/libc
 ///   through symbol mangling + disambiguators (`RA_MIRDATA` metadata only).
-fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
+fn jit_run_loaded_with_std<R: Copy>(
+    db: TestDB,
+    file_id: EditionedFileId,
+    local_crate: base_db::Crate,
+    entry: &str,
+) -> R {
     let libstd_handle = load_libstd_global();
     let disambiguators = crate::link::extract_crate_disambiguators()
         .expect("failed to load crate disambiguators; run via `just test-clif`");
-    let (db, file_id, local_crate) = load_sysroot_and_user_code(src);
 
     attach_db(&db, || {
         let isa = crate::build_host_isa(false);
@@ -2459,6 +2635,23 @@ fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
             f()
         }
     })
+}
+
+fn jit_run_with_std<R: Copy>(src: &str, entry: &str) -> R {
+    let (db, file_id, local_crate) = load_sysroot_and_user_code(src);
+    jit_run_loaded_with_std(db, file_id, local_crate, entry)
+}
+
+fn jit_run_with_std_source_deps<R: Copy>(
+    test_name: &str,
+    main_src: &str,
+    root_deps: &[&str],
+    deps: &[SourceDependency<'_>],
+    entry: &str,
+) -> R {
+    let (_temp_workspace, db, file_id, local_crate) =
+        load_sysroot_and_source_workspace(test_name, main_src, root_deps, deps);
+    jit_run_loaded_with_std(db, file_id, local_crate, entry)
 }
 
 fn host_supports_atomic_128() -> bool {
@@ -3817,7 +4010,10 @@ static COUNTER: AtomicUsize = AtomicUsize::new(5);
     let static_id = find_static(&db, file_id, "COUNTER");
     let interner = DbInterner::new_with(&db, krate);
     attach_db(&db, || {
-        assert!(!hir_ty::freeze::is_freeze_mono(interner, crate::static_pointee_ty(&db, static_id)));
+        assert!(!hir_ty::freeze::is_freeze_mono(
+            interner,
+            crate::static_pointee_ty(&db, static_id)
+        ));
     });
 }
 
@@ -5133,6 +5329,71 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_source_dep_vec_smoke() {
+    let deps = [SourceDependency {
+        name: "dep_vec",
+        lib_rs: r#"
+pub fn pop_and_count() -> i32 {
+    let mut items = vec![10, 20, 30];
+    let tail = items.pop().unwrap();
+    tail + items.len() as i32
+}
+"#,
+        deps: &[],
+    }];
+
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_vec_smoke",
+        r#"
+fn foo() -> i32 {
+    dep_vec::pop_and_count()
+}
+"#,
+        &["dep_vec"],
+        &deps,
+        "foo",
+    );
+    assert_eq!(result, 32);
+}
+
+#[test]
+fn std_jit_source_dep_transitive_generic_smoke() {
+    let deps = [
+        SourceDependency {
+            name: "dep_math",
+            lib_rs: r#"
+pub fn pick<T: Copy>(a: T, b: T, first: bool) -> T {
+    if first { a } else { b }
+}
+"#,
+            deps: &[],
+        },
+        SourceDependency {
+            name: "dep_chain",
+            lib_rs: r#"
+pub fn compute() -> i32 {
+    dep_math::pick(40, 2, true) + dep_math::pick(10, 1, false)
+}
+"#,
+            deps: &["dep_math"],
+        },
+    ];
+
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_transitive_generic_smoke",
+        r#"
+fn foo() -> i32 {
+    dep_chain::compute()
+}
+"#,
+        &["dep_chain"],
+        &deps,
+        "foo",
+    );
+    assert_eq!(result, 41);
 }
 
 // ---------------------------------------------------------------------------
