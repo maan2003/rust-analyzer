@@ -3906,6 +3906,198 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_vecdeque_push_pop_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::collections::VecDeque;
+
+fn foo() -> i32 {
+    let mut q = VecDeque::new();
+    q.push_back(2_i32);
+    q.push_front(1_i32);
+    q.push_back(3_i32);
+
+    let first = q.pop_front();
+    let last = q.pop_back();
+
+    match (first, last) {
+        (Some(a), Some(b)) => (a == 1 && b == 3 && q.len() == 1 && q[0] == 2) as i32,
+        _ => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_binary_heap_pop_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::collections::BinaryHeap;
+
+fn foo() -> i32 {
+    let mut heap = BinaryHeap::new();
+    heap.push(10_i32);
+    heap.push(4_i32);
+    heap.push(7_i32);
+
+    match (heap.pop(), heap.pop(), heap.pop()) {
+        (Some(a), Some(b), Some(c)) => (a == 10 && b == 7 && c == 4) as i32,
+        _ => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_hashset_insert_contains_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+use std::collections::HashSet;
+
+fn foo() -> i32 {
+    let mut set = HashSet::new();
+    set.insert(10_i32);
+    set.insert(20_i32);
+    set.insert(10_i32);
+
+    (set.contains(&10) && set.contains(&20) && !set.contains(&30) && set.len() == 2) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_iter_filter_map_sum_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let sum: i32 = (0_i32..10)
+        .filter(|x| x % 2 == 0)
+        .map(|x| x * 3)
+        .sum();
+    (sum == 60) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_str_split_whitespace_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut iter = "  alpha beta   gamma ".split_whitespace();
+    match (iter.next(), iter.next(), iter.next(), iter.next()) {
+        (Some(a), Some(b), Some(c), None) => (a == "alpha" && b == "beta" && c == "gamma") as i32,
+        _ => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_rwlock_read_write_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let lock = std::sync::RwLock::new(40_i32);
+
+    {
+        match lock.write() {
+            Ok(mut guard) => *guard += 2,
+            Err(_) => return 0,
+        }
+    }
+
+    match lock.read() {
+        Ok(guard) => (*guard == 42) as i32,
+        Err(_) => 0,
+    }
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_once_lock_get_or_init_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let cell = std::sync::OnceLock::<String>::new();
+    let first = cell.get_or_init(|| String::from("alpha"));
+    let second = cell.get_or_init(|| String::from("beta"));
+    (first == "alpha" && second == "alpha" && cell.get().is_some()) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_fs_read_dir_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn foo() -> i32 {
+    let mut dir = std::env::temp_dir();
+    dir.push("cg_clif_std_jit_fs_read_dir_probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir(&dir).is_err() {
+        return 0;
+    }
+
+    let mut file = dir.clone();
+    file.push("data.txt");
+    if std::fs::write(&file, b"abc").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return 0;
+    }
+
+    let mut saw_file = false;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return 0;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return 0;
+            }
+        };
+        saw_file |= entry.file_name() == "data.txt";
+    }
+
+    let removed = std::fs::remove_dir_all(&dir).is_ok();
+    (saw_file && removed) as i32
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
 fn const_eval_raw_ptr_preserves_backing_allocation() {
     let (db, file_ids) = TestDB::with_many_files(
         r#"
