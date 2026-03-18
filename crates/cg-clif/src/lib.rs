@@ -2741,7 +2741,7 @@ pub(crate) fn codegen_get_discriminant(
             }
         }
         Variants::Empty => {
-            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+            fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             iconst_from_bits(&mut fx.bcx, dest_clif_ty, 0)
         }
     }
@@ -8469,6 +8469,50 @@ fn address_taken_locals(body: &MirBody) -> std::collections::HashSet<LocalId> {
     result
 }
 
+fn reachable_runtime_blocks(body: &MirBody) -> std::collections::HashSet<BasicBlockId> {
+    let mut reachable = std::collections::HashSet::new();
+    let mut worklist = vec![body.start_block];
+
+    while let Some(bb) = worklist.pop() {
+        if !reachable.insert(bb) {
+            continue;
+        }
+
+        let Some(term) = body.basic_blocks[bb].terminator.as_ref() else {
+            continue;
+        };
+
+        match &term.kind {
+            TerminatorKind::Goto { target } => worklist.push(*target),
+            TerminatorKind::SwitchInt { targets, .. } => {
+                worklist.extend(targets.all_targets().iter().copied());
+            }
+            TerminatorKind::Call { target, .. } => {
+                if let Some(target) = target {
+                    worklist.push(*target);
+                }
+            }
+            TerminatorKind::Assert { target, .. } => worklist.push(*target),
+            TerminatorKind::Drop { target, .. } => worklist.push(*target),
+            TerminatorKind::FalseEdge { real_target, .. } => worklist.push(*real_target),
+            TerminatorKind::FalseUnwind { real_target, .. } => worklist.push(*real_target),
+            TerminatorKind::Yield { resume, drop, .. } => {
+                worklist.push(*resume);
+                if let Some(drop) = drop {
+                    worklist.push(*drop);
+                }
+            }
+            TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Abort
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::CoroutineDrop => {}
+        }
+    }
+
+    reachable
+}
+
 fn store_fn_param_into_place(
     place: &CPlace,
     param_abi: &abi::ArgAbi,
@@ -8721,6 +8765,28 @@ pub fn compile_fn(
             block_params.len(),
         );
 
+        let arg_uninhabited = body.param_locals.iter().any(|&param_local| {
+            let param_idx_local = param_local.into_raw().into_u32() as usize;
+            local_map[param_idx_local].layout.is_uninhabited()
+        });
+        if arg_uninhabited {
+            bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            bcx.seal_all_blocks();
+            bcx.finalize();
+            let mut ctx = Context::for_function(func);
+            if let Some(pattern) = std::env::var_os("CG_CLIF_DUMP_FN_MATCH")
+                && fn_name.contains(pattern.to_string_lossy().as_ref())
+            {
+                eprintln!("-- function: {fn_name} --\n{}", ctx.func.display());
+            }
+            module.define_function(func_id, &mut ctx).map_err(|e| {
+                format!("define_function: {e}\n-- function: {fn_name} --\n{}", ctx.func.display(),)
+            })?;
+            return Ok(func_id);
+        }
+
+        let reachable_blocks = reachable_runtime_blocks(body);
+
         // Create drop flags for locals that have drop glue.
         // r-a's MIR lacks drop elaboration, so Drop terminators fire even
         // for locals that have been moved out. Drop flags (0=dead, 1=live)
@@ -8772,6 +8838,11 @@ pub fn compile_fn(
             let clif_block = fx.clif_block(bb_id);
             if bb_id != body.start_block {
                 fx.bcx.switch_to_block(clif_block);
+            }
+
+            if !reachable_blocks.contains(&bb_id) {
+                fx.bcx.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                continue;
             }
 
             for stmt in &bb.statements {
