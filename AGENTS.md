@@ -15,7 +15,7 @@ cargo .. -p .. is slow, avoid it.
 
 Use `jj commit -m "<short commit message>"` to create commits.
 
-AVOID HACKS, just say it to the user
+Always do arhictectural and principled fixes instead of paper over stuff.
 
 You are in a "vibe coding" setting, user doesn't review the code, so you have to be very clear when
 you are doing a hack or something that will bite us in future.
