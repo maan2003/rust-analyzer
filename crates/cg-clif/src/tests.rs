@@ -2238,6 +2238,7 @@ struct SourceDependency<'a> {
     name: &'a str,
     lib_rs: &'a str,
     deps: &'a [&'a str],
+    extra_manifest_deps: &'a str,
 }
 
 struct TempCargoWorkspace {
@@ -2249,6 +2250,7 @@ impl TempCargoWorkspace {
         test_name: &str,
         main_src: &str,
         root_deps: &[&str],
+        root_extra_manifest_deps: &str,
         deps: &[SourceDependency<'_>],
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -2265,9 +2267,23 @@ impl TempCargoWorkspace {
             &root.join("Cargo.toml"),
             &workspace_manifest_contents(deps.iter().map(|dep| dep.name)),
         );
-        write_workspace_crate(&root, "main", "main_crate", main_src, root_deps);
+        write_workspace_crate(
+            &root,
+            "main",
+            "main_crate",
+            main_src,
+            root_deps,
+            root_extra_manifest_deps,
+        );
         for dep in deps {
-            write_workspace_crate(&root, dep.name, dep.name, dep.lib_rs, dep.deps);
+            write_workspace_crate(
+                &root,
+                dep.name,
+                dep.name,
+                dep.lib_rs,
+                dep.deps,
+                dep.extra_manifest_deps,
+            );
         }
 
         Self { root }
@@ -2294,13 +2310,21 @@ fn workspace_manifest_contents<'a>(deps: impl Iterator<Item = &'a str>) -> Strin
     format!("[workspace]\nresolver = \"2\"\nmembers = [{}]\n", members.join(", "))
 }
 
-fn lib_crate_manifest_contents(package_name: &str, deps: &[&str]) -> String {
+fn lib_crate_manifest_contents(
+    package_name: &str,
+    deps: &[&str],
+    extra_manifest_deps: &str,
+) -> String {
     let mut manifest =
         format!("[package]\nname = \"{package_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n");
-    if !deps.is_empty() {
+    if !deps.is_empty() || !extra_manifest_deps.trim().is_empty() {
         manifest.push_str("\n[dependencies]\n");
         for dep in deps {
             manifest.push_str(&format!("{dep} = {{ path = \"../{dep}\" }}\n"));
+        }
+        manifest.push_str(extra_manifest_deps);
+        if !extra_manifest_deps.is_empty() && !extra_manifest_deps.ends_with('\n') {
+            manifest.push('\n');
         }
     }
     manifest
@@ -2312,13 +2336,14 @@ fn write_workspace_crate(
     package_name: &str,
     lib_rs: &str,
     deps: &[&str],
+    extra_manifest_deps: &str,
 ) {
     let crate_dir = root.join(dir_name);
     let src_dir = crate_dir.join("src");
     std::fs::create_dir_all(&src_dir).expect("create workspace crate src dir");
     write_workspace_file(
         &crate_dir.join("Cargo.toml"),
-        &lib_crate_manifest_contents(package_name, deps),
+        &lib_crate_manifest_contents(package_name, deps, extra_manifest_deps),
     );
     write_workspace_file(&src_dir.join("lib.rs"), lib_rs);
 }
@@ -2335,11 +2360,13 @@ fn load_sysroot_and_source_workspace(
     test_name: &str,
     main_src: &str,
     root_deps: &[&str],
+    root_extra_manifest_deps: &str,
     deps: &[SourceDependency<'_>],
 ) -> (TempCargoWorkspace, TestDB, EditionedFileId, base_db::Crate) {
     use project_model::{ManifestPath, ProjectManifest, ProjectWorkspace};
 
-    let temp_workspace = TempCargoWorkspace::new(test_name, main_src, root_deps, deps);
+    let temp_workspace =
+        TempCargoWorkspace::new(test_name, main_src, root_deps, root_extra_manifest_deps, deps);
     let cargo_config = std_test_cargo_config();
     let manifest_path =
         ManifestPath::try_from(temp_workspace.main_manifest_path()).expect("main Cargo.toml path");
@@ -2646,11 +2673,17 @@ fn jit_run_with_std_source_deps<R: Copy>(
     test_name: &str,
     main_src: &str,
     root_deps: &[&str],
+    root_extra_manifest_deps: &str,
     deps: &[SourceDependency<'_>],
     entry: &str,
 ) -> R {
-    let (_temp_workspace, db, file_id, local_crate) =
-        load_sysroot_and_source_workspace(test_name, main_src, root_deps, deps);
+    let (_temp_workspace, db, file_id, local_crate) = load_sysroot_and_source_workspace(
+        test_name,
+        main_src,
+        root_deps,
+        root_extra_manifest_deps,
+        deps,
+    );
     jit_run_loaded_with_std(db, file_id, local_crate, entry)
 }
 
@@ -5343,6 +5376,7 @@ pub fn pop_and_count() -> i32 {
 }
 "#,
         deps: &[],
+        extra_manifest_deps: "",
     }];
 
     let result: i32 = jit_run_with_std_source_deps(
@@ -5353,6 +5387,7 @@ fn foo() -> i32 {
 }
 "#,
         &["dep_vec"],
+        "",
         &deps,
         "foo",
     );
@@ -5370,6 +5405,7 @@ pub fn pick<T: Copy>(a: T, b: T, first: bool) -> T {
 }
 "#,
             deps: &[],
+            extra_manifest_deps: "",
         },
         SourceDependency {
             name: "dep_chain",
@@ -5379,6 +5415,7 @@ pub fn compute() -> i32 {
 }
 "#,
             deps: &["dep_math"],
+            extra_manifest_deps: "",
         },
     ];
 
@@ -5390,10 +5427,97 @@ fn foo() -> i32 {
 }
 "#,
         &["dep_chain"],
+        "",
         &deps,
         "foo",
     );
     assert_eq!(result, 41);
+}
+
+#[test]
+fn std_jit_source_dep_crossbeam_probe() {
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_crossbeam_probe",
+        r#"
+use crossbeam::utils::CachePadded;
+
+fn foo() -> i32 {
+    let value = CachePadded::new(42_i32);
+    *value
+}
+"#,
+        &[],
+        "crossbeam = \"0.8.4\"\n",
+        &[],
+        "foo",
+    );
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn std_jit_source_dep_crossbeam_channel_probe() {
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_crossbeam_channel_probe",
+        r#"
+use crossbeam::channel::unbounded;
+
+fn foo() -> i32 {
+    let (sender, receiver) = unbounded();
+    sender.send(17_i32).unwrap();
+    let value = receiver.recv().unwrap() + receiver.is_empty() as i32;
+    std::mem::forget(sender);
+    std::mem::forget(receiver);
+    value
+}
+"#,
+        &[],
+        "crossbeam = \"0.8.4\"\n",
+        &[],
+        "foo",
+    );
+    assert_eq!(result, 18);
+}
+
+#[test]
+fn std_jit_source_dep_regex_is_match_probe() {
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_regex_is_match_probe",
+        r#"
+use regex::Regex;
+
+fn foo() -> i32 {
+    let re = Regex::new(r"ticket-\d{3}").unwrap();
+    re.is_match("ticket-123") as i32 + re.is_match("ticket-12") as i32 * 10
+}
+"#,
+        &[],
+        "regex = { version = \"1.12.3\", default-features = false, features = [\"std\"] }\n",
+        &[],
+        "foo",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn std_jit_source_dep_regex_captures_probe() {
+    let result: i32 = jit_run_with_std_source_deps(
+        "source_dep_regex_captures_probe",
+        r#"
+use regex::Regex;
+
+fn foo() -> i32 {
+    let re = Regex::new(r"(\d+)-(\d+)").unwrap();
+    let caps = re.captures("12-30").unwrap();
+    caps.get(1).unwrap().as_str().parse::<i32>().unwrap()
+        + caps.get(2).unwrap().as_str().parse::<i32>().unwrap()
+}
+"#,
+        &[],
+        "regex = { version = \"1.12.3\", default-features = false, features = [\"std\"] }\n",
+        &[],
+        "foo",
+    );
+    assert_eq!(result, 42);
 }
 
 // ---------------------------------------------------------------------------
