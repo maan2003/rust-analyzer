@@ -3545,6 +3545,103 @@ fn foo() -> i32 {
 }
 
 #[test]
+fn std_jit_option_dyn_trait_niche_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+trait Animal {
+    fn legs(&self) -> i32;
+}
+
+struct Dog;
+
+impl Animal for Dog {
+    fn legs(&self) -> i32 { 4 }
+}
+
+fn pick<'a>(flag: bool, dog: &'a Dog) -> Option<&'a dyn Animal> {
+    if flag { Some(dog) } else { None }
+}
+
+fn foo() -> i32 {
+    let dog = Dog;
+    let some = pick(true, &dog);
+    let none = pick(false, &dog);
+
+    let score = match some {
+        Some(animal) => animal.legs(),
+        None => 0,
+    } + match none {
+        Some(_) => 100,
+        None => 2,
+    };
+
+    score
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 6);
+}
+
+#[test]
+fn std_jit_dst_field_align_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+struct Foo<T: ?Sized> {
+    a: u16,
+    b: T,
+}
+
+trait Bar {
+    fn get(&self) -> usize;
+}
+
+impl Bar for usize {
+    fn get(&self) -> usize { *self }
+}
+
+struct Baz<T: ?Sized> {
+    a: T,
+}
+
+struct HasDrop<T: ?Sized> {
+    ptr: Box<usize>,
+    data: T,
+}
+
+fn foo() -> i32 {
+    let base: Foo<usize> = Foo { a: 0, b: 11 };
+    let ptr1 = &base.b as *const usize as usize;
+
+    let wide: &Foo<dyn Bar> = &base;
+    let ptr2 = (&wide.b as *const dyn Bar) as *const () as usize;
+
+    let nested: Foo<Foo<usize>> = Foo { a: 0, b: Foo { a: 1, b: 17 } };
+    let nested_wide: &Foo<Foo<dyn Bar>> = &nested;
+
+    let &Foo { a: _, b: ref bar } = wide;
+
+    let dropped: HasDrop<Baz<[i32; 4]>> =
+        HasDrop { ptr: Box::new(0), data: Baz { a: [1, 2, 3, 4] } };
+    let dropped_wide: &HasDrop<Baz<[i32]>> = &dropped;
+
+    let mut score = 0_i32;
+    score |= (wide.b.get() == 11) as i32;
+    score |= ((ptr1 == ptr2) as i32) << 1;
+    score |= ((nested_wide.b.b.get() == 17) as i32) << 2;
+    score |= ((bar.get() == 11) as i32) << 3;
+    score |= ((*dropped_wide.ptr == 0) as i32) << 4;
+    score |= ((dropped_wide.data.a[3] == 4) as i32) << 5;
+
+    score
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 0b11_1111);
+}
+
+#[test]
 fn std_jit_btreemap_get_probe() {
     let result: i32 = jit_run_with_std(
         r#"
@@ -3783,6 +3880,29 @@ fn foo() -> i32 {
         "foo",
     );
     assert_eq!(result, 3);
+}
+
+#[test]
+fn std_jit_non_capturing_closure_fn_pointer_probe() {
+    let result: i32 = jit_run_with_std(
+        r#"
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+
+fn foo() -> i32 {
+    let add_one: fn(i32) -> i32 = |x| x + 1;
+    let double: fn(i32) -> i32 = |x| x * 2;
+    let table = [add_one, double];
+
+    let left = apply(table[0], 20);
+    let right = apply(table[1], 10);
+    left + right + 1
+}
+"#,
+        "foo",
+    );
+    assert_eq!(result, 42);
 }
 
 #[test]
