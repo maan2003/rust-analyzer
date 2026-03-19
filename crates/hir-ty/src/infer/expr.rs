@@ -16,7 +16,8 @@ use hir_def::{FunctionId, hir::ClosureKind};
 use hir_expand::name::Name;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
-    CoroutineArgs, CoroutineArgsParts, InferTy, Interner,
+    CoroutineArgs, CoroutineArgsParts, InferTy, Interner, TypeSuperVisitable, TypeVisitable,
+    TypeVisitor,
     inherent::{AdtDef, GenericArgs as _, IntoKind, Ty as _},
 };
 use syntax::ast::RangeOp;
@@ -35,7 +36,7 @@ use crate::{
     lower::{GenericPredicates, lower_mutability},
     method_resolution::{self, CandidateId, MethodCallee, MethodError},
     next_solver::{
-        ErrorGuaranteed, FnSig, GenericArg, GenericArgs, TraitRef, Ty, TyKind, TypeError,
+        ErrorGuaranteed, GenericArg, GenericArgs, TraitRef, Ty, TyKind, TypeError,
         infer::{
             BoundRegionConversionTime, InferOk,
             traits::{Obligation, ObligationCause},
@@ -58,6 +59,25 @@ pub(crate) enum ExprIsRead {
 }
 
 impl<'db> InferenceContext<'_, 'db> {
+    fn ty_contains_rvalue_like_unsized(&self, ty: Ty<'db>) -> bool {
+        struct ContainsRvalueLikeUnsized;
+
+        impl<'db> TypeVisitor<crate::next_solver::DbInterner<'db>> for ContainsRvalueLikeUnsized {
+            type Result = std::ops::ControlFlow<()>;
+
+            fn visit_ty(&mut self, ty: Ty<'db>) -> Self::Result {
+                match ty.kind() {
+                    TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) => {
+                        std::ops::ControlFlow::Break(())
+                    }
+                    _ => ty.super_visit_with(self),
+                }
+            }
+        }
+
+        ty.visit_with(&mut ContainsRvalueLikeUnsized).is_break()
+    }
+
     pub(crate) fn infer_expr(
         &mut self,
         tgt_expr: ExprId,
@@ -1377,7 +1397,7 @@ impl<'db> InferenceContext<'_, 'db> {
             .expect("infer_return called outside function body")
             .expected_ty();
         let return_expr_ty =
-            self.infer_expr_inner(expr, &Expectation::HasType(ret_ty), ExprIsRead::Yes);
+            self.infer_expr_coerce(expr, &Expectation::HasType(ret_ty), ExprIsRead::Yes);
         let mut coerce_many = self.return_coercion.take().unwrap();
         coerce_many.coerce(self, &ObligationCause::new(), expr, return_expr_ty, ExprIsRead::Yes);
         self.return_coercion = Some(coerce_many);
@@ -1476,13 +1496,7 @@ impl<'db> InferenceContext<'_, 'db> {
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let {
-                            pat,
-                            type_ref,
-                            initializer,
-                            else_branch,
-                            ..
-                        } => {
+                        Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                             let decl_ty = type_ref
                                 .as_ref()
                                 .map(|&tr| this.make_body_ty(tr))
@@ -1714,7 +1728,7 @@ impl<'db> InferenceContext<'_, 'db> {
                 });
                 match resolved {
                     Ok((func, _is_visible)) => {
-                        self.check_method_call(tgt_expr, &[], func.sig, expected)
+                        self.check_method_call(tgt_expr, &[], func, expected)
                     }
                     Err(_) => self.err_ty(),
                 }
@@ -1813,6 +1827,17 @@ impl<'db> InferenceContext<'_, 'db> {
         is_varargs: bool,
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
+        if let Some(expected_ty) = expected.only_has_type(&mut self.table)
+            && !self.ty_contains_rvalue_like_unsized(expected_ty)
+        {
+            let _ = self
+                .table
+                .infer_ctxt
+                .at(&ObligationCause::new(), self.table.param_env)
+                .eq(ret_ty, expected_ty)
+                .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+        }
+
         self.register_obligations_for_call(callee_ty);
 
         self.check_call_arguments(
@@ -1854,7 +1879,7 @@ impl<'db> InferenceContext<'_, 'db> {
                         item: func.def_id.into(),
                     })
                 }
-                self.check_method_call(tgt_expr, args, func.sig, expected)
+                self.check_method_call(tgt_expr, args, func, expected)
             }
             // Failed to resolve, report diagnostic and try to resolve as call to field access or
             // assoc function
@@ -1943,9 +1968,10 @@ impl<'db> InferenceContext<'_, 'db> {
         &mut self,
         tgt_expr: ExprId,
         args: &[ExprId],
-        sig: FnSig<'db>,
+        callee: MethodCallee<'db>,
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
+        let sig = callee.sig;
         let param_tys = if !sig.inputs_and_output.inputs().is_empty() {
             &sig.inputs_and_output.inputs()[1..]
         } else {
@@ -1953,6 +1979,22 @@ impl<'db> InferenceContext<'_, 'db> {
         };
         let ret_ty = sig.output();
 
+        if let Some(expected_ty) = expected.only_has_type(&mut self.table)
+            && !self.ty_contains_rvalue_like_unsized(expected_ty)
+        {
+            let _ = self
+                .table
+                .infer_ctxt
+                .at(&ObligationCause::new(), self.table.param_env)
+                .eq(ret_ty, expected_ty)
+                .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+        }
+
+        self.register_obligations_for_call(Ty::new_fn_def(
+            self.interner(),
+            CallableDefId::FunctionId(callee.def_id).into(),
+            callee.args,
+        ));
         self.check_call_arguments(tgt_expr, param_tys, ret_ty, expected, args, &[], sig.c_variadic);
         ret_ty
     }
@@ -1973,51 +2015,64 @@ impl<'db> InferenceContext<'_, 'db> {
         // Whether the function is variadic, for example when imported from C
         c_variadic: bool,
     ) {
-        // First, let's unify the formal method signature with the expectation eagerly.
-        // We use this to guide coercion inference; it's output is "fudged" which means
-        // any remaining type variables are assigned to new, unrelated variables. This
-        // is because the inference guidance here is only speculative.
-        let formal_output = self.table.resolve_vars_with_obligations(formal_output);
-        let expected_input_tys: Option<Vec<_>> = expectation
-            .only_has_type(&mut self.table)
-            .and_then(|expected_output| {
-                self.table
-                    .infer_ctxt
-                    .fudge_inference_if_ok(|| {
-                        let mut ocx = ObligationCtxt::new(&self.table.infer_ctxt);
+        let compute_expected_input_tys = |this: &mut Self| {
+            // First, let's unify the formal method signature with the expectation eagerly.
+            // We use this to guide coercion inference; its output is "fudged", which means
+            // any remaining type variables are assigned to new, unrelated variables.
+            let formal_output = this.table.resolve_vars_with_obligations(formal_output);
+            let expected_input_tys: Option<Vec<_>> = expectation
+                .only_has_type(&mut this.table)
+                .filter(|&expected_output| {
+                    matches!(
+                        Expectation::rvalue_hint(this, expected_output),
+                        Expectation::HasType(_)
+                    )
+                })
+                .and_then(|expected_output| {
+                    this.table
+                        .infer_ctxt
+                        .fudge_inference_if_ok(|| {
+                            let mut ocx = ObligationCtxt::new(&this.table.infer_ctxt);
+                            let origin = ObligationCause::new();
+                            ocx.sup(&origin, this.table.param_env, expected_output, formal_output)?;
+                            if !ocx.try_evaluate_obligations().is_empty() {
+                                return Err(TypeError::Mismatch);
+                            }
 
-                        // Attempt to apply a subtyping relationship between the formal
-                        // return type (likely containing type variables if the function
-                        // is polymorphic) and the expected return type.
-                        // No argument expectations are produced if unification fails.
-                        let origin = ObligationCause::new();
-                        ocx.sup(&origin, self.table.param_env, expected_output, formal_output)?;
-                        if !ocx.try_evaluate_obligations().is_empty() {
-                            return Err(TypeError::Mismatch);
-                        }
+                            Ok(Some(
+                                formal_input_tys
+                                    .iter()
+                                    .map(|&ty| this.table.infer_ctxt.resolve_vars_if_possible(ty))
+                                    .collect(),
+                            ))
+                        })
+                        .ok()
+                })
+                .unwrap_or_default();
 
-                        // Record all the argument types, with the args
-                        // produced from the above subtyping unification.
-                        Ok(Some(
-                            formal_input_tys
-                                .iter()
-                                .map(|&ty| self.table.infer_ctxt.resolve_vars_if_possible(ty))
-                                .collect(),
-                        ))
-                    })
-                    .ok()
-            })
-            .unwrap_or_default();
-
-        // If there are no external expectations at the call site, just use the types from the function defn
-        let expected_input_tys = if let Some(expected_input_tys) = &expected_input_tys {
-            assert_eq!(expected_input_tys.len(), formal_input_tys.len());
             expected_input_tys
-        } else {
-            formal_input_tys
+                .unwrap_or_else(|| formal_input_tys.to_vec())
+                .into_iter()
+                .zip(formal_input_tys.iter().copied())
+                .map(|(expected_ty, formal_ty)| {
+                    let expected_ty = this.table.resolve_vars_with_obligations(expected_ty);
+                    match expected_ty.kind() {
+                        TyKind::Infer(rustc_type_ir::TyVar(_)) => formal_ty,
+                        _ if matches!(formal_ty.kind(), TyKind::Infer(rustc_type_ir::TyVar(_)))
+                            && matches!(
+                                Expectation::rvalue_hint(this, expected_ty),
+                                Expectation::RValueLikeUnsized(_)
+                            ) =>
+                        {
+                            formal_ty
+                        }
+                        _ => expected_ty,
+                    }
+                })
+                .collect::<Vec<_>>()
         };
 
-        let minimum_input_count = expected_input_tys.len();
+        let minimum_input_count = formal_input_tys.len();
         let provided_arg_count = provided_args.len() - skip_indices.len();
 
         // Keep track of whether we *could possibly* be satisfied, i.e. whether we're on the happy path
@@ -2033,7 +2088,7 @@ impl<'db> InferenceContext<'_, 'db> {
         if !args_count_matches {
             self.push_diagnostic(InferenceDiagnostic::MismatchedArgCount {
                 call_expr,
-                expected: expected_input_tys.len() + skip_indices.len(),
+                expected: minimum_input_count + skip_indices.len(),
                 found: provided_args.len(),
             });
         }
@@ -2041,7 +2096,9 @@ impl<'db> InferenceContext<'_, 'db> {
         // We introduce a helper function to demand that a given argument satisfy a given input
         // This is more complicated than just checking type equality, as arguments could be coerced
         // This version writes those types back so further type checking uses the narrowed types
-        let demand_compatible = |this: &mut InferenceContext<'_, 'db>, idx| {
+        let demand_compatible = |this: &mut InferenceContext<'_, 'db>,
+                                 expected_input_tys: &[Ty<'db>],
+                                 idx| {
             let formal_input_ty: Ty<'db> = formal_input_tys[idx];
             let expected_input_ty: Ty<'db> = expected_input_tys[idx];
             let provided_arg = provided_args[idx];
@@ -2109,6 +2166,8 @@ impl<'db> InferenceContext<'_, 'db> {
                 self.table.select_obligations_where_possible();
             }
 
+            let expected_input_tys = compute_expected_input_tys(self);
+
             let mut skip_indices = skip_indices.iter().copied();
             // Check each argument, to satisfy the input it was provided for
             // Visually, we're traveling down the diagonal of the compatibility matrix
@@ -2138,7 +2197,8 @@ impl<'db> InferenceContext<'_, 'db> {
                     continue;
                 }
 
-                if let Err((_error, expected, found)) = demand_compatible(self, idx)
+                if let Err((_error, expected, found)) =
+                    demand_compatible(self, &expected_input_tys, idx)
                     && args_count_matches
                 {
                     // Don't report type mismatches if there is a mismatch in args count.
@@ -2160,9 +2220,12 @@ impl<'db> InferenceContext<'_, 'db> {
                 self.db,
                 GenericDefId::from_callable(self.db, fn_def.0),
             );
+            let instantiated_preds = generic_predicates
+                .iter_instantiated_copied(self.interner(), parameters.as_slice())
+                .collect::<Vec<_>>();
             let param_env = self.table.param_env;
             self.table.register_predicates(clauses_as_obligations(
-                generic_predicates.iter_instantiated_copied(self.interner(), parameters.as_slice()),
+                instantiated_preds.iter().copied(),
                 ObligationCause::new(),
                 param_env,
             ));

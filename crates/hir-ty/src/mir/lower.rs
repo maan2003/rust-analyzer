@@ -2044,10 +2044,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         target_depth: usize,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        let prev = self.storage_scope_override.replace(StorageScopeOverride {
-            source_depth: self.drop_scopes.len(),
-            target_depth,
-        });
+        let prev = self
+            .storage_scope_override
+            .replace(StorageScopeOverride { source_depth: self.drop_scopes.len(), target_depth });
         let result = f(self);
         self.storage_scope_override = prev;
         result
@@ -2059,11 +2058,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
         if is_super {
-            let target_depth = self
-                .drop_scopes
-                .len()
-                .checked_sub(2)
-                .expect("super let requires a parent scope");
+            let target_depth =
+                self.drop_scopes.len().checked_sub(2).expect("super let requires a parent scope");
             self.with_storage_scope_override(target_depth, f)
         } else {
             f(self)
@@ -2116,10 +2112,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         // and has all declarations of the `let`.
                         let resolver_guard =
                             self.resolver.update_to_inner_scope(self.db, self.owner, *expr_id);
-                        (current, else_block) = self.with_statement_storage_scope(
-                            *is_super,
-                            |this| this.pattern_match(current, None, init_place, *pat),
-                        )?;
+                        (current, else_block) = self
+                            .with_statement_storage_scope(*is_super, |this| {
+                                this.pattern_match(current, None, init_place, *pat)
+                            })?;
                         self.resolver.reset_to_guard(resolver_guard);
                         match (else_block, else_branch) {
                             (None, _) => (),
@@ -2395,8 +2391,9 @@ pub fn mir_body_for_closure_query<'db>(
     };
     let (captures, kind) = infer.closure_info(closure);
     let mut ctx = MirLowerCtx::new(db, owner, &body, infer);
+    let sig = ctx.interner().signature_unclosure(substs.as_closure().sig(), Safety::Safe);
     // 0 is return local
-    ctx.result.locals.alloc(Local { ty: infer.expr_ty(*root).store() });
+    ctx.result.locals.alloc(Local { ty: sig.skip_binder().output().store() });
     let closure_local = ctx.result.locals.alloc(Local {
         ty: match kind {
             FnTrait::FnOnce | FnTrait::AsyncFnOnce => infer.expr_ty(expr),
@@ -2416,7 +2413,6 @@ pub fn mir_body_for_closure_query<'db>(
         .store(),
     });
     ctx.result.param_locals.push(closure_local);
-    let sig = ctx.interner().signature_unclosure(substs.as_closure().sig(), Safety::Safe);
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, owner, expr);
     let current = ctx.lower_params_and_bindings(
         args.iter().zip(sig.skip_binder().inputs().iter()).map(|(it, y)| (*it, *y)),

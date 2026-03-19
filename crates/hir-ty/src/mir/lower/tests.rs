@@ -2,7 +2,7 @@ use hir_def::{DefWithBodyId, HasModule, db::DefDatabase};
 use span::Edition;
 use test_fixture::WithFixture;
 
-use crate::{db::HirDatabase, setup_tracing, test_db::TestDB};
+use crate::{InferenceResult, db::HirDatabase, setup_tracing, test_db::TestDB};
 
 fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let _tracing = setup_tracing();
@@ -22,6 +22,28 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     })
 }
 
+fn lower_mir_including_closures(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
+    let _tracing = setup_tracing();
+    let (db, file_ids) = TestDB::with_many_files(ra_fixture);
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let def_map = module_id.def_map(&db);
+        let scope = &def_map[module_id].scope;
+        let funcs = scope.declarations().filter_map(|x| match x {
+            hir_def::ModuleDefId::FunctionId(it) => Some(it),
+            _ => None,
+        });
+        for func in funcs {
+            _ = db.mir_body(func.into());
+            let infer = InferenceResult::for_body(&db, func.into());
+            for closure in infer.closure_info.keys() {
+                _ = db.mir_body_for_closure(*closure);
+            }
+        }
+    })
+}
+
 fn lowered_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
     let _tracing = setup_tracing();
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
@@ -34,7 +56,11 @@ fn lowered_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
             .declarations()
             .find_map(|x| match x {
                 hir_def::ModuleDefId::FunctionId(it)
-                    if db.function_signature(it).name.display(&db, Edition::CURRENT).to_string()
+                    if db
+                        .function_signature(it)
+                        .name
+                        .display(&db, Edition::CURRENT)
+                        .to_string()
                         == "main" =>
                 {
                     Some(it)
@@ -74,6 +100,70 @@ fn foo() {
     (|deserializer| Box::new(())) as DeserializeFn<<dyn CustomValue as Strictest>::Object>;
 }
     "#,
+    );
+}
+
+#[test]
+fn try_in_generic_closure_monomorphizes() {
+    lower_mir(
+        r#"
+//- minicore: try, result, from, fn
+struct BuildError;
+struct Trie;
+impl Trie {
+    fn iter<E, F: FnMut() -> Result<(), E>>(&self, mut f: F) -> Result<(), E> {
+        f()
+    }
+}
+
+struct Utf8Compiler;
+impl Utf8Compiler {
+    fn add(&mut self) -> Result<(), BuildError> {
+        Result::Ok(())
+    }
+}
+
+fn foo(trie: &Trie, utf8c: &mut Utf8Compiler) -> Result<(), BuildError> {
+    trie.iter(|| {
+        utf8c.add()?;
+        Ok(())
+    })?;
+    Ok(())
+}
+    "#,
+    );
+}
+
+#[test]
+fn try_in_generic_closure_with_slice_arg_monomorphizes() {
+    lower_mir_including_closures(
+        r#"
+//- minicore: try, result, from, slice, fn
+struct BuildError;
+struct Utf8Range;
+struct Trie;
+impl Trie {
+    fn iter<E, F: FnMut(&[Utf8Range]) -> Result<(), E>>(&self, mut f: F) -> Result<(), E> {
+        let ranges: &[Utf8Range] = loop {};
+        f(ranges)
+    }
+}
+
+struct Utf8Compiler;
+impl Utf8Compiler {
+    fn add(&mut self, ranges: &[Utf8Range]) -> Result<(), BuildError> {
+        Result::Ok(())
+    }
+}
+
+fn foo(trie: &Trie, utf8c: &mut Utf8Compiler) -> Result<(), BuildError> {
+    trie.iter(|seq| {
+        utf8c.add(&seq)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+        "#,
     );
 }
 

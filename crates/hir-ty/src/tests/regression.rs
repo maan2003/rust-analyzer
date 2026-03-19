@@ -197,6 +197,96 @@ fn infer_std_crash_2() {
 }
 
 #[test]
+fn try_in_generic_closure_with_slice_arg() {
+    check_no_mismatches(
+        r#"
+        //- minicore: try, result, from, slice, fn
+        struct BuildError;
+        struct Utf8Range;
+        struct Trie;
+        impl Trie {
+            fn iter<E, F: FnMut(&[Utf8Range]) -> Result<(), E>>(&self, mut f: F) -> Result<(), E> {
+                let ranges: &[Utf8Range] = loop {};
+                f(ranges)
+            }
+        }
+
+        struct Utf8Compiler;
+        impl Utf8Compiler {
+            fn add(&mut self, ranges: &[Utf8Range]) -> Result<(), BuildError> {
+                Result::Ok(())
+            }
+        }
+
+        fn foo(trie: &Trie, utf8c: &mut Utf8Compiler) -> Result<(), BuildError> {
+            trie.iter(|seq| {
+                utf8c.add(&seq)?;
+                Ok(())
+            })?;
+            Ok(())
+        }
+        "#,
+    );
+}
+
+#[test]
+fn try_in_generic_closure_with_different_outer_ok_type() {
+    check_no_mismatches(
+        r#"
+        //- minicore: try, result, from, slice, fn
+        struct BuildError;
+        struct Outer;
+        struct Utf8Range;
+        struct Trie;
+        impl Trie {
+            fn iter<E, F: FnMut(&[Utf8Range]) -> Result<(), E>>(&self, mut f: F) -> Result<(), E> {
+                let ranges: &[Utf8Range] = loop {};
+                f(ranges)
+            }
+        }
+
+        struct Utf8Compiler;
+        impl Utf8Compiler {
+            fn add(&mut self, ranges: &[Utf8Range]) -> Result<(), BuildError> {
+                Result::Ok(())
+            }
+        }
+
+        fn foo(trie: &Trie, utf8c: &mut Utf8Compiler) -> Result<Outer, BuildError> {
+            trie.iter(|seq| {
+                utf8c.add(&seq)?;
+                Ok(())
+            })?;
+            Ok(Outer)
+        }
+        "#,
+    );
+}
+
+#[test]
+fn arc_allocate_for_layout_never_closure_regression() {
+    check_no_mismatches(
+        r#"
+        //- minicore: sized, panic, coerce_unsized, dispatch_from_dyn, deref, unsize, fn
+        extern "Rust" {
+            fn handle_alloc_error(layout: Layout) -> !;
+        }
+
+        pub struct Layout;
+        pub struct Arc<T: ?Sized>(T);
+        impl<T> Arc<T> {
+            pub fn allocate_for_layout() -> Arc<T> {
+                let layout = Layout;
+                let mem = Err(());
+                let _ = mem.map_or_else(|_| handle_alloc_error(layout), |()| ());
+                loop {}
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
 fn infer_std_crash_3() {
     // taken from rustc
     check_infer(

@@ -149,21 +149,23 @@ pub fn infer_query_with_inspect<'db>(
 
     ctx.handle_opaque_type_uses();
 
-    ctx.type_inference_fallback();
+    // Let obligations from desugarings like `?` constrain inference variables
+    // before fallback commits unresolved vars to defaults/error types.
+    ctx.table.select_obligations_where_possible();
+
+    ctx.infer_closures();
 
     // Comment from rustc:
     // Even though coercion casts provide type hints, we check casts after fallback for
     // backwards compatibility. This makes fallback a stronger type hint than a cast coercion.
+    ctx.type_inference_fallback();
+
     let cast_checks = std::mem::take(&mut ctx.deferred_cast_checks);
     for mut cast in cast_checks.into_iter() {
         if let Err(diag) = cast.check(&mut ctx) {
             ctx.diagnostics.push(diag);
         }
     }
-
-    ctx.table.select_obligations_where_possible();
-
-    ctx.infer_closures();
 
     ctx.table.select_obligations_where_possible();
 
