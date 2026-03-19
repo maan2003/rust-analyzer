@@ -1536,15 +1536,17 @@ impl<'db> Interner for DbInterner<'db> {
         })
     }
 
-    #[expect(unreachable_code)]
     fn const_conditions(
         self,
-        _def_id: Self::DefId,
+        def_id: Self::DefId,
     ) -> EarlyBinder<
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
-        EarlyBinder::bind([unimplemented!()])
+        match self.generic_def_id(def_id) {
+            Some(def_id) => GenericPredicates::query(self.db(), def_id).const_conditions(),
+            None => EarlyBinder::bind(Vec::new()),
+        }
     }
 
     fn has_target_features(self, _def_id: Self::FunctionId) -> bool {
@@ -2163,9 +2165,11 @@ impl<'db> Interner for DbInterner<'db> {
         SolverDefIds::new_from_slice(&result)
     }
 
-    fn alias_has_const_conditions(self, _def_id: Self::DefId) -> bool {
-        // FIXME(next-solver)
-        false
+    fn alias_has_const_conditions(self, def_id: Self::DefId) -> bool {
+        self.generic_def_id(def_id)
+            .is_some_and(|def_id| {
+                !GenericPredicates::query(self.db(), def_id).const_conditions().skip_binder().is_empty()
+            })
     }
 
     fn explicit_implied_const_bounds(
@@ -2187,8 +2191,11 @@ impl<'db> Interner for DbInterner<'db> {
         self.db().function_signature(id).flags.contains(FnFlags::CONST)
     }
 
-    fn impl_is_const(self, _def_id: Self::ImplId) -> bool {
-        false
+    fn impl_is_const(self, def_id: Self::ImplId) -> bool {
+        match def_id {
+            AnyImplId::ImplId(impl_id) => self.db().impl_signature(impl_id).is_const(),
+            AnyImplId::BuiltinDeriveImplId(_) => false,
+        }
     }
 
     fn opt_alias_variances(
@@ -2296,6 +2303,24 @@ impl<'db> Interner for DbInterner<'db> {
 }
 
 impl<'db> DbInterner<'db> {
+    fn generic_def_id(self, def_id: SolverDefId) -> Option<hir_def::GenericDefId> {
+        Some(match def_id {
+            SolverDefId::AdtId(def_id) => def_id.into(),
+            SolverDefId::ConstId(def_id) => def_id.into(),
+            SolverDefId::FunctionId(def_id) => def_id.into(),
+            SolverDefId::ImplId(def_id) => def_id.into(),
+            SolverDefId::StaticId(def_id) => def_id.into(),
+            SolverDefId::TraitId(def_id) => def_id.into(),
+            SolverDefId::TypeAliasId(def_id) => def_id.into(),
+            SolverDefId::BuiltinDeriveImplId(_)
+            | SolverDefId::InternedClosureId(_)
+            | SolverDefId::InternedCoroutineId(_)
+            | SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::EnumVariantId(_)
+            | SolverDefId::Ctor(_) => return None,
+        })
+    }
+
     pub fn shift_bound_var_indices<T>(self, bound_vars: usize, value: T) -> T
     where
         T: rustc_type_ir::TypeFoldable<Self>,

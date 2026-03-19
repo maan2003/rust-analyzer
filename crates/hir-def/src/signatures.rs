@@ -367,6 +367,7 @@ bitflags::bitflags! {
         const NEGATIVE = 1 << 1;
         const DEFAULT = 1 << 2;
         const UNSAFE = 1 << 3;
+        const CONST = 1 << 4;
     }
 }
 
@@ -394,6 +395,9 @@ impl ImplSignature {
         if src.value.default_token().is_some() {
             flags.insert(ImplFlags::DEFAULT);
         }
+        if src.value.const_token().is_some() {
+            flags.insert(ImplFlags::CONST);
+        }
 
         let (store, source_map, self_ty, target_trait, generic_params) =
             crate::expr_store::lower::lower_impl(db, loc.container, src, id);
@@ -419,6 +423,11 @@ impl ImplSignature {
     pub fn is_default(&self) -> bool {
         self.flags.contains(ImplFlags::DEFAULT)
     }
+
+    #[inline]
+    pub fn is_const(&self) -> bool {
+        self.flags.contains(ImplFlags::CONST)
+    }
 }
 
 bitflags::bitflags! {
@@ -433,6 +442,7 @@ bitflags::bitflags! {
         const RUSTC_PAREN_SUGAR = 1 << 7;
         const COINDUCTIVE = 1 << 8;
         const ALIAS = 1 << 9;
+        const CONST = 1 << 10;
     }
 }
 
@@ -456,6 +466,9 @@ impl TraitSignature {
         }
         if source.value.unsafe_token().is_some() {
             flags.insert(TraitFlags::UNSAFE);
+        }
+        if source.value.const_token().is_some() {
+            flags.insert(TraitFlags::CONST);
         }
         if source.value.eq_token().is_some() {
             flags.insert(TraitFlags::ALIAS);
@@ -487,6 +500,11 @@ impl TraitSignature {
             Arc::new(TraitSignature { store: Arc::new(store), generic_params, flags, name }),
             Arc::new(source_map),
         )
+    }
+
+    #[inline]
+    pub fn is_const(&self) -> bool {
+        self.flags.contains(TraitFlags::CONST)
     }
 }
 

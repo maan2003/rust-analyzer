@@ -186,7 +186,7 @@ pub enum LifetimeRef {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TypeBound {
     Path(PathId, TraitBoundModifier),
-    ForLifetime(ThinVec<Name>, PathId),
+    ForLifetime(ThinVec<Name>, PathId, TraitBoundModifier),
     Lifetime(LifetimeRefId),
     Use(ThinVec<UseArgRef>),
     Error,
@@ -207,6 +207,8 @@ pub enum UseArgRef {
 pub enum TraitBoundModifier {
     None,
     Maybe,
+    Const,
+    MaybeConst,
 }
 
 impl TypeRef {
@@ -236,7 +238,8 @@ impl TypeRef {
                 TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
                     for bound in bounds {
                         match bound {
-                            &TypeBound::Path(path, _) | &TypeBound::ForLifetime(_, path) => {
+                            &TypeBound::Path(path, _)
+                            | &TypeBound::ForLifetime(_, path, _) => {
                                 go_path(&map[path], f, map)
                             }
                             TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => (),
@@ -268,7 +271,8 @@ impl TypeRef {
                         }
                         for bound in binding.bounds.iter() {
                             match bound {
-                                &TypeBound::Path(path, _) | &TypeBound::ForLifetime(_, path) => {
+                                &TypeBound::Path(path, _)
+                                | &TypeBound::ForLifetime(_, path, _) => {
                                     go_path(&map[path], f, map)
                                 }
                                 TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => (),
@@ -285,7 +289,7 @@ impl TypeBound {
     pub fn as_path<'a>(&self, map: &'a ExpressionStore) -> Option<(&'a Path, TraitBoundModifier)> {
         match self {
             &TypeBound::Path(p, m) => Some((&map[p], m)),
-            &TypeBound::ForLifetime(_, p) => Some((&map[p], TraitBoundModifier::None)),
+            &TypeBound::ForLifetime(_, p, m) => Some((&map[p], m)),
             TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => None,
         }
     }

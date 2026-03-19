@@ -1062,9 +1062,16 @@ impl<'db> ExprCollector<'db> {
                         .collect(),
                     None => ThinVec::default(),
                 };
-                let m = match node.question_mark_token() {
-                    Some(_) => TraitBoundModifier::Maybe,
-                    None => TraitBoundModifier::None,
+                let m = if node.question_mark_token().is_some() {
+                    TraitBoundModifier::Maybe
+                } else if node.const_token().is_some() {
+                    if node.l_brack_token().is_some() {
+                        TraitBoundModifier::MaybeConst
+                    } else {
+                        TraitBoundModifier::Const
+                    }
+                } else {
+                    TraitBoundModifier::None
                 };
                 self.lower_path_type(&path_type, impl_trait_lower_fn)
                     .map(|p| {
@@ -1072,7 +1079,7 @@ impl<'db> ExprCollector<'db> {
                         if binder.is_empty() {
                             TypeBound::Path(path, m)
                         } else {
-                            TypeBound::ForLifetime(binder, path)
+                            TypeBound::ForLifetime(binder, path, m)
                         }
                     })
                     .unwrap_or(TypeBound::Error)

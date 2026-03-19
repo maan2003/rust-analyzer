@@ -5,14 +5,14 @@ mod tests;
 
 use base_db::Crate;
 use hir_def::{
-    ConstId, EnumVariantId, GeneralConstId, HasModule, StaticId,
+    ConstId, EnumVariantId, GeneralConstId, HasModule, ItemContainerId, StaticId,
     attrs::AttrFlags,
     builtin_type::{BuiltinInt, BuiltinType, BuiltinUint},
     expr_store::Body,
     hir::{Expr, ExprId, Literal},
 };
 use hir_expand::Lookup;
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::{TypingMode, inherent::IntoKind};
 use triomphe::Arc;
 
 use crate::{
@@ -20,10 +20,12 @@ use crate::{
     db::HirDatabase,
     display::DisplayTarget,
     infer::InferenceContext,
+    method_resolution::lookup_impl_const,
     mir::{MirEvalError, MirLowerError},
     next_solver::{
         Const, ConstBytes, ConstKind, DbInterner, ErrorGuaranteed, GenericArg, GenericArgs,
         StoredConst, StoredGenericArgs, Ty, ValueConst,
+        infer::DbInternerInferExt,
     },
     traits::StoredParamEnvAndCrate,
 };
@@ -355,6 +357,7 @@ pub(crate) fn const_eval<'db>(
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Const<'db>, ConstEvalError> {
+    let (def, subst, trait_env) = resolve_assoc_const_for_eval(db, def, subst, trait_env);
     return match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
@@ -367,13 +370,16 @@ pub(crate) fn const_eval<'db>(
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
     ) -> Result<StoredConst, ConstEvalError> {
+        let monomorphization_env = trait_env.unwrap_or_else(|| {
+            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+                .store()
+        });
         let body = db.monomorphized_mir_body(
             def.into(),
             subst,
-            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-                .store(),
+            monomorphization_env.clone(),
         )?;
-        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref()))?.0?;
+        let c = interpret_mir(db, body, false, Some(monomorphization_env.as_ref()))?.0?;
         Ok(c.store())
     }
 
@@ -386,6 +392,26 @@ pub(crate) fn const_eval<'db>(
     ) -> Result<StoredConst, ConstEvalError> {
         Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
     }
+}
+
+fn resolve_assoc_const_for_eval<'db>(
+    db: &'db dyn HirDatabase,
+    def: ConstId,
+    subst: GenericArgs<'db>,
+    trait_env: Option<ParamEnvAndCrate<'db>>,
+) -> (ConstId, GenericArgs<'db>, Option<ParamEnvAndCrate<'db>>) {
+    if !matches!(def.loc(db).container, ItemContainerId::TraitId(_)) {
+        return (def, subst, trait_env);
+    }
+
+    let env = trait_env.unwrap_or_else(|| ParamEnvAndCrate {
+        param_env: db.trait_environment(def.into()),
+        krate: def.krate(db),
+    });
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    let (resolved_def, resolved_subst) = lookup_impl_const(&infcx, env.param_env, def, subst);
+    (resolved_def, resolved_subst, Some(env))
 }
 
 pub(crate) fn const_eval_static<'db>(

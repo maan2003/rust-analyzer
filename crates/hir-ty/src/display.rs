@@ -2314,11 +2314,19 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeBound {
                 match modifier {
                     TraitBoundModifier::None => (),
                     TraitBoundModifier::Maybe => write!(f, "?")?,
+                    TraitBoundModifier::Const => write!(f, "const ")?,
+                    TraitBoundModifier::MaybeConst => write!(f, "[const] ")?,
                 }
                 store[path].hir_fmt(f, store)
             }
             TypeBound::Lifetime(lifetime) => lifetime.hir_fmt(f, store),
-            TypeBound::ForLifetime(lifetimes, path) => {
+            TypeBound::ForLifetime(lifetimes, path, modifier) => {
+                match modifier {
+                    TraitBoundModifier::None => (),
+                    TraitBoundModifier::Maybe => write!(f, "?")?,
+                    TraitBoundModifier::Const => write!(f, "const ")?,
+                    TraitBoundModifier::MaybeConst => write!(f, "[const] ")?,
+                }
                 let edition = f.edition();
                 write!(
                     f,

@@ -2409,6 +2409,33 @@ pub trait Destruct {}
 }
 
 #[test]
+fn const_trait_bound_on_const_fn() {
+    check_no_mismatches(
+        r#"
+pub const trait Foo {
+    fn foo(&self) -> i32;
+}
+
+struct S;
+
+impl const Foo for S {
+    fn foo(&self) -> i32 {
+        1
+    }
+}
+
+const fn call<T: [const] Foo>(t: &T) -> i32 {
+    t.foo()
+}
+
+fn test() {
+    let _ = call(&S);
+}
+"#,
+    );
+}
+
+#[test]
 fn no_duplicated_lang_item_metadata() {
     check_types(
         r#"

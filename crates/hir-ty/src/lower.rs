@@ -39,7 +39,8 @@ use path::{PathDiagnosticCallback, PathLoweringContext};
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    AliasTyKind, BoundVarIndexKind, ConstKind, DebruijnIndex, ExistentialPredicate,
+    AliasTyKind, BoundConstness, BoundVarIndexKind, ConstKind, DebruijnIndex,
+    ExistentialPredicate,
     ExistentialProjection, ExistentialTraitRef, FnSig, IntTy, Interner, OutlivesPredicate,
     TermKind,
     TyKind::{self},
@@ -996,9 +997,21 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let meta_sized = self.lang_items.MetaSized;
         let pointee_sized = self.lang_items.PointeeSized;
         let mut assoc_bounds = None;
-        let mut clause = None;
+        let mut clauses = SmallVec::<[(Clause<'db>, GenericPredicateSource); 2]>::new();
         match bound {
-            &TypeBound::Path(path, TraitBoundModifier::None) | &TypeBound::ForLifetime(_, path) => {
+            &TypeBound::Path(
+                path,
+                TraitBoundModifier::None
+                | TraitBoundModifier::Const
+                | TraitBoundModifier::MaybeConst,
+            )
+            | &TypeBound::ForLifetime(
+                _,
+                path,
+                TraitBoundModifier::None
+                | TraitBoundModifier::Const
+                | TraitBoundModifier::MaybeConst,
+            ) => {
                 // FIXME Don't silently drop the hrtb lifetimes here
                 if let Some((trait_ref, mut ctx)) = self.lower_trait_ref_from_path(path, self_ty) {
                     // FIXME(sized-hierarchy): Remove this bound modifications once we have implemented
@@ -1012,15 +1025,38 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                         if !ignore_bindings {
                             assoc_bounds = ctx.assoc_type_bindings_from_type_bound(trait_ref);
                         }
-                        clause = Some(Clause(Predicate::new(
-                            interner,
-                            Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                                rustc_type_ir::ClauseKind::Trait(TraitPredicate {
-                                    trait_ref,
-                                    polarity: rustc_type_ir::PredicatePolarity::Positive,
-                                }),
+                        clauses.push((
+                            Clause(Predicate::new(
+                                interner,
+                                Binder::dummy(rustc_type_ir::PredicateKind::Clause(
+                                    rustc_type_ir::ClauseKind::Trait(TraitPredicate {
+                                        trait_ref,
+                                        polarity: rustc_type_ir::PredicatePolarity::Positive,
+                                    }),
+                                )),
                             )),
-                        )));
+                            GenericPredicateSource::SelfOnly,
+                        ));
+                        if matches!(
+                            bound,
+                            TypeBound::Path(_, TraitBoundModifier::Const)
+                                | TypeBound::ForLifetime(_, _, TraitBoundModifier::Const)
+                        ) {
+                            clauses.push((
+                                Clause(Predicate::new(
+                                    interner,
+                                    Binder::dummy(rustc_type_ir::PredicateKind::Clause(
+                                        rustc_type_ir::ClauseKind::HostEffect(
+                                            rustc_type_ir::HostEffectPredicate {
+                                                trait_ref,
+                                                constness: BoundConstness::Const,
+                                            },
+                                        ),
+                                    )),
+                                )),
+                                GenericPredicateSource::SelfOnly,
+                            ));
+                        }
                     }
                 }
             }
@@ -1036,23 +1072,32 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     self.unsized_types.insert(self_ty);
                 }
             }
+            &TypeBound::ForLifetime(_, path, TraitBoundModifier::Maybe) => {
+                let sized_trait = self.lang_items.Sized;
+                let trait_id = self
+                    .lower_trait_ref_from_path(path, self_ty)
+                    .map(|(trait_ref, _)| trait_ref.def_id.0);
+                if trait_id == sized_trait {
+                    self.unsized_types.insert(self_ty);
+                }
+            }
             &TypeBound::Lifetime(l) => {
                 let lifetime = self.lower_lifetime(l);
-                clause = Some(Clause(Predicate::new(
-                    self.interner,
-                    Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                        rustc_type_ir::ClauseKind::TypeOutlives(OutlivesPredicate(
-                            self_ty, lifetime,
+                clauses.push((
+                    Clause(Predicate::new(
+                        self.interner,
+                        Binder::dummy(rustc_type_ir::PredicateKind::Clause(
+                            rustc_type_ir::ClauseKind::TypeOutlives(OutlivesPredicate(
+                                self_ty, lifetime,
+                            )),
                         )),
                     )),
-                )));
+                    GenericPredicateSource::SelfOnly,
+                ));
             }
             TypeBound::Use(_) | TypeBound::Error => {}
         }
-        clause
-            .into_iter()
-            .map(|pred| (pred, GenericPredicateSource::SelfOnly))
-            .chain(assoc_bounds.into_iter().flatten())
+        clauses.into_iter().chain(assoc_bounds.into_iter().flatten())
     }
 
     fn lower_dyn_trait(&mut self, bounds: &[TypeBound]) -> Ty<'db> {
@@ -1985,9 +2030,26 @@ impl SupertraitsInfo {
                 else {
                     continue;
                 };
-                let (TypeBound::Path(bounded_trait, TraitBoundModifier::None)
-                | TypeBound::ForLifetime(_, bounded_trait)) = *bound
-                else {
+                let Some(bounded_trait) = (match *bound {
+                    TypeBound::Path(
+                        bounded_trait,
+                        TraitBoundModifier::None
+                        | TraitBoundModifier::Const
+                        | TraitBoundModifier::MaybeConst,
+                    )
+                    | TypeBound::ForLifetime(
+                        _,
+                        bounded_trait,
+                        TraitBoundModifier::None
+                        | TraitBoundModifier::Const
+                        | TraitBoundModifier::MaybeConst,
+                    ) => Some(bounded_trait),
+                    TypeBound::Path(_, TraitBoundModifier::Maybe)
+                    | TypeBound::ForLifetime(_, _, TraitBoundModifier::Maybe)
+                    | TypeBound::Lifetime(_)
+                    | TypeBound::Use(_)
+                    | TypeBound::Error => None,
+                }) else {
                     continue;
                 };
                 let target = &signature.store[*target];
@@ -2096,9 +2158,26 @@ fn resolve_type_param_assoc_type_shorthand(
             else {
                 continue;
             };
-            let (TypeBound::Path(bounded_trait_path, TraitBoundModifier::None)
-            | TypeBound::ForLifetime(_, bounded_trait_path)) = *bound
-            else {
+            let Some(bounded_trait_path) = (match *bound {
+                TypeBound::Path(
+                    bounded_trait_path,
+                    TraitBoundModifier::None
+                    | TraitBoundModifier::Const
+                    | TraitBoundModifier::MaybeConst,
+                )
+                | TypeBound::ForLifetime(
+                    _,
+                    bounded_trait_path,
+                    TraitBoundModifier::None
+                    | TraitBoundModifier::Const
+                    | TraitBoundModifier::MaybeConst,
+                ) => Some(bounded_trait_path),
+                TypeBound::Path(_, TraitBoundModifier::Maybe)
+                | TypeBound::ForLifetime(_, _, TraitBoundModifier::Maybe)
+                | TypeBound::Lifetime(_)
+                | TypeBound::Use(_)
+                | TypeBound::Error => None,
+            }) else {
                 continue;
             };
             let Some(target) = ctx.lower_ty_only_param(*target) else { continue };
@@ -2277,6 +2356,7 @@ pub struct GenericPredicates {
     // predicate for the child, then the bounds of the associated types of the child,
     // then the implicit trait predicate for the child, if `is_trait` is `true`.
     predicates: StoredEarlyBinder<StoredClauses>,
+    const_conditions: StoredEarlyBinder<StoredClauses>,
     parent_explicit_self_predicates_start: u32,
     own_predicates_start: u32,
     own_assoc_ty_bounds_start: u32,
@@ -2320,6 +2400,7 @@ impl GenericPredicates {
         let len = predicates.get().skip_binder().len() as u32;
         Self {
             predicates,
+            const_conditions: StoredEarlyBinder::bind(Clauses::default().store()),
             parent_explicit_self_predicates_start: 0,
             own_predicates_start: 0,
             own_assoc_ty_bounds_start: len,
@@ -2368,6 +2449,18 @@ impl GenericPredicates {
     #[inline]
     pub fn all_predicates(&self) -> EarlyBinder<'_, &[Clause<'_>]> {
         self.predicates.get().map_bound(|it| it.as_slice())
+    }
+
+    #[inline]
+    pub fn const_conditions(&self) -> EarlyBinder<'_, Vec<Binder<'_, TraitRef<'_>>>> {
+        self.const_conditions.get().map_bound(|it| {
+            it.iter()
+                .map(|clause| match clause.kind().skip_binder() {
+                    ClauseKind::Trait(trait_pred) => clause.kind().rebind(trait_pred.trait_ref),
+                    _ => unreachable!("const conditions are stored as trait clauses"),
+                })
+                .collect()
+        })
     }
 
     #[inline]
@@ -2454,6 +2547,7 @@ fn generic_predicates(db: &dyn HirDatabase, def: GenericDefId) -> (GenericPredic
     let mut parent_predicates = Vec::new();
     let mut own_assoc_ty_bounds = Vec::new();
     let mut parent_assoc_ty_bounds = Vec::new();
+    let mut const_conditions = Vec::new();
     let all_generics =
         std::iter::successors(Some(&generics), |generics| generics.parent_generics())
             .collect::<ArrayVec<_, 2>>();
@@ -2470,6 +2564,22 @@ fn generic_predicates(db: &dyn HirDatabase, def: GenericDefId) -> (GenericPredic
         ctx.store = maybe_parent_generics.store();
         for pred in maybe_parent_generics.where_predicates() {
             tracing::debug!(?pred);
+            let &(WherePredicate::TypeBound { target, ref bound }
+            | WherePredicate::ForLifetime { lifetimes: _, target, ref bound }) = pred
+            else {
+                continue;
+            };
+            let maybe_const_bound_path = match bound {
+                TypeBound::Path(path, TraitBoundModifier::MaybeConst)
+                | TypeBound::ForLifetime(_, path, TraitBoundModifier::MaybeConst) => Some(path),
+                _ => None,
+            };
+            if let Some(path) = maybe_const_bound_path {
+                let self_ty = ctx.lower_ty(target);
+                if let Some((trait_ref, _)) = ctx.lower_trait_ref_from_path(*path, self_ty) {
+                    const_conditions.push(trait_ref.upcast(interner));
+                }
+            }
             for (pred, source) in ctx.lower_where_predicate(pred, false) {
                 match source {
                     GenericPredicateSource::SelfOnly => {
@@ -2587,6 +2697,9 @@ fn generic_predicates(db: &dyn HirDatabase, def: GenericDefId) -> (GenericPredic
         is_trait,
         parent_is_trait,
         predicates: StoredEarlyBinder::bind(Clauses::new_from_slice(&predicates).store()),
+        const_conditions: StoredEarlyBinder::bind(
+            Clauses::new_from_slice(&const_conditions).store(),
+        ),
     };
     return (predicates, diagnostics);
 

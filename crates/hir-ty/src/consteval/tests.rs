@@ -1,6 +1,8 @@
 use base_db::RootQueryDb;
-use hir_def::db::DefDatabase;
+use hir_def::{AdtId, AssocItemId, ModuleDefId, db::DefDatabase};
 use hir_expand::EditionedFileId;
+use hir_expand::name::Name;
+use intern::Symbol;
 use rustc_apfloat::{
     Float,
     ieee::{Half as f16, Quad as f128},
@@ -145,6 +147,60 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Const<'_>, ConstEv
     db.const_eval(const_id, GenericArgs::empty(interner), None)
 }
 
+#[track_caller]
+fn find_trait(db: &TestDB, file_id: EditionedFileId, trait_name: &str) -> hir_def::TraitId {
+    let module_id = db.module_for_file(file_id.file_id(db));
+    let scope = &module_id.def_map(db)[module_id].scope;
+    let trait_name = Name::new_symbol_root(Symbol::intern(trait_name));
+    scope
+        .declarations()
+        .find_map(|item| match item {
+            ModuleDefId::TraitId(trait_id)
+                if db.trait_signature(trait_id).name == trait_name =>
+            {
+                Some(trait_id)
+            }
+            _ => None,
+        })
+        .expect("No matching trait found")
+}
+
+#[track_caller]
+fn find_struct(db: &TestDB, file_id: EditionedFileId, struct_name: &str) -> hir_def::StructId {
+    let module_id = db.module_for_file(file_id.file_id(db));
+    let scope = &module_id.def_map(db)[module_id].scope;
+    let struct_name = Name::new_symbol_root(Symbol::intern(struct_name));
+    scope
+        .declarations()
+        .find_map(|item| match item {
+            ModuleDefId::AdtId(AdtId::StructId(struct_id))
+                if db.struct_signature(struct_id).name == struct_name =>
+            {
+                Some(struct_id)
+            }
+            _ => None,
+        })
+        .expect("No matching struct found")
+}
+
+#[track_caller]
+fn find_assoc_const_eval_target<'db>(
+    db: &'db TestDB,
+    file_id: EditionedFileId,
+    trait_name: &str,
+    const_name: &str,
+    self_ty: crate::next_solver::Ty<'db>,
+) -> (hir_def::ConstId, GenericArgs<'db>) {
+    let trait_id = find_trait(db, file_id, trait_name);
+    let assoc_name = Name::new_symbol_root(Symbol::intern(const_name));
+    let AssocItemId::ConstId(const_id) =
+        trait_id.trait_items(db).assoc_item_by_name(&assoc_name).expect("No matching const found")
+    else {
+        panic!("Associated item is not a const");
+    };
+    (const_id, GenericArgs::new_from_slice(&[self_ty.into()]))
+}
+
 #[test]
 fn add() {
     check_number(r#"const GOAL: usize = 2 + 2;"#, 4);
@@ -163,6 +219,64 @@ fn bit_op() {
         e == ConstEvalError::MirEvalError(MirEvalError::Panic("Overflow in Shl".to_owned()))
     });
     check_number(r#"const GOAL: i32 = 100000000i32 << 11"#, (100000000i32 << 11) as i128);
+}
+
+#[test]
+fn assoc_const_eval_normalizes_trait_item_to_impl_const() {
+    let (db, file_id) = TestDB::with_single_file(
+        r#"
+trait Foo {
+    const BAR: usize;
+}
+
+struct S;
+
+impl Foo for S {
+    const BAR: usize = 7;
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let self_ty = db.ty(find_struct(&db, file_id, "S").into()).instantiate_identity();
+        let (const_id, subst) = find_assoc_const_eval_target(&db, file_id, "Foo", "BAR", self_ty);
+        let value =
+            db.const_eval(const_id, subst, None).expect("const eval should resolve impl const");
+        assert_eq!(try_const_usize(&db, value), Some(7));
+    });
+}
+
+#[test]
+fn assoc_const_eval_handles_generic_impl_forwarding() {
+    let (db, file_id) = TestDB::with_single_file(
+        r#"
+trait Foo {
+    const BAR: usize;
+}
+
+struct Inner;
+struct Wrap<T>(T);
+
+impl Foo for Inner {
+    const BAR: usize = 7;
+}
+
+impl<T: Foo> Foo for Wrap<T> {
+    const BAR: usize = T::BAR;
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        let inner_ty = db.ty(find_struct(&db, file_id, "Inner").into()).instantiate_identity();
+        let wrap_ty = db
+            .ty(find_struct(&db, file_id, "Wrap").into())
+            .instantiate(interner, &[inner_ty.into()]);
+        let (const_id, subst) = find_assoc_const_eval_target(&db, file_id, "Foo", "BAR", wrap_ty);
+        let value = db
+            .const_eval(const_id, subst, None)
+            .expect("const eval should resolve forwarded impl const");
+        assert_eq!(try_const_usize(&db, value), Some(7));
+    });
 }
 
 #[test]
