@@ -4187,6 +4187,7 @@ fn store_call_result_and_jump(
     sret_slot: Option<CPlace>,
     dest: CPlace,
     call_result: Option<CValue>,
+    source_return_ty: Option<&StoredTy>,
     destination_place: &Place,
     target: &Option<BasicBlockId>,
 ) {
@@ -4195,6 +4196,12 @@ fn store_call_result_and_jump(
         dest.write_cvalue(fx, cval);
     } else if let Some(cval) = call_result {
         dest.write_cvalue(fx, cval);
+    } else if source_return_ty
+        .is_some_and(|ty| matches!(ty.as_ref().kind(), TyKind::Never))
+    {
+        // Redirected calls can lower a concrete diverging callee into a destination
+        // that originally came from a coercing call site. In that case there is no
+        // materialized return value to store.
     } else {
         match dest.layout.backend_repr {
             BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _) if !dest.layout.is_zst() => {
@@ -5111,7 +5118,15 @@ fn codegen_fn_ptr_call(
         source_return_ty.as_ref(),
         destination,
     );
-    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        source_return_ty.as_ref(),
+        destination,
+        target,
+    );
 }
 
 /// Call a closure body directly.
@@ -5196,7 +5211,15 @@ fn codegen_closure_call(
         Some(&closure_ret_ty),
         destination,
     );
-    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        Some(&closure_ret_ty),
+        destination,
+        target,
+    );
 }
 
 fn adapt_closure_receiver_to_body_abi(
@@ -7195,7 +7218,15 @@ fn codegen_direct_call(
         source_return_ty.as_ref(),
         destination,
     );
-    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        source_return_ty.as_ref(),
+        destination,
+        target,
+    );
 }
 
 /// Virtual dispatch: load fn ptr from vtable, call indirectly.
@@ -7340,7 +7371,15 @@ fn codegen_virtual_call(
         source_return_ty.as_ref(),
         destination,
     );
-    store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+    store_call_result_and_jump(
+        fx,
+        sret_slot,
+        dest,
+        call_result,
+        source_return_ty.as_ref(),
+        destination,
+        target,
+    );
 }
 
 fn codegen_intrinsic_call(
@@ -7733,7 +7772,15 @@ fn codegen_intrinsic_call(
             let call = fx.bcx.ins().call(callee_ref, &call_args);
             let call_result =
                 prepare_call_result_cvalue(fx, call, &callee_abi.ret, &dest, None, destination);
-            store_call_result_and_jump(fx, sret_slot, dest, call_result, destination, target);
+            store_call_result_and_jump(
+                fx,
+                sret_slot,
+                dest,
+                call_result,
+                None,
+                destination,
+                target,
+            );
             return true;
         }
         // --- memory operations ---
