@@ -4352,7 +4352,7 @@ const RAW_PTR: *const i8 = &ALIGNED_TAGS.tags as *const [i8; 16] as *const i8;
         let value = db
             .const_eval(const_id, GenericArgs::empty(interner), None)
             .expect("const eval RAW_PTR");
-        let resolved = crate::resolve_const_value(&db, value);
+        let resolved = crate::resolve_const_value(&db, None, value);
         let bytes = resolved.value.inner();
         let ptr_size = std::mem::size_of::<usize>();
         let raw = usize::from_le_bytes(bytes.memory[..ptr_size].try_into().unwrap());

@@ -27,7 +27,7 @@ use hir_def::{
     Lookup, StaticId, TraitId, VariantId,
 };
 use hir_ty::PointerCast;
-use hir_ty::consteval::{try_const_usize, usize_const};
+use hir_ty::consteval::{const_eval_with_stored_env, try_const_usize, usize_const};
 use hir_ty::db::HirDatabase;
 use hir_ty::display::{DisplayTarget, HirDisplay};
 use hir_ty::mir::{
@@ -374,13 +374,20 @@ fn get_caller_location(fx: &mut FunctionCx<'_, impl Module>, span: MirSpan) -> V
 // Constant extraction
 // ---------------------------------------------------------------------------
 
-fn resolve_const_value<'db>(db: &'db dyn HirDatabase, mut konst: Const<'db>) -> ValueConst<'db> {
+fn resolve_const_value<'db>(
+    db: &'db dyn HirDatabase,
+    env: Option<&StoredParamEnvAndCrate>,
+    mut konst: Const<'db>,
+) -> ValueConst<'db> {
     loop {
         match konst.kind() {
             ConstKind::Value(val) => return val,
             ConstKind::Unevaluated(uv) => {
                 let evaluated = match uv.def.0 {
-                    GeneralConstId::ConstId(id) => db.const_eval(id, uv.args, None),
+                    GeneralConstId::ConstId(id) => match env {
+                        Some(env) => const_eval_with_stored_env(db, id, uv.args, env),
+                        None => db.const_eval(id, uv.args, None),
+                    },
                     GeneralConstId::StaticId(id) => db.const_eval_static(id),
                 }
                 .unwrap_or_else(|e| panic!("failed to evaluate const {:?}: {e:?}", konst));
@@ -396,8 +403,13 @@ fn resolve_const_value<'db>(db: &'db dyn HirDatabase, mut konst: Const<'db>) -> 
     }
 }
 
-fn const_to_u128<'db>(db: &'db dyn HirDatabase, konst: Const<'db>, size: Size) -> u128 {
-    let val = resolve_const_value(db, konst);
+fn const_to_u128<'db>(
+    db: &'db dyn HirDatabase,
+    env: Option<&StoredParamEnvAndCrate>,
+    konst: Const<'db>,
+    size: Size,
+) -> u128 {
+    let val = resolve_const_value(db, env, konst);
     let bytes = &val.value.inner().memory;
     let mut buf = [0u8; 16];
     let len = (size.bytes() as usize).min(16);
@@ -406,8 +418,12 @@ fn const_to_u128<'db>(db: &'db dyn HirDatabase, konst: Const<'db>, size: Size) -
 }
 
 /// Extract a `u64` from a constant. Used for array lengths and repeat counts.
-fn const_to_u64<'db>(db: &'db dyn HirDatabase, konst: Const<'db>) -> u64 {
-    let val = resolve_const_value(db, konst);
+fn const_to_u64<'db>(
+    db: &'db dyn HirDatabase,
+    env: Option<&StoredParamEnvAndCrate>,
+    konst: Const<'db>,
+) -> u64 {
+    let val = resolve_const_value(db, env, konst);
     let bytes = &val.value.inner().memory;
     let mut buf = [0u8; 8];
     let len = bytes.len().min(8);
@@ -2415,7 +2431,10 @@ fn codegen_assign(fx: &mut FunctionCx<'_, impl Module>, place: &Place, rvalue: &
         }
         Rvalue::Repeat(operand, count) => {
             let elem_val = codegen_operand(fx, &operand.kind);
-            let count_val = const_to_u64(fx.db(), count.as_ref());
+            let count_val = {
+                let env = fx.env();
+                const_to_u64(fx.db(), Some(env), count.as_ref())
+            };
             let elem_layout = elem_val.layout.clone();
             for i in 0..count_val {
                 let field_place = dest.place_field(fx, i as usize, elem_layout.clone());
@@ -2448,7 +2467,10 @@ fn codegen_rvalue(
             let place_ty = place_ty(fx.db(), body, place);
             match place_ty.as_ref().kind() {
                 TyKind::Array(_, len) => {
-                    let len_val = const_to_u64(fx.db(), len) as i64;
+                    let len_val = {
+                        let env = fx.env();
+                        const_to_u64(fx.db(), Some(env), len)
+                    } as i64;
                     CValue::by_val(
                         fx.bcx.ins().iconst(fx.pointer_type, len_val),
                         result_layout.clone(),
@@ -3230,7 +3252,8 @@ fn codegen_static_operand(fx: &mut FunctionCx<'_, impl Module>, static_id: Stati
 
             match const_eval_result {
                 Ok(konst) => {
-                    let const_value = resolve_const_value(db, konst);
+                    let env = fx.env().clone();
+                    let const_value = resolve_const_value(db, Some(&env), konst);
                     let const_bytes = const_value.value.inner();
                     let const_memory = const_bytes.memory.clone();
                     let const_memory_map = const_bytes.memory_map.clone();
@@ -3283,9 +3306,10 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
             }
             match layout.backend_repr {
                 BackendRepr::Scalar(scalar) => {
-                    let raw_bits = const_to_u128(fx.db(), konst.as_ref(), scalar.size(fx.dl));
+                    let env = fx.env().clone();
+                    let raw_bits = const_to_u128(fx.db(), Some(&env), konst.as_ref(), scalar.size(fx.dl));
                     let const_memory_map = {
-                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        let val = resolve_const_value(fx.db(), Some(&env), konst.as_ref());
                         val.value.inner().memory_map.clone()
                     };
                     let const_allocs = create_const_data_sections(fx, &const_memory_map);
@@ -3329,7 +3353,8 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                 }
                 BackendRepr::ScalarPair(a_scalar, b_scalar) => {
                     let (const_memory, const_memory_map) = {
-                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        let env = fx.env().clone();
+                        let val = resolve_const_value(fx.db(), Some(&env), konst.as_ref());
                         let const_bytes = val.value.inner();
                         (const_bytes.memory.clone(), const_bytes.memory_map.clone())
                     };
@@ -3377,7 +3402,8 @@ fn codegen_operand(fx: &mut FunctionCx<'_, impl Module>, kind: &OperandKind) -> 
                 _ => {
                     // Memory-repr constant.
                     let (const_memory, const_memory_map) = {
-                        let val = resolve_const_value(fx.db(), konst.as_ref());
+                        let env = fx.env().clone();
+                        let val = resolve_const_value(fx.db(), Some(&env), konst.as_ref());
                         let const_bytes = val.value.inner();
                         (const_bytes.memory.clone(), const_bytes.memory_map.clone())
                     };
@@ -9958,7 +9984,7 @@ fn collect_const_operand_callables(
     let Ok(layout) = db.layout_of_ty(ty.clone(), env.clone()) else {
         return;
     };
-    let value = resolve_const_value(db, konst.as_ref());
+    let value = resolve_const_value(db, Some(env), konst.as_ref());
     let const_bytes = value.value.inner();
     let memory_map = &const_bytes.memory_map;
     let operand_ty = ty.as_ref();
