@@ -1219,6 +1219,103 @@ fn unsize_metadata_for_pointees(
     }
 }
 
+fn cplace_for_cvalue(fx: &mut FunctionCx<'_, impl Module>, cvalue: CValue) -> CPlace {
+    let layout = cvalue.layout.clone();
+    let (ptr, extra) = cvalue.force_stack(fx);
+    match extra {
+        Some(extra) => CPlace::for_ptr_with_extra(ptr, extra, layout),
+        None => CPlace::for_ptr(ptr, layout),
+    }
+}
+
+fn instantiated_struct_field_tys(
+    db: &dyn HirDatabase,
+    ty: &StoredTy,
+) -> Option<Vec<StoredTy>> {
+    let TyKind::Adt(adt_id, args) = ty.as_ref().kind() else {
+        return None;
+    };
+    let hir_def::AdtId::StructId(struct_id) = adt_id.inner().id else {
+        return None;
+    };
+    let interner = DbInterner::new_no_crate(db);
+    Some(
+        db.field_types(struct_id.into())
+            .iter()
+            .map(|(_, field_ty)| field_ty.get().instantiate(interner, args).store())
+            .collect(),
+    )
+}
+
+fn coerce_unsized_into(
+    fx: &mut FunctionCx<'_, impl Module>,
+    src: CPlace,
+    src_ty: StoredTy,
+    dst: CPlace,
+    dst_ty: StoredTy,
+) {
+    match (src_ty.as_ref().kind(), dst_ty.as_ref().kind()) {
+        (TyKind::Ref(_, source_pointee, _), TyKind::Ref(_, target_pointee, _))
+        | (TyKind::Ref(_, source_pointee, _), TyKind::RawPtr(target_pointee, _))
+        | (TyKind::RawPtr(source_pointee, _), TyKind::RawPtr(target_pointee, _)) => {
+            let (data_ptr, from_meta) = if matches!(src.layout.backend_repr, BackendRepr::ScalarPair(_, _))
+            {
+                let (ptr, meta) = src.to_cvalue(fx).load_scalar_pair(fx);
+                (ptr, Some(meta))
+            } else {
+                (src.to_cvalue(fx).load_scalar(fx), None)
+            };
+            let metadata = unsize_metadata_for_pointees(
+                fx,
+                source_pointee.store(),
+                target_pointee.store(),
+                from_meta,
+            );
+            dst.write_cvalue(fx, CValue::by_val_pair(data_ptr, metadata, dst.layout.clone()));
+        }
+        (TyKind::Adt(source_adt, _), TyKind::Adt(target_adt, _))
+            if source_adt.inner().id == target_adt.inner().id =>
+        {
+            let source_fields = instantiated_struct_field_tys(fx.db(), &src_ty)
+                .expect("CoerceUnsized wrapper source must be a struct");
+            let target_fields = instantiated_struct_field_tys(fx.db(), &dst_ty)
+                .expect("CoerceUnsized wrapper target must be a struct");
+            assert_eq!(source_fields.len(), target_fields.len());
+
+            for field_idx in 0..source_fields.len() {
+                let source_field_ty = source_fields[field_idx].clone();
+                let target_field_ty = target_fields[field_idx].clone();
+                let source_field_layout = fx
+                    .db()
+                    .layout_of_ty(source_field_ty.clone(), fx.env().clone())
+                    .expect("CoerceUnsized source field layout");
+                let target_field_layout = fx
+                    .db()
+                    .layout_of_ty(target_field_ty.clone(), fx.env().clone())
+                    .expect("CoerceUnsized target field layout");
+
+                if target_field_layout.is_zst() {
+                    continue;
+                }
+
+                let src_field = src.place_field(fx, field_idx, source_field_layout.clone());
+                let dst_field = dst.place_field(fx, field_idx, target_field_layout.clone());
+                if source_field_ty == target_field_ty {
+                    let src_field_value = src_field.to_cvalue(fx);
+                    dst_field.write_cvalue(fx, src_field_value);
+                } else {
+                    coerce_unsized_into(fx, src_field, source_field_ty, dst_field, target_field_ty);
+                }
+            }
+        }
+        _ => panic!(
+            "invalid unsize coercion {:?} -> {:?}",
+            src_ty.as_ref().kind(),
+            dst_ty.as_ref().kind()
+        ),
+    }
+}
+
 /// Handle `PointerCoercion(Unsize)`.
 ///
 /// Produces a fat pointer `(data_ptr, metadata)` for:
@@ -1232,35 +1329,40 @@ fn codegen_unsize_coercion(
     result_layout: &LayoutArc,
 ) -> CValue {
     let body = fx.ra_body();
-    let from_cval = codegen_operand(fx, &operand.kind);
-    let (data_ptr, from_meta) = match from_cval.layout.backend_repr {
-        BackendRepr::ScalarPair(_, _) => {
-            let (ptr, meta) = from_cval.load_scalar_pair(fx);
-            (ptr, Some(meta))
-        }
-        _ => (from_cval.load_scalar(fx), None),
-    };
-
-    // Extract source/target pointee types.
     let target_pointee = target_ty
         .as_ref()
-        .builtin_deref(true)
-        .expect("Unsize target must be a pointer/reference type");
+        .builtin_deref(true);
     let from_ty = operand_ty(fx.db(), body, &operand.kind);
-    let source_pointee = from_ty
-        .as_ref()
-        .builtin_deref(true)
-        .expect("Unsize source must be a pointer/reference type");
-    let metadata =
-        unsize_metadata_for_pointees(fx, source_pointee.store(), target_pointee.store(), from_meta);
-
-    match result_layout.backend_repr {
-        BackendRepr::ScalarPair(_, _) => {
-            CValue::by_val_pair(data_ptr, metadata, result_layout.clone())
-        }
-        BackendRepr::Scalar(_) => CValue::by_val(data_ptr, result_layout.clone()),
-        _ => panic!("unsupported unsize result layout: {:?}", result_layout.backend_repr),
+    let source_pointee = from_ty.as_ref().builtin_deref(true);
+    if let (Some(source_pointee), Some(target_pointee)) = (source_pointee, target_pointee) {
+        let from_cval = codegen_operand(fx, &operand.kind);
+        let (data_ptr, from_meta) = match from_cval.layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                let (ptr, meta) = from_cval.load_scalar_pair(fx);
+                (ptr, Some(meta))
+            }
+            _ => (from_cval.load_scalar(fx), None),
+        };
+        let metadata = unsize_metadata_for_pointees(
+            fx,
+            source_pointee.store(),
+            target_pointee.store(),
+            from_meta,
+        );
+        return match result_layout.backend_repr {
+            BackendRepr::ScalarPair(_, _) => {
+                CValue::by_val_pair(data_ptr, metadata, result_layout.clone())
+            }
+            BackendRepr::Scalar(_) => CValue::by_val(data_ptr, result_layout.clone()),
+            _ => panic!("unsupported unsize result layout: {:?}", result_layout.backend_repr),
+        };
     }
+
+    let src_value = codegen_operand(fx, &operand.kind);
+    let src = cplace_for_cvalue(fx, src_value);
+    let dst = CPlace::new_stack_slot(fx, result_layout.clone());
+    coerce_unsized_into(fx, src, from_ty, dst.clone(), target_ty.clone());
+    dst.to_cvalue(fx)
 }
 
 /// Build or retrieve a vtable for `concrete_ty` implementing `trait_id`.
@@ -5529,12 +5631,18 @@ fn codegen_direct_call_from_cvalues_into_dest(
 
     let interner = DbInterner::new_no_crate(fx.db());
     let empty_args = GenericArgs::empty(interner);
-    let (callee_sig, callee_name) = if is_extern {
-        let sig =
-            build_fn_sig_from_ty(fx.isa, fx.db(), fx.dl, fx.env(), callee_func_id, empty_args)
-                .expect("extern fn sig");
+    let (callee_abi, callee_name) = if is_extern {
+        let fn_abi = abi::fn_abi_for_fn_item_from_ty(
+            fx.isa,
+            fx.db(),
+            fx.dl,
+            fx.env(),
+            callee_func_id,
+            empty_args,
+        )
+        .expect("extern fn ABI");
         let name = extern_fn_symbol_name(fx.db(), callee_func_id);
-        (sig, name)
+        (fn_abi, name)
     } else {
         match fx.db().monomorphized_mir_body(
             callee_func_id.into(),
@@ -5542,15 +5650,16 @@ fn codegen_direct_call_from_cvalues_into_dest(
             fx.env().clone(),
         ) {
             Ok(callee_body) => {
-                let sig = build_fn_sig(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
-                    .expect("callee sig");
+                let fn_abi =
+                    abi::fn_abi_for_body(fx.isa, fx.db(), fx.dl, fx.env(), &callee_body)
+                        .expect("callee ABI");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     callee_func_id,
                     generic_args,
                     fx.ext_crate_disambiguators(),
                 );
-                (sig, name)
+                (fn_abi, name)
             }
             Err(hir_ty::mir::MirLowerError::TraitFunctionDefinition(_, _)) => {
                 panic!(
@@ -5558,7 +5667,7 @@ fn codegen_direct_call_from_cvalues_into_dest(
                 )
             }
             Err(_) if is_cross_crate => {
-                let sig = build_fn_sig_from_ty(
+                let fn_abi = abi::fn_abi_for_fn_item_from_ty(
                     fx.isa,
                     fx.db(),
                     fx.dl,
@@ -5566,14 +5675,14 @@ fn codegen_direct_call_from_cvalues_into_dest(
                     callee_func_id,
                     generic_args,
                 )
-                .expect("cross-crate fn sig");
+                .expect("cross-crate fn ABI");
                 let name = symbol_mangling::mangle_function(
                     fx.db(),
                     callee_func_id,
                     generic_args,
                     fx.ext_crate_disambiguators(),
                 );
-                (sig, name)
+                (fn_abi, name)
             }
             Err(_) => panic!("failed to get local callee MIR for {callee_func_id:?}"),
         }
@@ -5581,15 +5690,14 @@ fn codegen_direct_call_from_cvalues_into_dest(
 
     let callee_id = fx
         .module
-        .declare_function(&callee_name, Linkage::Import, &callee_sig)
+        .declare_function(&callee_name, Linkage::Import, &callee_abi.sig)
         .expect("declare callee");
     let callee_ref = fx.module.declare_func_in_func(callee_id, fx.bcx.func);
 
-    let is_sret_return = !dest.layout.is_zst()
-        && !matches!(
-            dest.layout.backend_repr,
-            BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
-        );
+    let is_sret_return = matches!(
+        callee_abi.ret.mode,
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ }
+    );
 
     let mut call_args: Vec<Value> = Vec::new();
     let sret_slot = if is_sret_return {
@@ -5627,9 +5735,9 @@ fn codegen_direct_call_from_cvalues_into_dest(
 
     assert_eq!(
         call_args.len(),
-        callee_sig.params.len(),
+        callee_abi.sig.params.len(),
         "direct call ABI mismatch for {callee_name}: params={} args={} callee={:?}",
-        callee_sig.params.len(),
+        callee_abi.sig.params.len(),
         call_args.len(),
         callee_func_id,
     );
@@ -5645,15 +5753,31 @@ fn codegen_direct_call_from_cvalues_into_dest(
         return;
     }
 
-    let results = fx.bcx.inst_results(call);
-    match dest.layout.backend_repr {
-        BackendRepr::Scalar(_) => {
-            dest.write_cvalue(fx, CValue::by_val(results[0], dest.layout.clone()));
+    let results = fx.bcx.inst_results(call).to_vec();
+    match &callee_abi.ret.mode {
+        PassMode::Ignore => {}
+        PassMode::Direct(_) => match results.as_slice() {
+            [value] => dest.write_cvalue(fx, CValue::by_val(*value, dest.layout.clone())),
+            _ => panic!("direct return ABI expects 1 return value, got {}", results.len()),
+        },
+        PassMode::Pair(_, _) => match results.as_slice() {
+            [a, b] => dest.write_cvalue(fx, CValue::by_val_pair(*a, *b, dest.layout.clone())),
+            _ => panic!("pair return ABI expects 2 return values, got {}", results.len()),
+        },
+        PassMode::Cast { cast, .. } => {
+            let ret_layout = callee_abi
+                .ret
+                .layout
+                .as_ref()
+                .expect("Cast return ABI must carry a layout")
+                .clone();
+            let result = abi::pass_mode::from_casted_value(fx, &results, ret_layout, cast);
+            dest.write_cvalue(fx, result);
         }
-        BackendRepr::ScalarPair(_, _) => {
-            dest.write_cvalue(fx, CValue::by_val_pair(results[0], results[1], dest.layout.clone()));
+        PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => unreachable!(),
+        PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+            unreachable!("unsized return ABI is unsupported")
         }
-        _ => {}
     }
 }
 
