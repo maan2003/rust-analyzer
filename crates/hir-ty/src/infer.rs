@@ -69,10 +69,10 @@ use crate::{
     lower::{
         ImplTraitIdx, ImplTraitLoweringMode, LifetimeElisionKind, diagnostics::TyLoweringDiagnostic,
     },
-    method_resolution::{CandidateId, MethodResolutionUnstableFeatures},
+    method_resolution::{self, CandidateId, MethodResolutionUnstableFeatures},
     mir::MirSpan,
     next_solver::{
-        AliasTy, Const, DbInterner, ErrorGuaranteed, GenericArg, GenericArgs, Region,
+        AliasTy, AnyImplId, Const, DbInterner, ErrorGuaranteed, GenericArg, GenericArgs, Region,
         StoredGenericArgs, StoredTy, StoredTys, Ty, TyKind, Tys,
         abi::Safety,
         infer::{InferCtxt, ObligationInspector, traits::ObligationCause},
@@ -1558,6 +1558,48 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
         }
     }
 
+    fn normalize_impl_associated_type(
+        &mut self,
+        inner_ty: Ty<'db>,
+        assoc_ty: Option<TypeAliasId>,
+        params: &[GenericArg<'db>],
+    ) -> Option<Ty<'db>> {
+        let assoc_ty = assoc_ty?;
+        let ItemContainerId::TraitId(trait_id) = assoc_ty.lookup(self.db).container else {
+            return None;
+        };
+        let trait_ref = crate::next_solver::TraitRef::new_from_args(
+            self.interner(),
+            trait_id.into(),
+            GenericArgs::new_from_iter(
+                self.interner(),
+                iter::once(inner_ty.into()).chain(params.iter().copied()),
+            ),
+        );
+        let (impl_id, impl_subst) = if let Some(it) = method_resolution::find_matching_impl(
+            &self.table.infer_ctxt,
+            self.table.param_env,
+            trait_ref,
+        ) {
+            it
+        } else {
+            return None;
+        };
+        let AnyImplId::ImplId(impl_id) = impl_id else {
+            return None;
+        };
+        let assoc_name = self.db.type_alias_signature(assoc_ty).name.clone();
+        let Some(impl_assoc) =
+            impl_id.impl_items(self.db).items.iter().find_map(|(name, item)| match *item {
+                AssocItemId::TypeAliasId(id) if *name == assoc_name => Some(id),
+                _ => None,
+            })
+        else {
+            return None;
+        };
+        Some(self.db.ty(impl_assoc.into()).instantiate(self.interner(), impl_subst))
+    }
+
     fn resolve_variant(
         &mut self,
         node: ExprOrPatId,
@@ -1794,6 +1836,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
 
     fn resolve_output_on(&self, trait_: TraitId) -> Option<TypeAliasId> {
         trait_.trait_items(self.db).associated_type_by_name(&Name::new_symbol_root(sym::Output))
+    }
+
+    fn resolve_residual_on(&self, trait_: TraitId) -> Option<TypeAliasId> {
+        trait_.trait_items(self.db).associated_type_by_name(&Name::new_root("Residual"))
     }
 
     fn resolve_future_future_output(&self) -> Option<TypeAliasId> {

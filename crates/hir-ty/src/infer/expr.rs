@@ -8,8 +8,9 @@ use hir_def::{
     expr_store::path::{GenericArgs as HirGenericArgs, Path},
     hir::{
         Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId, ExprOrPatId,
-        InlineAsmKind, LabelId, Literal, Pat, PatId, RecordSpread, Statement, UnaryOp,
+        InlineAsmKind, LabelId, Literal, MatchArm, Pat, PatId, RecordSpread, Statement, UnaryOp,
     },
+    lang_item::LangItemTarget,
     resolver::ValueNs,
 };
 use hir_def::{FunctionId, hir::ClosureKind};
@@ -442,57 +443,64 @@ impl<'db> InferenceContext<'_, 'db> {
                 }
                 let scrutinee_is_read =
                     if scrutinee_is_read { ExprIsRead::Yes } else { ExprIsRead::No };
-                let input_ty = self.demand_scrutinee_type(
-                    *expr,
-                    contains_ref_bindings,
-                    arms.is_empty(),
-                    scrutinee_is_read,
-                );
-
-                if arms.is_empty() {
-                    self.diverges = Diverges::Always;
-                    self.types.types.never
+                if let Some(ty) =
+                    self.infer_try_operator_match(*expr, arms, expected, scrutinee_is_read)
+                {
+                    ty
                 } else {
-                    let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
-                    let mut all_arms_diverge = Diverges::Always;
-                    for arm in arms.iter() {
-                        self.infer_top_pat(arm.pat, input_ty, None);
-                    }
+                    let input_ty = self.demand_scrutinee_type(
+                        *expr,
+                        contains_ref_bindings,
+                        arms.is_empty(),
+                        scrutinee_is_read,
+                    );
 
-                    let expected = expected.adjust_for_branches(&mut self.table);
-                    let result_ty = match &expected {
-                        // We don't coerce to `()` so that if the match expression is a
-                        // statement it's branches can have any consistent type.
-                        Expectation::HasType(ty) if *ty != self.types.types.unit => *ty,
-                        _ => self.table.next_ty_var(),
-                    };
-                    let mut coerce = CoerceMany::new(result_ty);
+                    if arms.is_empty() {
+                        self.diverges = Diverges::Always;
+                        self.types.types.never
+                    } else {
+                        let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
+                        let mut all_arms_diverge = Diverges::Always;
+                        for arm in arms.iter() {
+                            self.infer_top_pat(arm.pat, input_ty, None);
+                        }
 
-                    for arm in arms.iter() {
-                        if let Some(guard_expr) = arm.guard {
+                        let expected = expected.adjust_for_branches(&mut self.table);
+                        let result_ty = match &expected {
+                            // We don't coerce to `()` so that if the match expression is a
+                            // statement it's branches can have any consistent type.
+                            Expectation::HasType(ty) if *ty != self.types.types.unit => *ty,
+                            _ => self.table.next_ty_var(),
+                        };
+                        let mut coerce = CoerceMany::new(result_ty);
+
+                        for arm in arms.iter() {
+                            if let Some(guard_expr) = arm.guard {
+                                self.diverges = Diverges::Maybe;
+                                self.infer_expr_coerce_never(
+                                    guard_expr,
+                                    &Expectation::HasType(self.types.types.bool),
+                                    ExprIsRead::Yes,
+                                );
+                            }
                             self.diverges = Diverges::Maybe;
-                            self.infer_expr_coerce_never(
-                                guard_expr,
-                                &Expectation::HasType(self.types.types.bool),
+
+                            let arm_ty =
+                                self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
+                            all_arms_diverge &= self.diverges;
+                            coerce.coerce(
+                                self,
+                                &ObligationCause::new(),
+                                arm.expr,
+                                arm_ty,
                                 ExprIsRead::Yes,
                             );
                         }
-                        self.diverges = Diverges::Maybe;
 
-                        let arm_ty = self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
-                        all_arms_diverge &= self.diverges;
-                        coerce.coerce(
-                            self,
-                            &ObligationCause::new(),
-                            arm.expr,
-                            arm_ty,
-                            ExprIsRead::Yes,
-                        );
+                        self.diverges = matchee_diverges | all_arms_diverge;
+
+                        coerce.complete(self)
                     }
-
-                    self.diverges = matchee_diverges | all_arms_diverge;
-
-                    coerce.complete(self)
                 }
             }
             Expr::Path(p) => self.infer_expr_path(p, tgt_expr.into(), tgt_expr),
@@ -1370,6 +1378,234 @@ impl<'db> InferenceContext<'_, 'db> {
         Ty::new_array_with_const_len(self.interner(), elem_ty, len)
     }
 
+    fn infer_try_operator_match(
+        &mut self,
+        scrutinee: ExprId,
+        arms: &[MatchArm],
+        expected: &Expectation<'db>,
+        scrutinee_is_read: ExprIsRead,
+    ) -> Option<Ty<'db>> {
+        let [continue_arm, break_arm] = arms else {
+            return None;
+        };
+        if continue_arm.guard.is_some() || break_arm.guard.is_some() {
+            return None;
+        }
+
+        self.try_branch_operand(scrutinee)?;
+        self.try_control_flow_arm_pat(continue_arm.pat, self.lang_items.ControlFlowContinue?)?;
+        self.try_control_flow_arm_pat(break_arm.pat, self.lang_items.ControlFlowBreak?)?;
+        let break_target = self.try_operator_break_target_ty(break_arm.expr)?;
+        let try_trait = self.lang_items.Try?;
+        let break_residual = self
+            .normalize_impl_associated_type(break_target, self.resolve_residual_on(try_trait), &[])
+            .unwrap_or_else(|| {
+                self.resolve_associated_type(break_target, self.resolve_residual_on(try_trait))
+            });
+        let residual_ty = self
+            .table
+            .at(&ObligationCause::new())
+            .deeply_normalize(break_residual)
+            .unwrap_or(break_residual);
+        let branch_expected = expected.adjust_for_branches(&mut self.table);
+        let output_ty = match branch_expected {
+            Expectation::HasType(ty) if ty != self.types.types.unit => ty,
+            _ => self.table.next_ty_var(),
+        };
+        let control_flow_enum = self.lang_items.ControlFlowContinue?.lookup(self.db).parent;
+        let scrutinee_ty = Ty::new_adt(
+            self.interner(),
+            control_flow_enum.into(),
+            GenericArgs::new_from_slice(&[residual_ty.into(), output_ty.into()]),
+        );
+
+        let input_ty = self.infer_try_branch_scrutinee(
+            scrutinee,
+            scrutinee_ty,
+            residual_ty,
+            output_ty,
+            scrutinee_is_read,
+        )?;
+        let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
+
+        self.infer_top_pat(continue_arm.pat, input_ty, None);
+        self.infer_top_pat(break_arm.pat, input_ty, None);
+
+        self.diverges = Diverges::Maybe;
+        let continue_ty = self.infer_expr_inner(
+            continue_arm.expr,
+            &Expectation::HasType(output_ty),
+            ExprIsRead::Yes,
+        );
+        let continue_diverges = self.diverges;
+        let _ = self.coerce(
+            continue_arm.expr.into(),
+            continue_ty,
+            output_ty,
+            AllowTwoPhase::No,
+            ExprIsRead::Yes,
+        );
+
+        self.diverges = Diverges::Maybe;
+        self.infer_expr_coerce_never(
+            break_arm.expr,
+            &Expectation::HasType(self.types.types.never),
+            ExprIsRead::Yes,
+        );
+        let break_diverges = self.diverges;
+
+        self.diverges = matchee_diverges | (continue_diverges & break_diverges);
+        Some(output_ty)
+    }
+
+    fn try_branch_operand(&self, scrutinee: ExprId) -> Option<ExprId> {
+        let Expr::Call { callee, args, .. } = &self.body[scrutinee] else {
+            return None;
+        };
+        let [operand] = args.as_ref() else {
+            return None;
+        };
+        let Expr::Path(Path::LangItem(LangItemTarget::FunctionId(lang_fn), _)) =
+            &self.body[*callee]
+        else {
+            return None;
+        };
+        (Some(*lang_fn) == self.lang_items.TryTraitBranch).then_some(*operand)
+    }
+
+    fn infer_try_branch_scrutinee(
+        &mut self,
+        scrutinee: ExprId,
+        scrutinee_ty: Ty<'db>,
+        residual_ty: Ty<'db>,
+        output_ty: Ty<'db>,
+        scrutinee_is_read: ExprIsRead,
+    ) -> Option<Ty<'db>> {
+        let Expr::Call { callee, args, .. } = &self.body[scrutinee] else {
+            return None;
+        };
+        let [operand] = args.as_ref() else {
+            return None;
+        };
+
+        let callee_ty = self.infer_expr(*callee, &Expectation::none(), ExprIsRead::Yes);
+        let callee_ty = self.table.try_structurally_resolve_type(callee_ty);
+        let (_, param_tys, ret_ty) = self.table.callable_sig(callee_ty, 1)?;
+        let [formal_input] = param_tys.as_slice() else {
+            return None;
+        };
+
+        self.register_obligations_for_call(callee_ty);
+        let operand_ty = self.infer_expr(*operand, &Expectation::none(), ExprIsRead::Yes);
+        let origin = ObligationCause::new();
+        let infer_ok = self
+            .table
+            .infer_ctxt
+            .at(&origin, self.table.param_env)
+            .eq(*formal_input, operand_ty)
+            .ok()?;
+        self.table.register_infer_ok(infer_ok);
+
+        let try_trait = self.lang_items.Try?;
+        let operand_output_alias = self
+            .normalize_impl_associated_type(operand_ty, self.resolve_output_on(try_trait), &[])
+            .unwrap_or_else(|| {
+                self.resolve_associated_type(operand_ty, self.resolve_output_on(try_trait))
+            });
+        let operand_output = self
+            .table
+            .at(&origin)
+            .deeply_normalize(operand_output_alias)
+            .unwrap_or(operand_output_alias);
+        let operand_residual_alias = self
+            .normalize_impl_associated_type(operand_ty, self.resolve_residual_on(try_trait), &[])
+            .unwrap_or_else(|| {
+                self.resolve_associated_type(operand_ty, self.resolve_residual_on(try_trait))
+            });
+        let operand_residual = self
+            .table
+            .at(&origin)
+            .deeply_normalize(operand_residual_alias)
+            .unwrap_or(operand_residual_alias);
+        let infer_ok = self
+            .table
+            .infer_ctxt
+            .at(&origin, self.table.param_env)
+            .eq(operand_output, output_ty)
+            .ok()?;
+        self.table.register_infer_ok(infer_ok);
+        let infer_ok = self
+            .table
+            .infer_ctxt
+            .at(&origin, self.table.param_env)
+            .eq(operand_residual, residual_ty)
+            .ok()?;
+        self.table.register_infer_ok(infer_ok);
+
+        let infer_ok = self
+            .table
+            .infer_ctxt
+            .at(&origin, self.table.param_env)
+            .eq(ret_ty, scrutinee_ty)
+            .ok()?;
+        self.table.register_infer_ok(infer_ok);
+        self.table.select_obligations_where_possible();
+        self.write_expr_ty(scrutinee, scrutinee_ty);
+        if self.shallow_resolve(scrutinee_ty).is_never()
+            && self.expr_guaranteed_to_constitute_read_for_never(scrutinee, scrutinee_is_read)
+        {
+            self.diverges = Diverges::Always;
+        }
+        Some(scrutinee_ty)
+    }
+
+    fn try_control_flow_arm_pat(
+        &self,
+        pat: PatId,
+        expected_variant: hir_def::EnumVariantId,
+    ) -> Option<PatId> {
+        let Pat::TupleStruct { path: Some(path), args, ellipsis: None } = &self.body[pat] else {
+            return None;
+        };
+        let [binding_pat] = args.as_ref() else {
+            return None;
+        };
+        let Path::LangItem(LangItemTarget::EnumVariantId(variant), _) = path.as_ref() else {
+            return None;
+        };
+        (*variant == expected_variant).then_some(*binding_pat)
+    }
+
+    fn try_operator_break_target_ty(&mut self, expr: ExprId) -> Option<Ty<'db>> {
+        match self.body[expr] {
+            Expr::Return { expr: Some(inner) } => {
+                self.try_operator_residual_conversion(inner)?;
+                self.return_coercion.as_ref().map(|it| it.expected_ty())
+            }
+            Expr::Break { expr: Some(inner), label } => {
+                self.try_operator_residual_conversion(inner)?;
+                let ctxt = find_breakable(&mut self.breakables, label)?;
+                ctxt.coerce.as_ref().map(|it| it.expected_ty())
+            }
+            _ => None,
+        }
+    }
+
+    fn try_operator_residual_conversion(&self, expr: ExprId) -> Option<()> {
+        let Expr::Call { callee, args, .. } = &self.body[expr] else {
+            return None;
+        };
+        let [_arg] = args.as_ref() else {
+            return None;
+        };
+        let Expr::Path(Path::LangItem(LangItemTarget::FunctionId(lang_fn), _)) =
+            &self.body[*callee]
+        else {
+            return None;
+        };
+        (Some(*lang_fn) == self.lang_items.TryTraitFromResidual).then_some(())
+    }
+
     pub(super) fn infer_return(&mut self, expr: ExprId) {
         let ret_ty = self
             .return_coercion
@@ -1476,13 +1712,7 @@ impl<'db> InferenceContext<'_, 'db> {
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let {
-                            pat,
-                            type_ref,
-                            initializer,
-                            else_branch,
-                            ..
-                        } => {
+                        Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                             let decl_ty = type_ref
                                 .as_ref()
                                 .map(|&tr| this.make_body_ty(tr))

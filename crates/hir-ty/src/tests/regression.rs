@@ -1015,6 +1015,36 @@ fn test() {
 }
 
 #[test]
+fn question_mark_infers_result_ctor_error_from_return_type() {
+    check_infer(
+        r#"
+//- minicore: try, result, from, fn
+fn f() -> Result<(), ()> {
+    Ok(())?;
+    Ok(())
+}
+        "#,
+        expect![[r#"
+            25..52 '{     ...(()) }': Result<(), ()>
+            31..33 'Ok': fn Ok<(), ()>(()) -> Result<(), ()>
+            31..37 'Ok(())': Result<(), ()>
+            31..38 'Ok(())?': fn branch<Result<(), ()>>(Result<(), ()>) -> ControlFlow<<Result<(), ()> as Try>::Residual, <Result<(), ()> as Try>::Output>
+            31..38 'Ok(())?': ControlFlow<Result<Infallible, ()>, ()>
+            31..38 'Ok(())?': ()
+            31..38 'Ok(())?': Result<Infallible, ()>
+            31..38 'Ok(())?': fn from_residual<Result<(), ()>, Result<Infallible, ()>>(Result<Infallible, ()>) -> Result<(), ()>
+            31..38 'Ok(())?': Result<(), ()>
+            31..38 'Ok(())?': !
+            31..38 'Ok(())?': ()
+            34..36 '()': ()
+            44..46 'Ok': fn Ok<(), ()>(()) -> Result<(), ()>
+            44..50 'Ok(())': Result<(), ()>
+            47..49 '()': ()
+        "#]],
+    );
+}
+
+#[test]
 fn cfg_tail() {
     // https://github.com/rust-lang/rust-analyzer/issues/8378
     check_infer(
