@@ -7,7 +7,7 @@
 //!
 //! So the monomorphization should be called even if the substitution is empty.
 
-use hir_def::DefWithBodyId;
+use hir_def::{DefWithBodyId, GeneralConstId, ItemContainerId};
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{
     FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt,
@@ -21,6 +21,7 @@ use crate::{
 };
 use crate::{
     db::{HirDatabase, InternedClosureId},
+    method_resolution::lookup_impl_const,
     next_solver::{
         DbInterner, GenericArgs, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -102,34 +103,56 @@ impl<'db> Filler<'db> {
         Self { infcx, trait_env: env, subst }
     }
 
-    fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError> {
-        // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
+    fn store_checked<T>(&self, value: T) -> Result<T, MirLowerError>
+    where
+        T: TypeVisitableExt<DbInterner<'db>>,
+    {
+        if references_non_lt_error(&value) {
             Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
         } else {
-            Ok(())
+            Ok(value)
         }
     }
 
-    fn fill_const(&mut self, t: &mut StoredConst) -> Result<(), MirLowerError> {
+    fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError> {
         // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
-        } else {
-            Ok(())
+        let ty = t.as_ref().try_fold_with(self)?;
+        *t = self.store_checked(ty)?.store();
+        Ok(())
+    }
+
+    fn normalize_monomorphized_const(&self, mut ct: Const<'db>) -> Const<'db> {
+        // Preserve const aliases in MIR, but resolve trait-associated const
+        // projections after substitution so later evaluation still has a
+        // concrete impl const in body context.
+        if let ConstKind::Unevaluated(uv) = ct.kind()
+            && let GeneralConstId::ConstId(const_id) = uv.def.0
+            && matches!(const_id.loc(self.infcx.interner.db).container, ItemContainerId::TraitId(_))
+        {
+            let (resolved_const, resolved_subst) =
+                lookup_impl_const(&self.infcx, self.trait_env.param_env, const_id, uv.args);
+            ct = Const::new(
+                self.infcx.interner,
+                ConstKind::Unevaluated(rustc_type_ir::UnevaluatedConst {
+                    def: GeneralConstId::ConstId(resolved_const).into(),
+                    args: resolved_subst,
+                }),
+            );
         }
+        ct
+    }
+
+    fn fill_const(&mut self, t: &mut StoredConst) -> Result<(), MirLowerError> {
+        let ct = t.as_ref().try_fold_with(self)?;
+        *t = self.store_checked(self.normalize_monomorphized_const(ct))?.store();
+        Ok(())
     }
 
     fn fill_args(&mut self, t: &mut StoredGenericArgs) -> Result<(), MirLowerError> {
         // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
-        } else {
-            Ok(())
-        }
+        let args = t.as_ref().try_fold_with(self)?;
+        *t = self.store_checked(args)?.store();
+        Ok(())
     }
 
     fn fill_operand(&mut self, op: &mut Operand) -> Result<(), MirLowerError> {

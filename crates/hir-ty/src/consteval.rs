@@ -12,7 +12,10 @@ use hir_def::{
     hir::{Expr, ExprId, Literal},
 };
 use hir_expand::Lookup;
-use rustc_type_ir::{TypingMode, inherent::IntoKind};
+use rustc_type_ir::{
+    TypingMode,
+    inherent::IntoKind,
+};
 use triomphe::Arc;
 
 use crate::{
@@ -358,40 +361,54 @@ pub(crate) fn const_eval<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Const<'db>, ConstEvalError> {
     let (def, subst, trait_env) = resolve_assoc_const_for_eval(db, def, subst, trait_env);
-    return match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
+    match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
-    };
-
-    #[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result)]
-    pub(crate) fn const_eval_query<'db>(
-        db: &'db dyn HirDatabase,
-        def: ConstId,
-        subst: StoredGenericArgs,
-        trait_env: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredConst, ConstEvalError> {
-        let monomorphization_env = trait_env.unwrap_or_else(|| {
-            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-                .store()
-        });
-        let body = db.monomorphized_mir_body(
-            def.into(),
-            subst,
-            monomorphization_env.clone(),
-        )?;
-        let c = interpret_mir(db, body, false, Some(monomorphization_env.as_ref()))?.0?;
-        Ok(c.store())
     }
+}
 
-    pub(crate) fn const_eval_cycle_result(
-        _: &dyn HirDatabase,
-        _: salsa::Id,
-        _: ConstId,
-        _: StoredGenericArgs,
-        _: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredConst, ConstEvalError> {
-        Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
+pub fn const_eval_with_stored_env<'db>(
+    db: &'db dyn HirDatabase,
+    def: ConstId,
+    subst: GenericArgs<'db>,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<Const<'db>, ConstEvalError> {
+    let (def, subst, trait_env) =
+        resolve_assoc_const_for_eval(db, def, subst, Some(trait_env.as_ref()));
+    match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
+        Ok(konst) => Ok(konst.as_ref()),
+        Err(err) => Err(err.clone()),
     }
+}
+
+#[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result)]
+pub(crate) fn const_eval_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: ConstId,
+    subst: StoredGenericArgs,
+    trait_env: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredConst, ConstEvalError> {
+    let monomorphization_env = trait_env.unwrap_or_else(|| {
+        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+            .store()
+    });
+    let body = db.monomorphized_mir_body(
+        def.into(),
+        subst,
+        monomorphization_env.clone(),
+    )?;
+    let c = interpret_mir(db, body, false, Some(monomorphization_env.as_ref()))?.0?;
+    Ok(c.store())
+}
+
+pub(crate) fn const_eval_cycle_result(
+    _: &dyn HirDatabase,
+    _: salsa::Id,
+    _: ConstId,
+    _: StoredGenericArgs,
+    _: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredConst, ConstEvalError> {
+    Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
 fn resolve_assoc_const_for_eval<'db>(

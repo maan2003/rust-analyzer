@@ -1,5 +1,9 @@
 use base_db::RootQueryDb;
-use hir_def::{AdtId, AssocItemId, ModuleDefId, db::DefDatabase};
+use hir_def::{
+    AdtId, AssocItemId, DefWithBodyId, ModuleDefId,
+    db::DefDatabase,
+    hir::Expr,
+};
 use hir_expand::EditionedFileId;
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -17,7 +21,8 @@ use crate::{
     db::HirDatabase,
     display::DisplayTarget,
     mir::pad16,
-    next_solver::{Const, ConstBytes, ConstKind, DbInterner, GenericArgs},
+    InferenceResult,
+    next_solver::{Const, ConstBytes, ConstKind, DbInterner, GenericArgs, Ty},
     setup_tracing,
     test_db::TestDB,
 };
@@ -184,6 +189,24 @@ fn find_struct(db: &TestDB, file_id: EditionedFileId, struct_name: &str) -> hir_
 }
 
 #[track_caller]
+fn find_function(db: &TestDB, file_id: EditionedFileId, fn_name: &str) -> hir_def::FunctionId {
+    let module_id = db.module_for_file(file_id.file_id(db));
+    let scope = &module_id.def_map(db)[module_id].scope;
+    let fn_name = Name::new_symbol_root(Symbol::intern(fn_name));
+    scope
+        .declarations()
+        .find_map(|item| match item {
+            ModuleDefId::FunctionId(function_id)
+                if db.function_signature(function_id).name == fn_name =>
+            {
+                Some(function_id)
+            }
+            _ => None,
+        })
+        .expect("No matching function found")
+}
+
+#[track_caller]
 fn find_assoc_const_eval_target<'db>(
     db: &'db TestDB,
     file_id: EditionedFileId,
@@ -276,6 +299,150 @@ impl<T: Foo> Foo for Wrap<T> {
             .const_eval(const_id, subst, None)
             .expect("const eval should resolve forwarded impl const");
         assert_eq!(try_const_usize(&db, value), Some(7));
+    });
+}
+
+#[test]
+fn assoc_const_eval_handles_foreign_local_type_in_self_ty() {
+    check_number(
+        r#"
+//- /dep.rs crate:dep
+pub trait Foo {
+    const BAR: usize;
+}
+
+pub struct Base;
+impl Foo for Base {
+    const BAR: usize = 7;
+}
+
+pub struct Wrap<T, U>(pub T, pub U);
+impl<T: Foo, U> Foo for Wrap<T, U> {
+    const BAR: usize = T::BAR;
+}
+
+//- /main.rs crate:main deps:dep
+struct Local;
+
+const GOAL: usize = <dep::Wrap<dep::Base, Local> as dep::Foo>::BAR;
+"#,
+        7,
+    );
+}
+
+#[test]
+fn assoc_const_eval_handles_foreign_local_fn_item_in_self_ty() {
+    check_number(
+        r#"
+//- /dep.rs crate:dep
+pub trait Foo {
+    const BAR: usize;
+}
+
+pub struct Base;
+impl Foo for Base {
+    const BAR: usize = 7;
+}
+
+pub struct Wrap<T, U>(pub T, pub U);
+impl<T: Foo, U> Foo for Wrap<T, U> {
+    const BAR: usize = T::BAR;
+}
+
+pub const fn use_wrap<U>(_u: U) -> usize {
+    <Wrap<Base, U> as Foo>::BAR
+}
+
+//- /main.rs crate:main deps:dep
+fn local() {}
+
+const GOAL: usize = dep::use_wrap(local);
+"#,
+        7,
+    );
+}
+
+#[test]
+fn assoc_const_eval_handles_foreign_closure_in_self_ty() {
+    check_number(
+        r#"
+//- /dep.rs crate:dep
+pub trait Foo {
+    const BAR: usize;
+}
+
+pub struct Base;
+impl Foo for Base {
+    const BAR: usize = 7;
+}
+
+pub struct Wrap<T, U>(pub T, pub U);
+impl<T: Foo, U> Foo for Wrap<T, U> {
+    const BAR: usize = T::BAR;
+}
+
+pub const fn use_wrap<U>(_u: U) -> usize {
+    <Wrap<Base, U> as Foo>::BAR
+}
+
+//- /main.rs crate:main deps:dep
+const GOAL: usize = dep::use_wrap(|| ());
+"#,
+        7,
+    );
+}
+
+#[test]
+fn assoc_const_eval_direct_query_handles_foreign_closure_in_self_ty() {
+    let (db, file_ids) = TestDB::with_many_files(
+        r#"
+//- /dep.rs crate:dep
+pub trait Foo {
+    const BAR: usize;
+}
+
+pub struct Base;
+impl Foo for Base {
+    const BAR: usize = 7;
+}
+
+pub struct Wrap<T, U>(pub T, pub U);
+impl<T: Foo, U> Foo for Wrap<T, U> {
+    const BAR: usize = T::BAR;
+}
+
+//- /main.rs crate:main deps:dep
+fn make_closure() {
+    let _x = || ();
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let dep_file = file_ids[0];
+        let main_file = file_ids[1];
+        let main_fn = find_function(&db, main_file, "make_closure");
+        let infer = InferenceResult::for_body(&db, DefWithBodyId::from(main_fn));
+        let body = db.body(main_fn.into());
+        let closure_expr = body
+            .exprs()
+            .find_map(|(expr_id, expr)| matches!(expr, Expr::Closure { .. }).then_some(expr_id))
+            .expect("closure expr not found");
+        let closure_ty = infer.expr_ty(closure_expr);
+
+        let interner = DbInterner::new_with(&db, db.module_for_file(main_file.file_id(&db)).krate(&db));
+        let base_ty = db.ty(find_struct(&db, dep_file, "Base").into()).instantiate_identity();
+        let wrap_id = find_struct(&db, dep_file, "Wrap");
+        let wrap_ty = Ty::new_adt(
+            interner,
+            AdtId::StructId(wrap_id),
+            GenericArgs::new_from_slice(&[base_ty.into(), closure_ty.into()]),
+        );
+        let (const_id, subst) =
+            find_assoc_const_eval_target(&db, dep_file, "Foo", "BAR", wrap_ty);
+        let result = db
+            .const_eval(const_id, subst, None)
+            .expect("const eval should resolve impl const with foreign closure type");
+        assert_eq!(try_const_usize(&db, result), Some(7));
     });
 }
 

@@ -1,13 +1,15 @@
-use hir_def::{HasModule, db::DefDatabase};
+use hir_def::{DefWithBodyId, HasModule, ItemContainerId, db::DefDatabase, hir::Expr};
 use hir_expand::EditionedFileId;
+use rustc_type_ir::inherent::IntoKind;
 use span::Edition;
 use syntax::{TextRange, TextSize};
 use test_fixture::WithFixture;
 
 use crate::{
+    InferenceResult, ParamEnvAndCrate,
     db::HirDatabase,
     display::DisplayTarget,
-    mir::MirLowerError,
+    mir::{MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind},
     next_solver::{DbInterner, GenericArgs},
     setup_tracing,
     test_db::TestDB,
@@ -133,6 +135,70 @@ fn check_error_with(
     })
 }
 
+fn find_function_by_name(
+    db: &TestDB,
+    file_id: EditionedFileId,
+    name: &str,
+) -> hir_def::FunctionId {
+    let module_id = db.module_for_file(file_id.file_id(db));
+    let scope = &module_id.def_map(db)[module_id].scope;
+    scope
+        .declarations()
+        .find_map(|item| match item {
+            hir_def::ModuleDefId::FunctionId(function_id)
+                if db.function_signature(function_id).name.display(db, Edition::CURRENT).to_string()
+                    == name =>
+            {
+                Some(function_id)
+            }
+            _ => None,
+        })
+        .expect("matching function not found")
+}
+
+fn operand_has_trait_assoc_const(db: &TestDB, operand: &Operand) -> bool {
+    match &operand.kind {
+        OperandKind::Constant { konst, .. } => match konst.as_ref().kind() {
+            crate::next_solver::ConstKind::Unevaluated(uv) => match uv.def.0 {
+                hir_def::GeneralConstId::ConstId(const_id) => {
+                    matches!(const_id.loc(db).container, ItemContainerId::TraitId(_))
+                }
+                hir_def::GeneralConstId::StaticId(_) => false,
+            },
+            _ => false,
+        },
+        OperandKind::Copy(_) | OperandKind::Move(_) | OperandKind::Static(_) => false,
+    }
+}
+
+fn rvalue_has_trait_assoc_const(db: &TestDB, rvalue: &Rvalue) -> bool {
+    match rvalue {
+        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => operand_has_trait_assoc_const(db, op),
+        Rvalue::Repeat(op, len) => {
+            operand_has_trait_assoc_const(db, op)
+                || matches!(
+                    len.as_ref().kind(),
+                    crate::next_solver::ConstKind::Unevaluated(uv)
+                        if matches!(uv.def.0, hir_def::GeneralConstId::ConstId(const_id)
+                            if matches!(const_id.loc(db).container, ItemContainerId::TraitId(_)))
+                )
+        }
+        Rvalue::Cast(_, op, _) => operand_has_trait_assoc_const(db, op),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_has_trait_assoc_const(db, lhs) || operand_has_trait_assoc_const(db, rhs)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_has_trait_assoc_const(db, op)),
+        Rvalue::ShallowInitBox(_, _)
+        | Rvalue::ShallowInitBoxWithAlloc(_)
+        | Rvalue::Ref(_, _)
+        | Rvalue::AddressOf(_, _)
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::CopyForDeref(_)
+        | Rvalue::ThreadLocalRef(_) => false,
+    }
+}
+
 #[test]
 fn function_with_extern_c_abi() {
     check_pass(
@@ -146,6 +212,93 @@ fn main() {
 }
         "#,
     );
+}
+
+#[test]
+fn monomorphization_normalizes_trait_assoc_const_operands() {
+    let (db, file_ids) = TestDB::with_many_files(
+        r#"
+//- minicore: fn
+trait Foo {
+    const BAR: u8;
+}
+
+struct Wrap<T>(T);
+impl<T> Foo for Wrap<T> {
+    const BAR: u8 = 1;
+}
+
+fn get<F: FnOnce()>(f: F) -> u8 {
+    let _ = f;
+    <Wrap<F> as Foo>::BAR
+}
+
+fn main() {
+    let _ = get(|| ());
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let main_fn = find_function_by_name(&db, file_id, "main");
+        let get_fn = find_function_by_name(&db, file_id, "get");
+
+        let infer = InferenceResult::for_body(&db, DefWithBodyId::from(main_fn));
+        let body = db.body(main_fn.into());
+        let closure_expr = body
+            .exprs()
+            .find_map(|(expr_id, expr)| matches!(expr, Expr::Closure { .. }).then_some(expr_id))
+            .expect("closure expr not found");
+        let closure_ty = infer.expr_ty(closure_expr);
+
+        let body = db
+            .monomorphized_mir_body(
+                get_fn.into(),
+                GenericArgs::new_from_slice(&[closure_ty.into()]).store(),
+                ParamEnvAndCrate {
+                    param_env: db.trait_environment(get_fn.into()),
+                    krate: main_fn.krate(&db),
+                }
+                .store(),
+            )
+            .expect("monomorphized MIR should lower");
+
+        let has_trait_assoc_const = body.basic_blocks.iter().any(|(_, block)| {
+            block.statements.iter().any(|statement| match &statement.kind {
+                StatementKind::Assign(_, rvalue) => rvalue_has_trait_assoc_const(&db, rvalue),
+                StatementKind::Deinit(_)
+                | StatementKind::SetDiscriminant { .. }
+                | StatementKind::FakeRead(_)
+                | StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => false,
+            }) || block.terminator.as_ref().is_some_and(|terminator| match &terminator.kind {
+                TerminatorKind::Call { func, args, .. } => {
+                    operand_has_trait_assoc_const(&db, func)
+                        || args.iter().any(|arg| operand_has_trait_assoc_const(&db, arg))
+                }
+                TerminatorKind::SwitchInt { discr, .. } => {
+                    operand_has_trait_assoc_const(&db, discr)
+                }
+                TerminatorKind::Goto { .. }
+                | TerminatorKind::UnwindResume
+                | TerminatorKind::Abort
+                | TerminatorKind::Return
+                | TerminatorKind::Unreachable
+                | TerminatorKind::Drop { .. }
+                | TerminatorKind::Assert { .. }
+                | TerminatorKind::Yield { .. }
+                | TerminatorKind::CoroutineDrop
+                | TerminatorKind::FalseEdge { .. }
+                | TerminatorKind::FalseUnwind { .. } => false,
+            })
+        });
+
+        assert!(
+            !has_trait_assoc_const,
+            "monomorphized MIR should not retain trait-associated unevaluated consts"
+        );
+    });
 }
 
 #[test]
